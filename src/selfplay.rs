@@ -115,6 +115,7 @@ pub fn generate_one_detailed(
             policy,
             value: 0.0,
             moves_left: 0.0,
+            generation: 0,
         });
         board.play(mv);
     }

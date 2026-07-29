@@ -9,7 +9,7 @@ use std::{
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        mpsc::{self, Receiver, SyncSender},
+        mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
 };
@@ -127,9 +127,15 @@ fn worker_loop(
         };
         game_index += 1;
         backlog.fetch_add(1, Ordering::Relaxed);
-        if sender.send(game).is_err() {
-            backlog.fetch_sub(1, Ordering::Relaxed);
-            return;
+        match sender.try_send(game) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                backlog.fetch_sub(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                backlog.fetch_sub(1, Ordering::Relaxed);
+                return;
+            }
         }
     }
 }

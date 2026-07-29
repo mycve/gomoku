@@ -497,6 +497,7 @@ mod tests {
             policy: vec![(Move::new(7, 7).unwrap(), 1.0)],
             value: 0.0,
             moves_left: 20.0,
+            generation: 0,
         };
         let stats = train(&mut model, &[sample], 1, 1e-3, 1, &[], 0.1).unwrap();
         assert_eq!(stats.optimizer_steps, 1);

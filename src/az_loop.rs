@@ -48,6 +48,9 @@ struct TrainerEvent {
     train_seconds: f32,
     pool_samples: usize,
     learning_rate: f32,
+    train_samples: usize,
+    recent_quota_rate: f32,
+    actual_recent_rate: f32,
 }
 
 pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()> {
@@ -124,6 +127,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     let backlog = actors.backlog_counter();
     let (ready_tx, ready_rx) = mpsc::sync_channel::<PendingBatch>(1);
     let collector_stop = Arc::clone(&stop);
+    let collector_version = Arc::clone(&version);
     let games_per_update = config.games_per_update.max(1);
     let collector = thread::spawn(move || {
         let mut pending = PendingBatch {
@@ -133,6 +137,17 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         let mut started = Instant::now();
         while let Ok(game) = actor_rx.recv() {
             backlog.fetch_sub(1, Ordering::Relaxed);
+            let current_version = collector_version.load(Ordering::Acquire);
+            if game.model_version < current_version {
+                continue;
+            }
+            if pending.games > 0 && pending.newest_version < current_version {
+                pending = PendingBatch {
+                    oldest_version: u64::MAX,
+                    ..Default::default()
+                };
+                started = Instant::now();
+            }
             merge_game(&mut pending, game);
             if pending.games < games_per_update {
                 continue;
@@ -142,11 +157,9 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 oldest_version: u64::MAX,
                 ..Default::default()
             };
-            if ready_tx
-                .send(std::mem::replace(&mut pending, next))
-                .is_err()
-            {
-                break;
+            match ready_tx.try_send(std::mem::replace(&mut pending, next)) {
+                Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                Err(mpsc::TrySendError::Disconnected(_)) => break,
             }
             started = Instant::now();
             if collector_stop.load(Ordering::SeqCst) {
@@ -154,8 +167,9 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             }
         }
     });
-    let (event_tx, event_rx) = mpsc::sync_channel::<TrainerEvent>(2);
+    let (event_tx, event_rx) = mpsc::channel::<TrainerEvent>();
     let trainer_stop = Arc::clone(&stop);
+    let trainer_version = Arc::clone(&version);
     let trainer_config = config.clone();
     let start_update = progress.update;
     let trainer = thread::spawn(move || -> io::Result<()> {
@@ -167,16 +181,32 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             if trainer_stop.load(Ordering::SeqCst) {
                 break;
             }
+            if batch.newest_version < trainer_version.load(Ordering::Acquire) {
+                continue;
+            }
+            replay::append(&trainer_config.replay_path, &batch.samples)?;
             pool.extend(batch.samples.iter().cloned());
+            let mut pruned = false;
             if pool.len() > trainer_config.replay_capacity {
                 pool.drain(..pool.len() - trainer_config.replay_capacity);
+                pruned = true;
             }
             let update = start_update + index + 1;
             let lr = current_lr(&trainer_config, update - 1);
             let started = Instant::now();
+            let sampled = replay::sample_mixed_recent(
+                &pool,
+                trainer_config.train_samples_per_update,
+                trainer_config.replay_recent_sample_fraction,
+                trainer_config.replay_recent_updates,
+                trainer_config.seed ^ update as u64,
+            );
+            let train_samples = sampled.samples.len();
+            let recent_quota_rate = sampled.recent_quota as f32 / train_samples.max(1) as f32;
+            let actual_recent_rate = sampled.actual_recent as f32 / train_samples.max(1) as f32;
             let train_stats = candle_train::train(
                 &mut model,
-                &pool,
+                &sampled.samples,
                 trainer_config.batch_epochs,
                 lr,
                 trainer_config.batch_size,
@@ -189,7 +219,9 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 .powi(train_stats.optimizer_steps.min(i32::MAX as usize) as i32);
             ema_model.update_ema(&model, effective_decay);
             let train_seconds = started.elapsed().as_secs_f32();
-            replay::save(&trainer_config.replay_path, &pool)?;
+            if pruned {
+                replay::save(&trainer_config.replay_path, &pool)?;
+            }
             if event_tx
                 .send(TrainerEvent {
                     model: ema_model.clone(),
@@ -199,6 +231,9 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                     train_seconds,
                     pool_samples: pool.len(),
                     learning_rate: lr,
+                    train_samples,
+                    recent_quota_rate,
+                    actual_recent_rate,
                 })
                 .is_err()
             {
@@ -211,7 +246,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     let train_devices = candle_train::training_device_names(&config.gpu_devices)?.join(",");
     let end = target_update.unwrap_or(usize::MAX);
     println!(
-        "loop     : mode=batch-async actors={} actor_queue={} collector_queue=1 trainer_queue=2 games/update={} sims={} train_device={} batch={} arena_opening_plies={}",
+        "loop     : mode=batch-async actors={} actor_queue={}(nonblocking-drop) collector_queue=1(nonblocking-drop) trainer_queue=unbounded games/update={} sims={} train_device={} batch={} arena_opening_plies={}",
         workers,
         queue_capacity,
         config.games_per_update,
@@ -276,6 +311,16 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             progress.update,
         );
         tb.add_scalar("replay/samples", event.pool_samples as f32, progress.update);
+        tb.add_scalar(
+            "replay/train_recent_quota_rate",
+            event.recent_quota_rate,
+            progress.update,
+        );
+        tb.add_scalar(
+            "replay/train_actual_recent_rate",
+            event.actual_recent_rate,
+            progress.update,
+        );
         if config.arena_interval > 0 && progress.update % config.arena_interval == 0 {
             let report = arena(
                 &event.model,
@@ -326,11 +371,14 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     Ok(())
 }
 
-fn merge_game(p: &mut PendingBatch, game: SelfplayGame) {
+fn merge_game(p: &mut PendingBatch, mut game: SelfplayGame) {
     p.oldest_version = p.oldest_version.min(game.model_version);
     p.newest_version = p.newest_version.max(game.model_version);
     p.workers.insert(game.worker);
     p.stats.add_assign(&game.stats);
+    for sample in &mut game.samples {
+        sample.generation = game.model_version;
+    }
     p.samples.extend(game.samples);
     p.games += 1;
 }
@@ -382,6 +430,13 @@ fn print_event(
         event.pool_samples as f32 * 100.0 / config.replay_capacity.max(1) as f32
     );
     println!(
+        "sampling : train_samples={} recent_quota={:.1}% actual_recent={:.1}% window={} updates",
+        event.train_samples,
+        event.recent_quota_rate * 100.0,
+        event.actual_recent_rate * 100.0,
+        config.replay_recent_updates
+    );
+    println!(
         "train    : device={} samples={} steps={} lr={:.6} loss={:.4} policy={:.4} value={:.4} moves_left={:.4} time={:.2}s sps={:.1}",
         device,
         event.train_stats.samples,
@@ -397,7 +452,8 @@ fn print_event(
 }
 
 fn current_lr(c: &AzLoopConfig, update: usize) -> f32 {
-    (c.learning_rate * c.learning_rate_decay.powi(update as i32)).max(c.learning_rate_min)
+    let exponent = update.min(i32::MAX as usize) as i32;
+    (c.learning_rate * c.learning_rate_decay.powi(exponent)).max(c.learning_rate_min)
 }
 fn load_or_init(path: &str) -> io::Result<PolicyValueModel> {
     if Path::new(path).exists() {
