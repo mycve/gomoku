@@ -26,6 +26,7 @@ pub struct AsyncSelfplay {
     handles: Vec<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
     backlog: Arc<AtomicUsize>,
+    dropped: Arc<AtomicUsize>,
 }
 
 impl AsyncSelfplay {
@@ -40,6 +41,7 @@ impl AsyncSelfplay {
     ) -> Self {
         let (sender, receiver) = mpsc::sync_channel(queue_capacity.max(1));
         let backlog = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::with_capacity(workers);
         for worker in 0..workers {
             let sender = sender.clone();
@@ -47,6 +49,7 @@ impl AsyncSelfplay {
             let model_version = Arc::clone(&model_version);
             let stop = Arc::clone(&stop);
             let backlog = Arc::clone(&backlog);
+            let dropped = Arc::clone(&dropped);
             handles.push(thread::spawn(move || {
                 worker_loop(
                     worker,
@@ -54,6 +57,7 @@ impl AsyncSelfplay {
                     model_version,
                     stop,
                     backlog,
+                    dropped,
                     sender,
                     search,
                     seed,
@@ -66,6 +70,7 @@ impl AsyncSelfplay {
             handles,
             stop,
             backlog,
+            dropped,
         }
     }
 
@@ -88,6 +93,9 @@ impl AsyncSelfplay {
     pub fn backlog_counter(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.backlog)
     }
+    pub fn dropped(&self) -> usize {
+        self.dropped.load(Ordering::Relaxed)
+    }
 
     pub fn shutdown(self) -> io::Result<()> {
         self.stop.store(true, Ordering::Relaxed);
@@ -107,6 +115,7 @@ fn worker_loop(
     model_version: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     backlog: Arc<AtomicUsize>,
+    dropped: Arc<AtomicUsize>,
     sender: SyncSender<SelfplayGame>,
     search: SearchConfig,
     seed: u64,
@@ -135,6 +144,7 @@ fn worker_loop(
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 backlog.fetch_sub(1, Ordering::Relaxed);
+                dropped.fetch_add(1, Ordering::Relaxed);
             }
             Err(TrySendError::Disconnected(_)) => {
                 backlog.fetch_sub(1, Ordering::Relaxed);

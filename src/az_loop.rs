@@ -403,6 +403,134 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             event.actual_recent_rate,
             progress.update,
         );
+        let games = event.batch.games.max(1) as f32;
+        let searches = event.batch.stats.searches.max(1) as f32;
+        let sampled_moves = event.batch.stats.sampled_moves.max(1) as f32;
+        tb.add_scalar("train/learning_rate", event.learning_rate, progress.update);
+        tb.add_scalar("train/seconds", event.train_seconds, progress.update);
+        tb.add_scalar(
+            "train/samples_per_second",
+            event.train_stats.samples as f32 / event.train_seconds.max(1.0e-6),
+            progress.update,
+        );
+        tb.add_scalar(
+            "train/optimizer_steps",
+            event.train_stats.optimizer_steps as f32,
+            progress.update,
+        );
+        tb.add_scalar(
+            "train/samples",
+            event.train_stats.samples as f32,
+            progress.update,
+        );
+        tb.add_scalar("selfplay/games", event.batch.games as f32, progress.update);
+        tb.add_scalar(
+            "selfplay/samples",
+            event.batch.samples.len() as f32,
+            progress.update,
+        );
+        tb.add_scalar(
+            "selfplay/average_plies",
+            event.batch.stats.plies as f32 / games,
+            progress.update,
+        );
+        tb.add_scalar(
+            "selfplay/black_win_rate",
+            event.batch.stats.black_wins as f32 / games,
+            progress.update,
+        );
+        tb.add_scalar(
+            "selfplay/white_win_rate",
+            event.batch.stats.white_wins as f32 / games,
+            progress.update,
+        );
+        tb.add_scalar(
+            "selfplay/draw_rate",
+            event.batch.stats.draws as f32 / games,
+            progress.update,
+        );
+        tb.add_scalar(
+            "search/average_simulations",
+            event.batch.stats.simulations as f32 / searches,
+            progress.update,
+        );
+        tb.add_scalar(
+            "search/policy_entropy",
+            event.batch.stats.entropy_sum / searches,
+            progress.update,
+        );
+        tb.add_scalar(
+            "search/visited_actions",
+            event.batch.stats.visited_actions_sum as f32 / searches,
+            progress.update,
+        );
+        tb.add_scalar(
+            "search/policy_top1",
+            event.batch.stats.policy_top1_sum / searches,
+            progress.update,
+        );
+        tb.add_scalar(
+            "search/policy_top2",
+            event.batch.stats.policy_top2_sum / searches,
+            progress.update,
+        );
+        tb.add_scalar(
+            "search/temperature_best_move_rate",
+            event.batch.stats.sampled_best_moves as f32 / sampled_moves,
+            progress.update,
+        );
+        tb.add_scalar(
+            "search/temperature_q_gap",
+            event.batch.stats.sampled_q_gap_sum / sampled_moves,
+            progress.update,
+        );
+        tb.add_scalar(
+            "pipeline/active_workers",
+            event.batch.workers.len() as f32,
+            progress.update,
+        );
+        tb.add_scalar(
+            "pipeline/active_worker_rate",
+            event.batch.workers.len() as f32 / workers.max(1) as f32,
+            progress.update,
+        );
+        tb.add_scalar(
+            "pipeline/actor_backlog",
+            actors.backlog() as f32,
+            progress.update,
+        );
+        tb.add_scalar(
+            "pipeline/dropped_games_total",
+            actors.dropped() as f32,
+            progress.update,
+        );
+        tb.add_scalar(
+            "pipeline/model_version_lag",
+            progress
+                .update
+                .saturating_sub(event.batch.oldest_version as usize) as f32,
+            progress.update,
+        );
+        tb.add_scalar(
+            "replay/fill_rate",
+            event.pool_samples as f32 / config.replay_capacity.max(1) as f32,
+            progress.update,
+        );
+        tb.add_scalar(
+            "replay/train_samples",
+            event.train_samples as f32,
+            progress.update,
+        );
+        tb.add_scalar(
+            "progress/total_games",
+            progress.total_games as f32,
+            progress.update,
+        );
+        tb.add_scalar(
+            "progress/total_samples",
+            progress.total_samples as f32,
+            progress.update,
+        );
         if config.arena_interval > 0 && progress.update % config.arena_interval == 0 {
             println!(
                 "arena    : starting games={} simulations={} workers={}",
@@ -410,6 +538,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 config.arena_simulations,
                 rayon::current_num_threads().min(config.arena_games.max(1))
             );
+            let arena_started = Instant::now();
             let report = arena_controlled(
                 &event.model,
                 &best,
@@ -423,6 +552,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 },
                 Some(&stop),
             );
+            let arena_seconds = arena_started.elapsed().as_secs_f32();
             let promoted = report.score_rate() >= config.arena_promotion_rate;
             println!(
                 "arena    : W/L/D={}/{}/{} score={:.2}% elo={:+.1} promoted={}",
@@ -433,6 +563,57 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 report.elo_diff(),
                 promoted
             );
+            let arena_games = report.games().max(1) as f32;
+            tb.add_scalar("arena/score_rate", report.score_rate(), progress.update);
+            tb.add_scalar(
+                "arena/score_lower_bound_90",
+                report.score_rate_lower_bound(1.28),
+                progress.update,
+            );
+            tb.add_scalar(
+                "arena/score_standard_error",
+                report.score_rate_standard_error(),
+                progress.update,
+            );
+            tb.add_scalar("arena/elo_diff", report.elo_diff(), progress.update);
+            tb.add_scalar(
+                "arena/win_rate",
+                report.wins as f32 / arena_games,
+                progress.update,
+            );
+            tb.add_scalar(
+                "arena/loss_rate",
+                report.losses as f32 / arena_games,
+                progress.update,
+            );
+            tb.add_scalar(
+                "arena/draw_rate",
+                report.draws as f32 / arena_games,
+                progress.update,
+            );
+            tb.add_scalar("arena/seconds", arena_seconds, progress.update);
+            tb.add_scalar(
+                "arena/games_per_second",
+                report.games() as f32 / arena_seconds.max(1.0e-6),
+                progress.update,
+            );
+            tb.add_scalar("arena/promoted", f32::from(promoted), progress.update);
+            let black_games =
+                (report.wins_as_black + report.losses_as_black + report.draws_as_black).max(1)
+                    as f32;
+            let white_games =
+                (report.wins_as_white + report.losses_as_white + report.draws_as_white).max(1)
+                    as f32;
+            tb.add_scalar(
+                "arena/score_as_black",
+                (report.wins_as_black as f32 + report.draws_as_black as f32 * 0.5) / black_games,
+                progress.update,
+            );
+            tb.add_scalar(
+                "arena/score_as_white",
+                (report.wins_as_white as f32 + report.draws_as_white as f32 * 0.5) / white_games,
+                progress.update,
+            );
             if promoted {
                 best = event.model.clone();
                 best.save(&config.best_model_path)?;
@@ -442,6 +623,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 );
             }
         }
+        tb.flush();
         if progress.update >= end {
             stop.store(true, Ordering::SeqCst);
         }
