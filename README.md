@@ -19,6 +19,18 @@ cargo run -- az-arena-best model.safetensors best.safetensors 40 400
 cargo run -- play
 ```
 
+日常开发和训练部署可使用与 ChineseAI 相同的快速优化编译模式：
+
+```bash
+cargo build --profile fast
+./target/fast/gomoku az-loop
+# 或直接运行
+cargo run --profile fast -- az-loop
+```
+
+`fast` 继承 Release 优化，但使用 Thin LTO、16 个 codegen unit 和增量编译，明显缩短
+重复编译时间；最终性能测量或正式长期训练仍可使用 `--release` 的 Fat LTO 单元构建。
+
 人工评估默认在终端原位刷新，不会重复堆叠棋盘。对局中输入 `info` 查看 Best 上次
 搜索的候选着，输入 `help` 查看命令，输入 `quit` 退出；不支持 ANSI 的控制台可增加
 `--no-clear`。

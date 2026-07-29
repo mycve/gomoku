@@ -21,5 +21,12 @@ candle-core = { version = "0.10.2", features = ["accelerate", "metal"] }
 candle-core = { version = "0.10.2", features = ["cuda"] }
 
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
+panic = "abort"
+
+[profile.fast]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+incremental = true
