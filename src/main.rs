@@ -160,7 +160,7 @@ fn main() -> io::Result<()> {
             PolicyValueModel::random(args.hidden, args.seed).save(&args.output)?;
             println!("model    : initialized {}", args.output);
             println!(
-                "arch     : input=451 hidden={} rmsnorm policy=225 value=96x96xWDL3",
+                "arch     : input=451 hidden={} rmsnorm policy=225 value=96x96xWDL3 moves-left=96x1",
                 args.hidden
             );
             println!("board    : 15x15 freestyle gomoku");
@@ -182,6 +182,7 @@ fn main() -> io::Result<()> {
                     SearchConfig {
                         simulations: args.simulations,
                         cpuct: args.cpuct,
+                        ..Default::default()
                     },
                 );
             }
@@ -214,6 +215,7 @@ fn main() -> io::Result<()> {
                 args.learning_rate,
                 args.batch_size,
                 &args.gpu_devices,
+                0.1,
             )?;
             let seconds = started.elapsed().as_secs_f64();
             println!(
@@ -228,8 +230,8 @@ fn main() -> io::Result<()> {
                 (samples.len() * args.epochs) as f64 / seconds.max(1e-9)
             );
             println!(
-                "loss     : total={:.4} policy={:.4} value={:.4}",
-                stats.loss, stats.policy_loss, stats.value_loss
+                "loss     : total={:.4} policy={:.4} value={:.4} moves_left={:.4}",
+                stats.loss, stats.policy_loss, stats.value_loss, stats.moves_left_loss
             );
         }
         Some(Command::AzLoop(args)) => {
@@ -245,7 +247,7 @@ fn main() -> io::Result<()> {
             let best = load_model(&args.best)?;
             println!("best-eval: candidate={} best={}", args.candidate, args.best);
             println!(
-                "settings : games={} simulations={} cpuct={} confidence_z={}",
+                "settings : games={} simulations={} cpuct={} opening_random_plies=2 confidence_z={}",
                 args.games, args.simulations, args.cpuct, args.confidence_z
             );
             let started = Instant::now();
@@ -256,6 +258,9 @@ fn main() -> io::Result<()> {
                 SearchConfig {
                     simulations: args.simulations,
                     cpuct: args.cpuct,
+                    opening_random_plies: 2,
+                    opening_seed: 20260730,
+                    ..Default::default()
                 },
             );
             let seconds = started.elapsed().as_secs_f32();
@@ -322,7 +327,15 @@ fn board_from_moves(moves: &[String]) -> io::Result<Board> {
 
 fn print_search(board: &Board, model: &PolicyValueModel, simulations: usize, cpuct: f32) {
     let started = Instant::now();
-    let result = search(board, model, SearchConfig { simulations, cpuct });
+    let result = search(
+        board,
+        model,
+        SearchConfig {
+            simulations,
+            cpuct,
+            ..Default::default()
+        },
+    );
     println!(
         "search   : simulations={} elapsed={:.3}s",
         simulations,
@@ -452,7 +465,15 @@ fn human_evaluate_best(
         println!("best     : thinking...");
         io::stdout().flush()?;
         let started = Instant::now();
-        let result = search(&board, model, SearchConfig { simulations, cpuct });
+        let result = search(
+            &board,
+            model,
+            SearchConfig {
+                simulations,
+                cpuct,
+                ..Default::default()
+            },
+        );
         let Some(best) = result.first() else {
             println!("evaluation: DRAW");
             return Ok(());

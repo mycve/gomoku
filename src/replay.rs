@@ -11,6 +11,8 @@ pub struct Sample {
     pub board: Board,
     pub policy: Vec<(Move, f32)>,
     pub value: f32,
+    #[serde(default)]
+    pub moves_left: f32,
 }
 pub fn append(path: impl AsRef<Path>, samples: &[Sample]) -> io::Result<()> {
     if let Some(p) = path.as_ref().parent() {

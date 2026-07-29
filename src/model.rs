@@ -1,4 +1,4 @@
-use crate::game::{Board, CELL_COUNT, Move};
+use crate::game::{Board, CELL_COUNT, Move, Player};
 use candle_core::{DType, Device, Shape, Var};
 use candle_nn::VarMap;
 use std::{fs, io, path::Path};
@@ -7,12 +7,17 @@ pub const INPUT_SIZE: usize = CELL_COUNT * 2 + 1;
 pub const DEFAULT_HIDDEN_SIZE: usize = 192;
 pub const VALUE_HEAD_SIZE: usize = 96;
 pub const WDL_SIZE: usize = 3;
-const FORMAT_VERSION: f32 = 2.0;
+pub const STONE_TYPES: usize = 2;
+pub const AXIS_FEATURES: usize = STONE_TYPES * 15;
+const FORMAT_VERSION: f32 = 4.0;
 
 #[derive(Clone)]
 pub struct PolicyValueModel {
     pub hidden_size: usize,
     pub(crate) input_hidden: Vec<f32>,
+    pub(crate) stone_hidden: Vec<f32>,
+    pub(crate) rank_hidden: Vec<f32>,
+    pub(crate) file_hidden: Vec<f32>,
     pub(crate) hidden_bias: Vec<f32>,
     pub(crate) policy_hidden: Vec<f32>,
     pub(crate) policy_bias: Vec<f32>,
@@ -21,6 +26,15 @@ pub struct PolicyValueModel {
     pub(crate) value_head_hidden2: Vec<f32>,
     pub(crate) value_head_bias2: Vec<f32>,
     pub(crate) value_head_output: Vec<f32>,
+    pub(crate) moves_left_output: Vec<f32>,
+    pub(crate) moves_left_bias: Vec<f32>,
+}
+
+#[derive(Clone)]
+pub(crate) struct EvalAccumulator {
+    black: Vec<f32>,
+    white: Vec<f32>,
+    move_count: usize,
 }
 
 impl Default for PolicyValueModel {
@@ -50,6 +64,9 @@ impl PolicyValueModel {
         Self {
             hidden_size,
             input_hidden,
+            stone_hidden: vec![0.0; STONE_TYPES * hidden_size],
+            rank_hidden: vec![0.0; AXIS_FEATURES * hidden_size],
+            file_hidden: vec![0.0; AXIS_FEATURES * hidden_size],
             hidden_bias: vec![0.0; hidden_size],
             policy_hidden,
             policy_bias,
@@ -62,11 +79,35 @@ impl PolicyValueModel {
                 .collect(),
             value_head_bias2: vec![0.0; VALUE_HEAD_SIZE],
             value_head_output: vec![0.0; VALUE_HEAD_SIZE * WDL_SIZE],
+            moves_left_output: vec![0.0; VALUE_HEAD_SIZE],
+            moves_left_bias: vec![0.0],
         }
     }
 
     pub fn evaluate(&self, board: &Board) -> (Vec<(Move, f32)>, f32) {
-        let hidden = self.hidden(board);
+        let accumulator = self.accumulator(board);
+        self.evaluate_accumulator(board, &accumulator)
+    }
+
+    pub(crate) fn evaluate_accumulator(
+        &self,
+        board: &Board,
+        accumulator: &EvalAccumulator,
+    ) -> (Vec<(Move, f32)>, f32) {
+        self.evaluate_accumulator_with_temperature(board, accumulator, 1.0)
+    }
+
+    pub(crate) fn evaluate_accumulator_with_temperature(
+        &self,
+        board: &Board,
+        accumulator: &EvalAccumulator,
+        policy_temperature: f32,
+    ) -> (Vec<(Move, f32)>, f32) {
+        debug_assert_eq!(accumulator.move_count, board.move_count());
+        let hidden = self.activate_hidden(match board.to_move() {
+            Player::Black => &accumulator.black,
+            Player::White => &accumulator.white,
+        });
         let moves = board.legal_moves();
         if moves.is_empty() {
             return (Vec::new(), 0.0);
@@ -76,10 +117,18 @@ impl PolicyValueModel {
             .map(|m| self.policy_logit(&hidden, m.0))
             .collect();
         let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let sum: f32 = logits.iter().map(|x| (x - max).exp()).sum();
+        let inverse_temperature = policy_temperature.max(1e-3).recip();
+        let sum: f32 = logits
+            .iter()
+            .map(|x| ((x - max) * inverse_temperature).exp())
+            .sum();
         let policy = moves
             .into_iter()
-            .zip(logits.into_iter().map(|x| (x - max).exp() / sum))
+            .zip(
+                logits
+                    .into_iter()
+                    .map(|x| ((x - max) * inverse_temperature).exp() / sum),
+            )
             .collect();
         let mut v1 = self.value_head_bias.clone();
         for h in 0..self.hidden_size {
@@ -112,14 +161,74 @@ impl PolicyValueModel {
         (policy, value)
     }
 
-    fn hidden(&self, board: &Board) -> Vec<f32> {
-        let mut hidden = self.hidden_bias.clone();
-        for (feature, x) in active_features(board) {
-            let offset = feature * self.hidden_size;
+    pub(crate) fn accumulator(&self, board: &Board) -> EvalAccumulator {
+        let mut accumulator = EvalAccumulator {
+            black: self.hidden_bias.clone(),
+            white: self.hidden_bias.clone(),
+            move_count: 0,
+        };
+        for (sq, &stone) in board.cells().iter().enumerate() {
+            if stone == 0 {
+                continue;
+            }
+            self.add_stone(
+                &mut accumulator,
+                Move(sq),
+                if stone == Player::Black.stone() {
+                    Player::Black
+                } else {
+                    Player::White
+                },
+            );
+        }
+        self.set_move_count(&mut accumulator, board.move_count());
+        accumulator
+    }
+
+    pub(crate) fn accumulator_after_move(
+        &self,
+        parent: &EvalAccumulator,
+        mv: Move,
+        player: Player,
+    ) -> EvalAccumulator {
+        let mut child = parent.clone();
+        self.add_stone(&mut child, mv, player);
+        self.set_move_count(&mut child, parent.move_count + 1);
+        child
+    }
+
+    fn add_stone(&self, accumulator: &mut EvalAccumulator, mv: Move, player: Player) {
+        for (perspective, hidden) in [
+            (Player::Black, &mut accumulator.black),
+            (Player::White, &mut accumulator.white),
+        ] {
+            let side = usize::from(player != perspective);
+            let exact = (side * CELL_COUNT + mv.0) * self.hidden_size;
+            let rank = (side * 15 + mv.row()) * self.hidden_size;
+            let file = (side * 15 + mv.col()) * self.hidden_size;
+            let stone = side * self.hidden_size;
             for h in 0..self.hidden_size {
-                hidden[h] += self.input_hidden[offset + h] * x;
+                hidden[h] += self.input_hidden[exact + h]
+                    + self.stone_hidden[stone + h]
+                    + self.rank_hidden[rank + h]
+                    + self.file_hidden[file + h];
             }
         }
+    }
+
+    fn set_move_count(&self, accumulator: &mut EvalAccumulator, move_count: usize) {
+        let delta = (move_count as f32 - accumulator.move_count as f32) / CELL_COUNT as f32;
+        let rule_offset = (INPUT_SIZE - 1) * self.hidden_size;
+        for h in 0..self.hidden_size {
+            let change = self.input_hidden[rule_offset + h] * delta;
+            accumulator.black[h] += change;
+            accumulator.white[h] += change;
+        }
+        accumulator.move_count = move_count;
+    }
+
+    fn activate_hidden(&self, preactivation: &[f32]) -> Vec<f32> {
+        let mut hidden = preactivation.to_vec();
         for x in &mut hidden {
             *x = x.max(0.0);
         }
@@ -149,6 +258,24 @@ impl PolicyValueModel {
             "input_hidden",
             &self.input_hidden,
             (INPUT_SIZE, self.hidden_size),
+        )?;
+        insert(
+            &vars,
+            "stone_hidden",
+            &self.stone_hidden,
+            (STONE_TYPES, self.hidden_size),
+        )?;
+        insert(
+            &vars,
+            "rank_hidden",
+            &self.rank_hidden,
+            (AXIS_FEATURES, self.hidden_size),
+        )?;
+        insert(
+            &vars,
+            "file_hidden",
+            &self.file_hidden,
+            (AXIS_FEATURES, self.hidden_size),
         )?;
         insert(&vars, "hidden_bias", &self.hidden_bias, (self.hidden_size,))?;
         insert(
@@ -188,6 +315,13 @@ impl PolicyValueModel {
             &self.value_head_output,
             (VALUE_HEAD_SIZE, WDL_SIZE),
         )?;
+        insert(
+            &vars,
+            "moves_left_output",
+            &self.moves_left_output,
+            (VALUE_HEAD_SIZE, 1),
+        )?;
+        insert(&vars, "moves_left_bias", &self.moves_left_bias, (1,))?;
         vars.save(path).map_err(candle_error)
     }
 
@@ -207,6 +341,9 @@ impl PolicyValueModel {
         let model = Self {
             hidden_size,
             input_hidden: load(&tensors, "input_hidden")?,
+            stone_hidden: load(&tensors, "stone_hidden")?,
+            rank_hidden: load(&tensors, "rank_hidden")?,
+            file_hidden: load(&tensors, "file_hidden")?,
             hidden_bias,
             policy_hidden: load(&tensors, "policy_hidden")?,
             policy_bias: load(&tensors, "policy_bias")?,
@@ -215,8 +352,13 @@ impl PolicyValueModel {
             value_head_hidden2: load(&tensors, "value_head_hidden2")?,
             value_head_bias2: load(&tensors, "value_head_bias2")?,
             value_head_output: load(&tensors, "value_head_output")?,
+            moves_left_output: load(&tensors, "moves_left_output")?,
+            moves_left_bias: load(&tensors, "moves_left_bias")?,
         };
         if model.input_hidden.len() != INPUT_SIZE * hidden_size
+            || model.stone_hidden.len() != STONE_TYPES * hidden_size
+            || model.rank_hidden.len() != AXIS_FEATURES * hidden_size
+            || model.file_hidden.len() != AXIS_FEATURES * hidden_size
             || model.policy_hidden.len() != CELL_COUNT * hidden_size
             || model.policy_bias.len() != CELL_COUNT
             || model.value_head_hidden.len() != hidden_size * VALUE_HEAD_SIZE
@@ -224,6 +366,8 @@ impl PolicyValueModel {
             || model.value_head_hidden2.len() != VALUE_HEAD_SIZE * VALUE_HEAD_SIZE
             || model.value_head_bias2.len() != VALUE_HEAD_SIZE
             || model.value_head_output.len() != VALUE_HEAD_SIZE * WDL_SIZE
+            || model.moves_left_output.len() != VALUE_HEAD_SIZE
+            || model.moves_left_bias.len() != 1
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -232,23 +376,32 @@ impl PolicyValueModel {
         }
         Ok(model)
     }
-}
 
-fn active_features(board: &Board) -> Vec<(usize, f32)> {
-    let us = board.to_move().stone();
-    let mut out = Vec::with_capacity(board.move_count() + 1);
-    for (sq, &stone) in board.cells().iter().enumerate() {
-        if stone == us {
-            out.push((sq, 1.0));
-        } else if stone == -us {
-            out.push((CELL_COUNT + sq, 1.0));
+    pub fn update_ema(&mut self, online: &Self, decay: f32) {
+        let decay = decay.clamp(0.0, 1.0);
+        let keep = 1.0 - decay;
+        macro_rules! blend {
+            ($field:ident) => {
+                for (ema, current) in self.$field.iter_mut().zip(&online.$field) {
+                    *ema = decay * *ema + keep * *current;
+                }
+            };
         }
+        blend!(input_hidden);
+        blend!(stone_hidden);
+        blend!(rank_hidden);
+        blend!(file_hidden);
+        blend!(hidden_bias);
+        blend!(policy_hidden);
+        blend!(policy_bias);
+        blend!(value_head_hidden);
+        blend!(value_head_bias);
+        blend!(value_head_hidden2);
+        blend!(value_head_bias2);
+        blend!(value_head_output);
+        blend!(moves_left_output);
+        blend!(moves_left_bias);
     }
-    out.push((
-        INPUT_SIZE - 1,
-        board.move_count() as f32 / CELL_COUNT as f32,
-    ));
-    out
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
@@ -290,5 +443,21 @@ impl SplitMix64 {
     }
     fn weight(&mut self, scale: f32) -> f32 {
         ((self.next() >> 40) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0) * scale
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ema_blends_every_parameter_group() {
+        let online = PolicyValueModel::random(8, 2);
+        let mut ema = PolicyValueModel::random(8, 1);
+        let before = ema.policy_bias[0];
+        ema.update_ema(&online, 0.75);
+        let expected = before * 0.75 + online.policy_bias[0] * 0.25;
+        assert!((ema.policy_bias[0] - expected).abs() < 1e-6);
+        assert_eq!(ema.moves_left_output.len(), VALUE_HEAD_SIZE);
     }
 }

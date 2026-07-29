@@ -1,6 +1,6 @@
 use crate::{
     game::CELL_COUNT,
-    model::{INPUT_SIZE, PolicyValueModel, VALUE_HEAD_SIZE, WDL_SIZE},
+    model::{AXIS_FEATURES, INPUT_SIZE, PolicyValueModel, STONE_TYPES, VALUE_HEAD_SIZE, WDL_SIZE},
     replay::Sample,
     selfplay::TrainStats,
 };
@@ -27,6 +27,7 @@ pub fn train(
     learning_rate: f32,
     batch_size: usize,
     requested_devices: &[usize],
+    moves_left_loss_weight: f32,
 ) -> io::Result<TrainStats> {
     if samples.is_empty() || epochs == 0 || learning_rate <= 0.0 {
         return Ok(TrainStats::default());
@@ -59,7 +60,9 @@ pub fn train(
                     .enumerate()
                     .map(|(rank, shard)| {
                         let replica = &replicas[rank];
-                        scope.spawn(move || replica.backward(shard, batch.len()))
+                        scope.spawn(move || {
+                            replica.backward(shard, batch.len(), moves_left_loss_weight)
+                        })
                     })
                     .collect::<Vec<_>>();
                 handles
@@ -73,13 +76,16 @@ pub fn train(
             stats.samples += primary.samples;
             stats.policy_loss += primary.policy_sum;
             stats.value_loss += primary.value_sum;
+            stats.moves_left_loss += primary.moves_left_sum;
             for output in outputs {
                 add_cpu_grads(&primary_vars, &mut primary_grads, &output.cpu_grads)?;
                 stats.samples += output.samples;
                 stats.policy_loss += output.policy_sum;
                 stats.value_loss += output.value_sum;
+                stats.moves_left_loss += output.moves_left_sum;
             }
             optimizer.step(&primary_grads).map_err(err)?;
+            stats.optimizer_steps += 1;
             broadcast(&replicas)?;
         }
     }
@@ -87,13 +93,18 @@ pub fn train(
     let count = stats.samples.max(1) as f32;
     stats.policy_loss /= count;
     stats.value_loss /= count;
-    stats.loss = stats.policy_loss + stats.value_loss;
+    stats.moves_left_loss /= count;
+    stats.loss =
+        stats.policy_loss + stats.value_loss + moves_left_loss_weight * stats.moves_left_loss;
     Ok(stats)
 }
 
 struct Replica {
     device: Device,
     input_hidden: Var,
+    stone_hidden: Var,
+    rank_hidden: Var,
+    file_hidden: Var,
     hidden_bias: Var,
     policy_hidden: Var,
     policy_bias: Var,
@@ -102,6 +113,8 @@ struct Replica {
     value_head_hidden2: Var,
     value_head_bias2: Var,
     value_head_output: Var,
+    moves_left_output: Var,
+    moves_left_bias: Var,
 }
 impl Replica {
     fn new(model: &PolicyValueModel, device: &Device) -> io::Result<Self> {
@@ -109,6 +122,9 @@ impl Replica {
         Ok(Self {
             device: device.clone(),
             input_hidden: var(&model.input_hidden, (INPUT_SIZE, h), device)?,
+            stone_hidden: var(&model.stone_hidden, (STONE_TYPES, h), device)?,
+            rank_hidden: var(&model.rank_hidden, (AXIS_FEATURES, h), device)?,
+            file_hidden: var(&model.file_hidden, (AXIS_FEATURES, h), device)?,
             hidden_bias: var(&model.hidden_bias, (h,), device)?,
             policy_hidden: var(&model.policy_hidden, (CELL_COUNT, h), device)?,
             policy_bias: var(&model.policy_bias, (CELL_COUNT,), device)?,
@@ -125,11 +141,16 @@ impl Replica {
                 (VALUE_HEAD_SIZE, WDL_SIZE),
                 device,
             )?,
+            moves_left_output: var(&model.moves_left_output, (VALUE_HEAD_SIZE, 1), device)?,
+            moves_left_bias: var(&model.moves_left_bias, (1,), device)?,
         })
     }
     fn vars(&self) -> Vec<Var> {
         vec![
             self.input_hidden.clone(),
+            self.stone_hidden.clone(),
+            self.rank_hidden.clone(),
+            self.file_hidden.clone(),
             self.hidden_bias.clone(),
             self.policy_hidden.clone(),
             self.policy_bias.clone(),
@@ -138,20 +159,38 @@ impl Replica {
             self.value_head_hidden2.clone(),
             self.value_head_bias2.clone(),
             self.value_head_output.clone(),
+            self.moves_left_output.clone(),
+            self.moves_left_bias.clone(),
         ]
     }
-    fn backward(&self, samples: &[Sample], global_len: usize) -> io::Result<ShardOutput> {
+    fn backward(
+        &self,
+        samples: &[Sample],
+        global_len: usize,
+        moves_left_loss_weight: f32,
+    ) -> io::Result<ShardOutput> {
         let packed = pack(samples);
         let b = samples.len();
         let inputs = Tensor::from_vec(packed.inputs, (b, INPUT_SIZE), &self.device).map_err(err)?;
+        let stone_counts =
+            Tensor::from_vec(packed.stone_counts, (b, STONE_TYPES), &self.device).map_err(err)?;
+        let rank_counts =
+            Tensor::from_vec(packed.rank_counts, (b, AXIS_FEATURES), &self.device).map_err(err)?;
+        let file_counts =
+            Tensor::from_vec(packed.file_counts, (b, AXIS_FEATURES), &self.device).map_err(err)?;
         let targets =
             Tensor::from_vec(packed.policy_targets, (b, CELL_COUNT), &self.device).map_err(err)?;
         let masks =
             Tensor::from_vec(packed.policy_masks, (b, CELL_COUNT), &self.device).map_err(err)?;
         let value_wdl =
             Tensor::from_vec(packed.value_wdl, (b, WDL_SIZE), &self.device).map_err(err)?;
+        let moves_left_targets =
+            Tensor::from_vec(packed.moves_left, (b, 1), &self.device).map_err(err)?;
         let hidden = inputs
             .matmul(&self.input_hidden)
+            .and_then(|x| x.add(&stone_counts.matmul(&self.stone_hidden)?))
+            .and_then(|x| x.add(&rank_counts.matmul(&self.rank_hidden)?))
+            .and_then(|x| x.add(&file_counts.matmul(&self.file_hidden)?))
             .and_then(|x| x.broadcast_add(&self.hidden_bias))
             .and_then(|x| x.relu())
             .map_err(err)?;
@@ -173,14 +212,16 @@ impl Replica {
             .and_then(|x| x.sum_all())
             .and_then(|x| x.affine(-1.0, 0.0))
             .map_err(err)?;
-        let value_logits = hidden
+        let value_features = hidden
             .matmul(&self.value_head_hidden)
             .and_then(|x| x.broadcast_add(&self.value_head_bias))
             .and_then(|x| x.relu())
             .and_then(|x| x.matmul(&self.value_head_hidden2))
             .and_then(|x| x.broadcast_add(&self.value_head_bias2))
             .and_then(|x| x.relu())
-            .and_then(|x| x.matmul(&self.value_head_output))
+            .map_err(err)?;
+        let value_logits = value_features
+            .matmul(&self.value_head_output)
             .map_err(err)?;
         let value_log_probs = log_softmax(&value_logits, 1).map_err(err)?;
         let value_sum_tensor = value_wdl
@@ -188,12 +229,21 @@ impl Replica {
             .and_then(|x| x.sum_all())
             .and_then(|x| x.affine(-1.0, 0.0))
             .map_err(err)?;
+        let moves_left_sum_tensor = value_features
+            .matmul(&self.moves_left_output)
+            .and_then(|x| x.broadcast_add(&self.moves_left_bias))
+            .and_then(|x| x.sub(&moves_left_targets))
+            .and_then(|x| x.sqr())
+            .and_then(|x| x.sum_all())
+            .map_err(err)?;
         let loss = policy_sum_tensor
             .add(&value_sum_tensor)
+            .and_then(|x| x.add(&moves_left_sum_tensor.affine(moves_left_loss_weight as f64, 0.0)?))
             .and_then(|x| x.affine(1.0 / global_len as f64, 0.0))
             .map_err(err)?;
         let policy_sum = policy_sum_tensor.to_scalar::<f32>().map_err(err)?;
         let value_sum = value_sum_tensor.to_scalar::<f32>().map_err(err)?;
+        let moves_left_sum = moves_left_sum_tensor.to_scalar::<f32>().map_err(err)?;
         let grads = loss.backward().map_err(err)?;
         let cpu_grads = self
             .vars()
@@ -216,6 +266,7 @@ impl Replica {
             samples: b,
             policy_sum,
             value_sum,
+            moves_left_sum,
         })
     }
     fn cpu_values(&self) -> io::Result<Vec<Vec<f32>>> {
@@ -242,14 +293,19 @@ impl Replica {
     fn copy_to(&self, m: &mut PolicyValueModel) -> io::Result<()> {
         let v = self.cpu_values()?;
         m.input_hidden = v[0].clone();
-        m.hidden_bias = v[1].clone();
-        m.policy_hidden = v[2].clone();
-        m.policy_bias = v[3].clone();
-        m.value_head_hidden = v[4].clone();
-        m.value_head_bias = v[5].clone();
-        m.value_head_hidden2 = v[6].clone();
-        m.value_head_bias2 = v[7].clone();
-        m.value_head_output = v[8].clone();
+        m.stone_hidden = v[1].clone();
+        m.rank_hidden = v[2].clone();
+        m.file_hidden = v[3].clone();
+        m.hidden_bias = v[4].clone();
+        m.policy_hidden = v[5].clone();
+        m.policy_bias = v[6].clone();
+        m.value_head_hidden = v[7].clone();
+        m.value_head_bias = v[8].clone();
+        m.value_head_hidden2 = v[9].clone();
+        m.value_head_bias2 = v[10].clone();
+        m.value_head_output = v[11].clone();
+        m.moves_left_output = v[12].clone();
+        m.moves_left_bias = v[13].clone();
         Ok(())
     }
 }
@@ -259,6 +315,7 @@ struct ShardOutput {
     samples: usize,
     policy_sum: f32,
     value_sum: f32,
+    moves_left_sum: f32,
 }
 fn add_cpu_grads(vars: &[Var], grads: &mut GradStore, cpu: &[Option<Vec<f32>>]) -> io::Result<()> {
     for (var, data) in vars.iter().zip(cpu) {
@@ -358,22 +415,36 @@ fn auto_cuda_ids() -> Vec<usize> {
 
 struct Packed {
     inputs: Vec<f32>,
+    stone_counts: Vec<f32>,
+    rank_counts: Vec<f32>,
+    file_counts: Vec<f32>,
     policy_targets: Vec<f32>,
     policy_masks: Vec<f32>,
     value_wdl: Vec<f32>,
+    moves_left: Vec<f32>,
 }
 fn pack(samples: &[Sample]) -> Packed {
     let mut inputs = vec![0.0; samples.len() * INPUT_SIZE];
+    let mut stone_counts = vec![0.0; samples.len() * STONE_TYPES];
+    let mut rank_counts = vec![0.0; samples.len() * AXIS_FEATURES];
+    let mut file_counts = vec![0.0; samples.len() * AXIS_FEATURES];
     let mut targets = vec![0.0; samples.len() * CELL_COUNT];
     let mut masks = vec![-1e9; samples.len() * CELL_COUNT];
     let mut value_wdl = Vec::with_capacity(samples.len() * WDL_SIZE);
+    let mut moves_left = Vec::with_capacity(samples.len());
     for (row, s) in samples.iter().enumerate() {
         let us = s.board.to_move().stone();
         for (sq, &stone) in s.board.cells().iter().enumerate() {
             if stone == us {
-                inputs[row * INPUT_SIZE + sq] = 1.0
+                inputs[row * INPUT_SIZE + sq] = 1.0;
+                stone_counts[row * STONE_TYPES] += 1.0;
+                rank_counts[row * AXIS_FEATURES + sq / 15] += 1.0;
+                file_counts[row * AXIS_FEATURES + sq % 15] += 1.0;
             } else if stone == -us {
-                inputs[row * INPUT_SIZE + CELL_COUNT + sq] = 1.0
+                inputs[row * INPUT_SIZE + CELL_COUNT + sq] = 1.0;
+                stone_counts[row * STONE_TYPES + 1] += 1.0;
+                rank_counts[row * AXIS_FEATURES + 15 + sq / 15] += 1.0;
+                file_counts[row * AXIS_FEATURES + 15 + sq % 15] += 1.0;
             }
         }
         inputs[row * INPUT_SIZE + INPUT_SIZE - 1] = s.board.move_count() as f32 / CELL_COUNT as f32;
@@ -393,12 +464,17 @@ fn pack(samples: &[Sample]) -> Packed {
         } else {
             &[0.0, 1.0, 0.0]
         });
+        moves_left.push((s.moves_left / CELL_COUNT as f32).clamp(0.0, 1.0));
     }
     Packed {
         inputs,
+        stone_counts,
+        rank_counts,
+        file_counts,
         policy_targets: targets,
         policy_masks: masks,
         value_wdl,
+        moves_left,
     }
 }
 fn var(data: &[f32], shape: impl Into<candle_core::Shape>, device: &Device) -> io::Result<Var> {
@@ -406,4 +482,25 @@ fn var(data: &[f32], shape: impl Into<candle_core::Shape>, device: &Device) -> i
 }
 fn err(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game::{Board, Move};
+
+    #[test]
+    fn trains_moves_left_head_on_available_device() {
+        let mut model = PolicyValueModel::random(16, 9);
+        let sample = Sample {
+            board: Board::new(),
+            policy: vec![(Move::new(7, 7).unwrap(), 1.0)],
+            value: 0.0,
+            moves_left: 20.0,
+        };
+        let stats = train(&mut model, &[sample], 1, 1e-3, 1, &[], 0.1).unwrap();
+        assert_eq!(stats.optimizer_steps, 1);
+        assert!(stats.moves_left_loss.is_finite());
+        assert!(stats.moves_left_loss > 0.0);
+    }
 }

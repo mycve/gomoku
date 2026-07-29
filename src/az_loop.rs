@@ -42,6 +42,7 @@ struct PendingBatch {
 
 struct TrainerEvent {
     model: PolicyValueModel,
+    online_model: PolicyValueModel,
     batch: PendingBatch,
     train_stats: crate::selfplay::TrainStats,
     train_seconds: f32,
@@ -55,11 +56,16 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst)).map_err(io::Error::other)?;
     let mut progress = load_progress(&config.progress_path)?;
     let initial_model = load_or_init(&config.model_path)?;
+    let initial_ema = if Path::new(&config.ema_model_path).exists() {
+        PolicyValueModel::load(&config.ema_model_path)?
+    } else {
+        initial_model.clone()
+    };
     let mut best = if Path::new(&config.best_model_path).exists() {
         PolicyValueModel::load(&config.best_model_path)?
     } else {
-        initial_model.save(&config.best_model_path)?;
-        initial_model.clone()
+        initial_ema.save(&config.best_model_path)?;
+        initial_ema.clone()
     };
     let workers = if config.selfplay_workers == 0 {
         thread::available_parallelism()
@@ -73,7 +79,24 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     } else {
         config.selfplay_queue_capacity.max(1)
     };
-    let published = Arc::new(RwLock::new(initial_model.clone()));
+    println!(
+        "explore  : temp={:.2}->{:.2} delay={} decay={} value_cutoff={:.2} visit_offset={:.2}",
+        config.temperature_start,
+        config.temperature_endgame,
+        config.temperature_decay_delay_plies,
+        config.temperature_decay_plies,
+        config.temperature_value_cutoff,
+        config.temperature_visit_offset
+    );
+    println!(
+        "priors   : softmax_temp={:.2} root_noise(alpha={:.2}, fraction={:.2})",
+        config.policy_softmax_temp, config.root_dirichlet_alpha, config.root_exploration_fraction
+    );
+    println!(
+        "aux      : moves_left_weight={:.3} ema_decay={:.6} ema_model={}",
+        config.moves_left_loss_weight, config.ema_decay, config.ema_model_path
+    );
+    let published = Arc::new(RwLock::new(initial_ema.clone()));
     let version = Arc::new(AtomicU64::new(progress.update as u64));
     let mut actors = AsyncSelfplay::start(
         Arc::clone(&published),
@@ -84,6 +107,16 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         SearchConfig {
             simulations: config.simulations,
             cpuct: config.cpuct,
+            root_dirichlet_alpha: config.root_dirichlet_alpha,
+            root_exploration_fraction: config.root_exploration_fraction,
+            policy_softmax_temp: config.policy_softmax_temp,
+            temperature_start: config.temperature_start,
+            temperature_endgame: config.temperature_endgame,
+            temperature_decay_delay_plies: config.temperature_decay_delay_plies,
+            temperature_decay_plies: config.temperature_decay_plies,
+            temperature_value_cutoff: config.temperature_value_cutoff,
+            temperature_visit_offset: config.temperature_visit_offset,
+            ..Default::default()
         },
         config.seed,
     );
@@ -127,6 +160,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     let start_update = progress.update;
     let trainer = thread::spawn(move || -> io::Result<()> {
         let mut model = initial_model;
+        let mut ema_model = initial_ema;
         let mut pool = replay::load(&trainer_config.replay_path)?;
         let mut index = 0usize;
         while let Ok(batch) = ready_rx.recv() {
@@ -147,12 +181,19 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 lr,
                 trainer_config.batch_size,
                 &trainer_config.gpu_devices,
+                trainer_config.moves_left_loss_weight,
             )?;
+            let effective_decay = trainer_config
+                .ema_decay
+                .clamp(0.0, 1.0)
+                .powi(train_stats.optimizer_steps.min(i32::MAX as usize) as i32);
+            ema_model.update_ema(&model, effective_decay);
             let train_seconds = started.elapsed().as_secs_f32();
             replay::save(&trainer_config.replay_path, &pool)?;
             if event_tx
                 .send(TrainerEvent {
-                    model: model.clone(),
+                    model: ema_model.clone(),
+                    online_model: model.clone(),
                     batch,
                     train_stats,
                     train_seconds,
@@ -170,13 +211,14 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     let train_devices = candle_train::training_device_names(&config.gpu_devices)?.join(",");
     let end = target_update.unwrap_or(usize::MAX);
     println!(
-        "loop     : mode=batch-async actors={} actor_queue={} collector_queue=1 trainer_queue=2 games/update={} sims={} train_device={} batch={}",
+        "loop     : mode=batch-async actors={} actor_queue={} collector_queue=1 trainer_queue=2 games/update={} sims={} train_device={} batch={} arena_opening_plies={}",
         workers,
         queue_capacity,
         config.games_per_update,
         config.simulations,
         train_devices,
-        config.batch_size
+        config.batch_size,
+        config.arena_opening_plies
     );
     let mut tb = SummaryWriter::new(&config.tensorboard_logdir);
     'main: while progress.update < end && !stop.load(Ordering::SeqCst) {
@@ -196,7 +238,8 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         progress.learning_rate = event.learning_rate;
         *published.write().unwrap_or_else(|e| e.into_inner()) = event.model.clone();
         version.store(progress.update as u64, Ordering::Release);
-        event.model.save(&config.model_path)?;
+        event.online_model.save(&config.model_path)?;
+        event.model.save(&config.ema_model_path)?;
         save_progress(&config.progress_path, &progress)?;
         let checkpoint = if config.checkpoint_interval > 0
             && progress.update % config.checkpoint_interval == 0
@@ -227,6 +270,11 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             event.train_stats.value_loss,
             progress.update,
         );
+        tb.add_scalar(
+            "train/moves_left_loss",
+            event.train_stats.moves_left_loss,
+            progress.update,
+        );
         tb.add_scalar("replay/samples", event.pool_samples as f32, progress.update);
         if config.arena_interval > 0 && progress.update % config.arena_interval == 0 {
             let report = arena(
@@ -236,6 +284,9 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 SearchConfig {
                     simulations: config.arena_simulations,
                     cpuct: config.cpuct,
+                    opening_random_plies: config.arena_opening_plies,
+                    opening_seed: config.seed ^ progress.update as u64,
+                    ..Default::default()
                 },
             );
             let promoted = report.score_rate() >= config.arena_promotion_rate;
@@ -251,6 +302,10 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             if promoted {
                 best = event.model.clone();
                 best.save(&config.best_model_path)?;
+                println!(
+                    "promote  : best={} model_version={}",
+                    config.best_model_path, progress.update
+                );
             }
         }
     }
@@ -327,13 +382,15 @@ fn print_event(
         event.pool_samples as f32 * 100.0 / config.replay_capacity.max(1) as f32
     );
     println!(
-        "train    : device={} samples={} lr={:.6} loss={:.4} policy={:.4} value={:.4} time={:.2}s sps={:.1}",
+        "train    : device={} samples={} steps={} lr={:.6} loss={:.4} policy={:.4} value={:.4} moves_left={:.4} time={:.2}s sps={:.1}",
         device,
         event.train_stats.samples,
+        event.train_stats.optimizer_steps,
         event.learning_rate,
         event.train_stats.loss,
         event.train_stats.policy_loss,
         event.train_stats.value_loss,
+        event.train_stats.moves_left_loss,
         event.train_seconds,
         event.train_stats.samples as f32 / event.train_seconds.max(1e-6)
     );

@@ -71,7 +71,9 @@ pub fn generate_one_detailed(
         ..Default::default()
     };
     while board.outcome().is_none() {
-        let c = search(&board, model, cfg);
+        let mut ply_cfg = cfg;
+        ply_cfg.root_noise_seed = seed ^ board.move_count() as u64;
+        let c = search(&board, model, ply_cfg);
         if c.is_empty() {
             break;
         }
@@ -94,12 +96,15 @@ pub fn generate_one_detailed(
         stats.visited_actions_sum += c.iter().filter(|x| x.visits > 0).count();
         stats.policy_top1_sum += top[0];
         stats.policy_top2_sum += top[0] + top[1];
-        let mv = if board.move_count() < 12 {
-            sample(&c, &mut seed)
-        } else {
-            c[0].mv
-        };
-        if board.move_count() < 12 {
+        let temperature = temperature_for_ply(cfg, board.move_count());
+        let mv = sample_with_temperature(
+            &c,
+            temperature,
+            cfg.temperature_value_cutoff,
+            cfg.temperature_visit_offset,
+            &mut seed,
+        );
+        if temperature > 1e-6 {
             stats.sampled_moves += 1;
             stats.sampled_best_moves += usize::from(mv == c[0].mv);
             let played_q = c.iter().find(|x| x.mv == mv).map(|x| x.q).unwrap_or(0.0);
@@ -109,6 +114,7 @@ pub fn generate_one_detailed(
             board: board.clone(),
             policy,
             value: 0.0,
+            moves_left: 0.0,
         });
         board.play(mv);
     }
@@ -119,7 +125,8 @@ pub fn generate_one_detailed(
         Some(Outcome::Win(crate::game::Player::White)) => stats.white_wins = 1,
         _ => stats.draws = 1,
     }
-    for s in &mut samples {
+    let game_len = samples.len();
+    for (index, s) in samples.iter_mut().enumerate() {
         s.value = match out {
             Some(Outcome::Draw) | None => 0.0,
             Some(Outcome::Win(p)) => {
@@ -129,19 +136,63 @@ pub fn generate_one_detailed(
                     -1.0
                 }
             }
-        }
+        };
+        s.moves_left = game_len.saturating_sub(index).max(1) as f32;
     }
     GeneratedGame { samples, stats }
 }
-fn sample(c: &[crate::mcts::Candidate], seed: &mut u64) -> crate::game::Move {
+fn temperature_for_ply(cfg: SearchConfig, ply: usize) -> f32 {
+    if ply < cfg.temperature_decay_delay_plies {
+        return cfg.temperature_start;
+    }
+    if cfg.temperature_decay_plies == 0 {
+        return cfg.temperature_endgame;
+    }
+    let decay_ply = ply.saturating_sub(cfg.temperature_decay_delay_plies);
+    if decay_ply >= cfg.temperature_decay_plies {
+        return cfg.temperature_endgame;
+    }
+    let progress = decay_ply as f32 / cfg.temperature_decay_plies as f32;
+    cfg.temperature_start + (cfg.temperature_endgame - cfg.temperature_start) * progress
+}
+
+fn sample_with_temperature(
+    c: &[crate::mcts::Candidate],
+    temperature: f32,
+    value_cutoff: f32,
+    visit_offset: f32,
+    seed: &mut u64,
+) -> crate::game::Move {
+    if temperature <= 1e-6 {
+        return c[0].mv;
+    }
+    let anchor_q = c
+        .iter()
+        .max_by(|a, b| {
+            (a.visits as f32 + visit_offset).total_cmp(&(b.visits as f32 + visit_offset))
+        })
+        .map(|x| x.q)
+        .unwrap_or(0.0);
+    let min_q = anchor_q - 2.0 * value_cutoff;
+    let weights = c
+        .iter()
+        .map(|x| {
+            if value_cutoff > 0.0 && value_cutoff < 1.0 && x.q < min_q {
+                0.0
+            } else {
+                (x.visits as f32 + visit_offset)
+                    .max(1e-9)
+                    .powf(temperature.max(1e-3).recip())
+            }
+        })
+        .collect::<Vec<_>>();
     *seed = seed.wrapping_add(0x9e3779b97f4a7c15);
     let mut z = *seed;
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
-    let mut x = ((z ^ (z >> 31)) as f64 / u64::MAX as f64)
-        * c.iter().map(|x| x.visits.max(1)).sum::<u32>() as f64;
-    for a in c {
-        x -= a.visits.max(1) as f64;
+    let mut x = ((z ^ (z >> 31)) as f64 / u64::MAX as f64) * weights.iter().sum::<f32>() as f64;
+    for (a, weight) in c.iter().zip(weights) {
+        x -= weight as f64;
         if x <= 0.0 {
             return a.mv;
         }
@@ -152,9 +203,11 @@ fn sample(c: &[crate::mcts::Candidate], seed: &mut u64) -> crate::game::Move {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TrainStats {
     pub samples: usize,
+    pub optimizer_steps: usize,
     pub loss: f32,
     pub policy_loss: f32,
     pub value_loss: f32,
+    pub moves_left_loss: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -212,6 +265,17 @@ pub fn arena(
         .map(|game| {
             let candidate_black = game % 2 == 0;
             let mut board = Board::new();
+            let opening_index = game / 2;
+            let mut opening_seed =
+                cfg.opening_seed ^ (opening_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            for _ in 0..cfg.opening_random_plies {
+                let legal = board.legal_moves();
+                if legal.is_empty() {
+                    break;
+                }
+                let index = random_index(&mut opening_seed, legal.len());
+                board.play(legal[index]);
+            }
             while board.outcome().is_none() {
                 let candidate_turn =
                     (board.to_move() == crate::game::Player::Black) == candidate_black;
@@ -260,4 +324,31 @@ pub fn arena(
             losses_as_white: a.losses_as_white + b.losses_as_white,
             draws_as_white: a.draws_as_white + b.draws_as_white,
         })
+}
+
+fn random_index(seed: &mut u64, len: usize) -> usize {
+    *seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *seed;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    ((z ^ (z >> 31)) as usize) % len.max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn temperature_decays_linearly() {
+        let cfg = SearchConfig {
+            temperature_start: 0.9,
+            temperature_endgame: 0.3,
+            temperature_decay_delay_plies: 10,
+            temperature_decay_plies: 20,
+            ..Default::default()
+        };
+        assert_eq!(temperature_for_ply(cfg, 9), 0.9);
+        assert!((temperature_for_ply(cfg, 20) - 0.6).abs() < 1e-6);
+        assert_eq!(temperature_for_ply(cfg, 30), 0.3);
+    }
 }

@@ -6,3 +6,4 @@ gomoku.azloop.toml
 model.safetensors
 best.safetensors
 .idea
+Cargo.lock

@@ -1,18 +1,42 @@
 use crate::{
     game::{Board, Move, Outcome},
-    model::PolicyValueModel,
+    model::{EvalAccumulator, PolicyValueModel},
 };
 
 #[derive(Clone, Copy)]
 pub struct SearchConfig {
     pub simulations: usize,
     pub cpuct: f32,
+    pub root_dirichlet_alpha: f32,
+    pub root_exploration_fraction: f32,
+    pub root_noise_seed: u64,
+    pub policy_softmax_temp: f32,
+    pub temperature_start: f32,
+    pub temperature_endgame: f32,
+    pub temperature_decay_delay_plies: usize,
+    pub temperature_decay_plies: usize,
+    pub temperature_value_cutoff: f32,
+    pub temperature_visit_offset: f32,
+    pub opening_random_plies: usize,
+    pub opening_seed: u64,
 }
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             simulations: 400,
             cpuct: 1.5,
+            root_dirichlet_alpha: 0.0,
+            root_exploration_fraction: 0.0,
+            root_noise_seed: 0,
+            policy_softmax_temp: 1.0,
+            temperature_start: 0.0,
+            temperature_endgame: 0.0,
+            temperature_decay_delay_plies: 0,
+            temperature_decay_plies: 0,
+            temperature_value_cutoff: 0.0,
+            temperature_visit_offset: 0.0,
+            opening_random_plies: 0,
+            opening_seed: 0,
         }
     }
 }
@@ -26,6 +50,7 @@ pub struct Candidate {
 }
 struct Node {
     board: Board,
+    accumulator: EvalAccumulator,
     children: Vec<Edge>,
     expanded: bool,
 }
@@ -40,12 +65,13 @@ struct Edge {
 pub fn search(board: &Board, model: &PolicyValueModel, cfg: SearchConfig) -> Vec<Candidate> {
     let mut nodes = vec![Node {
         board: board.clone(),
+        accumulator: model.accumulator(board),
         children: vec![],
         expanded: false,
     }];
-    expand(&mut nodes, 0, model);
+    expand(&mut nodes, 0, model, cfg);
     for _ in 0..cfg.simulations {
-        simulate(&mut nodes, 0, model, cfg.cpuct);
+        simulate(&mut nodes, 0, model, cfg);
     }
     let mut out: Vec<_> = nodes[0]
         .children
@@ -64,7 +90,7 @@ pub fn search(board: &Board, model: &PolicyValueModel, cfg: SearchConfig) -> Vec
     out.sort_by_key(|x| std::cmp::Reverse(x.visits));
     out
 }
-fn expand(nodes: &mut Vec<Node>, idx: usize, model: &PolicyValueModel) -> f32 {
+fn expand(nodes: &mut Vec<Node>, idx: usize, model: &PolicyValueModel, cfg: SearchConfig) -> f32 {
     if let Some(out) = nodes[idx].board.outcome() {
         return match out {
             Outcome::Draw => 0.0,
@@ -77,7 +103,23 @@ fn expand(nodes: &mut Vec<Node>, idx: usize, model: &PolicyValueModel) -> f32 {
             }
         };
     }
-    let (policy, value) = model.evaluate(&nodes[idx].board);
+    let (mut policy, value) = model.evaluate_accumulator_with_temperature(
+        &nodes[idx].board,
+        &nodes[idx].accumulator,
+        cfg.policy_softmax_temp,
+    );
+    if idx == 0 && cfg.root_dirichlet_alpha > 0.0 && cfg.root_exploration_fraction > 0.0 {
+        let mut priors = policy.iter().map(|(_, prior)| *prior).collect::<Vec<_>>();
+        apply_root_dirichlet_noise(
+            &mut priors,
+            cfg.root_dirichlet_alpha,
+            cfg.root_exploration_fraction.clamp(0.0, 1.0),
+            cfg.root_noise_seed,
+        );
+        for ((_, prior), noisy) in policy.iter_mut().zip(priors) {
+            *prior = noisy;
+        }
+    }
     nodes[idx].children = policy
         .into_iter()
         .map(|(mv, prior)| Edge {
@@ -91,7 +133,7 @@ fn expand(nodes: &mut Vec<Node>, idx: usize, model: &PolicyValueModel) -> f32 {
     nodes[idx].expanded = true;
     value
 }
-fn simulate(nodes: &mut Vec<Node>, idx: usize, model: &PolicyValueModel, cpuct: f32) -> f32 {
+fn simulate(nodes: &mut Vec<Node>, idx: usize, model: &PolicyValueModel, cfg: SearchConfig) -> f32 {
     if let Some(out) = nodes[idx].board.outcome() {
         return match out {
             Outcome::Draw => 0.0,
@@ -105,7 +147,7 @@ fn simulate(nodes: &mut Vec<Node>, idx: usize, model: &PolicyValueModel, cpuct: 
         };
     }
     if !nodes[idx].expanded {
-        return expand(nodes, idx, model);
+        return expand(nodes, idx, model, cfg);
     }
     let total = nodes[idx]
         .children
@@ -121,7 +163,7 @@ fn simulate(nodes: &mut Vec<Node>, idx: usize, model: &PolicyValueModel, cpuct: 
         } else {
             e.value_sum / e.visits as f32
         };
-        let s = q + cpuct * e.prior * total.sqrt() / (1.0 + e.visits as f32);
+        let s = q + cfg.cpuct * e.prior * total.sqrt() / (1.0 + e.visits as f32);
         if s > score {
             score = s;
             best = i
@@ -131,19 +173,89 @@ fn simulate(nodes: &mut Vec<Node>, idx: usize, model: &PolicyValueModel, cpuct: 
         c
     } else {
         let mut b = nodes[idx].board.clone();
-        b.play(nodes[idx].children[best].mv);
+        let mv = nodes[idx].children[best].mv;
+        let player = b.to_move();
+        let accumulator = model.accumulator_after_move(&nodes[idx].accumulator, mv, player);
+        b.play(mv);
         let c = nodes.len();
         nodes.push(Node {
             board: b,
+            accumulator,
             children: vec![],
             expanded: false,
         });
         nodes[idx].children[best].child = Some(c);
         c
     };
-    let value = -simulate(nodes, child, model, cpuct);
+    let value = -simulate(nodes, child, model, cfg);
     let e = &mut nodes[idx].children[best];
     e.visits += 1;
     e.value_sum += value;
     value
+}
+
+fn apply_root_dirichlet_noise(priors: &mut [f32], alpha: f32, fraction: f32, seed: u64) {
+    let mut rng = SplitMix64(seed ^ 0xD1A1_71C7_0000_0000 ^ priors.len() as u64);
+    let mut noise = Vec::with_capacity(priors.len());
+    let mut sum = 0.0;
+    for _ in 0..priors.len() {
+        let value = sample_gamma(alpha.max(1e-3), &mut rng).max(1e-12);
+        noise.push(value);
+        sum += value;
+    }
+    let keep = 1.0 - fraction;
+    for (prior, value) in priors.iter_mut().zip(noise) {
+        *prior = keep * *prior + fraction * value / sum.max(1e-12);
+    }
+}
+
+fn sample_gamma(alpha: f32, rng: &mut SplitMix64) -> f32 {
+    if alpha < 1.0 {
+        return sample_gamma(alpha + 1.0, rng) * rng.unit().max(1e-12).powf(1.0 / alpha);
+    }
+    let d = alpha - 1.0 / 3.0;
+    let c = (1.0 / (9.0 * d)).sqrt();
+    loop {
+        let x =
+            (-2.0 * rng.unit().max(1e-12).ln()).sqrt() * (std::f32::consts::TAU * rng.unit()).cos();
+        let v = 1.0 + c * x;
+        if v <= 0.0 {
+            continue;
+        }
+        let v3 = v * v * v;
+        let u = rng.unit();
+        if u < 1.0 - 0.0331 * x.powi(4) || u.ln() < 0.5 * x * x + d * (1.0 - v3 + v3.ln()) {
+            return d * v3;
+        }
+    }
+}
+
+struct SplitMix64(u64);
+impl SplitMix64 {
+    fn unit(&mut self) -> f32 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        ((z ^ (z >> 31)) >> 40) as f32 / (1u32 << 24) as f32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_noise_is_normalized_and_seeded() {
+        let original = vec![0.1, 0.2, 0.3, 0.4];
+        let mut first = original.clone();
+        let mut same = original.clone();
+        let mut other = original;
+        apply_root_dirichlet_noise(&mut first, 0.12, 0.25, 7);
+        apply_root_dirichlet_noise(&mut same, 0.12, 0.25, 7);
+        apply_root_dirichlet_noise(&mut other, 0.12, 0.25, 8);
+        assert_eq!(first, same);
+        assert_ne!(first, other);
+        assert!((first.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+    }
 }
