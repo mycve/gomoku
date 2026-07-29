@@ -1,5 +1,8 @@
 use crate::{
-    game::{CELL_COUNT, TACTICAL_FEATURES, tactical_features},
+    game::{
+        CELL_COUNT, GLOBAL_TACTICAL_FEATURES, TACTICAL_FEATURES, add_global_tactical_features,
+        normalize_global_tactical_features, tactical_features,
+    },
     model::{
         AXIS_FEATURES, DIAGONAL_FEATURES, INPUT_SIZE, PolicyValueModel, STONE_TYPES,
         VALUE_HEAD_SIZE, WDL_SIZE,
@@ -32,6 +35,7 @@ pub fn train(
     batch_size: usize,
     requested_devices: &[usize],
     moves_left_loss_weight: f32,
+    value_search_target_weight: f32,
 ) -> io::Result<TrainStats> {
     train_controlled(
         model,
@@ -41,6 +45,7 @@ pub fn train(
         batch_size,
         requested_devices,
         moves_left_loss_weight,
+        value_search_target_weight,
         None,
     )
 }
@@ -54,6 +59,7 @@ pub fn train_controlled(
     batch_size: usize,
     requested_devices: &[usize],
     moves_left_loss_weight: f32,
+    value_search_target_weight: f32,
     stop: Option<&AtomicBool>,
 ) -> io::Result<TrainStats> {
     if samples.is_empty() || epochs == 0 || learning_rate <= 0.0 {
@@ -93,8 +99,12 @@ pub fn train_controlled(
                     .map(|(rank, shard)| {
                         let replica = &replicas[rank];
                         scope.spawn(move || {
-                            let result =
-                                replica.backward(shard, batch.len(), moves_left_loss_weight);
+                            let result = replica.backward(
+                                shard,
+                                batch.len(),
+                                moves_left_loss_weight,
+                                value_search_target_weight,
+                            );
                             crate::profile::flush_thread();
                             result
                         })
@@ -158,6 +168,7 @@ struct Replica {
     policy_bias: Var,
     policy_tactical: Var,
     value_head_hidden: Var,
+    global_tactical_value: Var,
     value_head_bias: Var,
     value_head_hidden2: Var,
     value_head_bias2: Var,
@@ -181,6 +192,11 @@ impl Replica {
             policy_bias: var(&model.policy_bias, (CELL_COUNT,), device)?,
             policy_tactical: var(&model.policy_tactical, (TACTICAL_FEATURES, 1), device)?,
             value_head_hidden: var(&model.value_head_hidden, (VALUE_HEAD_SIZE, h), device)?,
+            global_tactical_value: var(
+                &model.global_tactical_value,
+                (VALUE_HEAD_SIZE, GLOBAL_TACTICAL_FEATURES),
+                device,
+            )?,
             value_head_bias: var(&model.value_head_bias, (VALUE_HEAD_SIZE,), device)?,
             value_head_hidden2: var(
                 &model.value_head_hidden2,
@@ -210,6 +226,7 @@ impl Replica {
             self.policy_bias.clone(),
             self.policy_tactical.clone(),
             self.value_head_hidden.clone(),
+            self.global_tactical_value.clone(),
             self.value_head_bias.clone(),
             self.value_head_hidden2.clone(),
             self.value_head_bias2.clone(),
@@ -223,10 +240,11 @@ impl Replica {
         samples: &[Sample],
         global_len: usize,
         moves_left_loss_weight: f32,
+        value_search_target_weight: f32,
     ) -> io::Result<ShardOutput> {
         let packed = {
             crate::scope_profile!("train.pack");
-            pack(samples)
+            pack(samples, value_search_target_weight)
         };
         let b = samples.len();
         crate::scope_profile!("train.tensor_h2d");
@@ -262,6 +280,12 @@ impl Replica {
             .map_err(err)?;
         let value_wdl =
             Tensor::from_vec(packed.value_wdl, (b, WDL_SIZE), &self.device).map_err(err)?;
+        let global_tactical = Tensor::from_vec(
+            packed.global_tactical,
+            (b, GLOBAL_TACTICAL_FEATURES),
+            &self.device,
+        )
+        .map_err(err)?;
         let moves_left_targets =
             Tensor::from_vec(packed.moves_left, (b, 1), &self.device).map_err(err)?;
         let hidden = {
@@ -298,6 +322,7 @@ impl Replica {
             .map_err(err)?;
         let value_features = hidden
             .matmul(&self.value_head_hidden.t().map_err(err)?)
+            .and_then(|x| x.add(&global_tactical.matmul(&self.global_tactical_value.t()?)?))
             .and_then(|x| x.broadcast_add(&self.value_head_bias))
             .and_then(|x| x.relu())
             .and_then(|x| x.matmul(&self.value_head_hidden2.t()?))
@@ -390,12 +415,13 @@ impl Replica {
         m.policy_bias = v[8].clone();
         m.policy_tactical = v[9].clone();
         m.value_head_hidden = v[10].clone();
-        m.value_head_bias = v[11].clone();
-        m.value_head_hidden2 = v[12].clone();
-        m.value_head_bias2 = v[13].clone();
-        m.value_head_output = v[14].clone();
-        m.moves_left_output = v[15].clone();
-        m.moves_left_bias = v[16].clone();
+        m.global_tactical_value = v[11].clone();
+        m.value_head_bias = v[12].clone();
+        m.value_head_hidden2 = v[13].clone();
+        m.value_head_bias2 = v[14].clone();
+        m.value_head_output = v[15].clone();
+        m.moves_left_output = v[16].clone();
+        m.moves_left_bias = v[17].clone();
         Ok(())
     }
 }
@@ -513,10 +539,11 @@ struct Packed {
     policy_targets: Vec<f32>,
     policy_masks: Vec<f32>,
     tactical: Vec<f32>,
+    global_tactical: Vec<f32>,
     value_wdl: Vec<f32>,
     moves_left: Vec<f32>,
 }
-fn pack(samples: &[Sample]) -> Packed {
+fn pack(samples: &[Sample], value_search_target_weight: f32) -> Packed {
     let mut inputs = vec![0.0; samples.len() * INPUT_SIZE];
     let mut stone_counts = vec![0.0; samples.len() * STONE_TYPES];
     let mut rank_counts = vec![0.0; samples.len() * AXIS_FEATURES];
@@ -526,6 +553,7 @@ fn pack(samples: &[Sample]) -> Packed {
     let mut targets = vec![0.0; samples.len() * CELL_COUNT];
     let mut masks = vec![-1e9; samples.len() * CELL_COUNT];
     let mut tactical = vec![0.0; samples.len() * CELL_COUNT * TACTICAL_FEATURES];
+    let mut global_tactical = vec![0.0; samples.len() * GLOBAL_TACTICAL_FEATURES];
     let mut value_wdl = Vec::with_capacity(samples.len() * WDL_SIZE);
     let mut moves_left = Vec::with_capacity(samples.len());
     for (row, s) in samples.iter().enumerate() {
@@ -551,9 +579,16 @@ fn pack(samples: &[Sample]) -> Packed {
         for m in s.board.legal_moves() {
             masks[row * CELL_COUNT + m.0] = 0.0;
             let offset = (row * CELL_COUNT + m.0) * TACTICAL_FEATURES;
-            tactical[offset..offset + TACTICAL_FEATURES]
-                .copy_from_slice(&tactical_features(&s.board, m));
+            let features = tactical_features(&s.board, m);
+            tactical[offset..offset + TACTICAL_FEATURES].copy_from_slice(&features);
+            let global = &mut global_tactical
+                [row * GLOBAL_TACTICAL_FEATURES..(row + 1) * GLOBAL_TACTICAL_FEATURES];
+            let global: &mut [f32; GLOBAL_TACTICAL_FEATURES] = global.try_into().unwrap();
+            add_global_tactical_features(global, &features);
         }
+        let global = &mut global_tactical
+            [row * GLOBAL_TACTICAL_FEATURES..(row + 1) * GLOBAL_TACTICAL_FEATURES];
+        normalize_global_tactical_features(global.try_into().unwrap());
         let sum: f32 = s.policy.iter().map(|(_, p)| p.max(0.0)).sum();
         for &(m, p) in &s.policy {
             if m.0 < CELL_COUNT && sum > 1e-12 {
@@ -575,7 +610,11 @@ fn pack(samples: &[Sample]) -> Packed {
         } else {
             [0.0, 1.0, 0.0]
         };
-        value_wdl.extend((0..WDL_SIZE).map(|i| final_wdl[i] * 0.75 + search_wdl[i] * 0.25));
+        let search_weight = value_search_target_weight.clamp(0.0, 1.0);
+        value_wdl.extend(
+            (0..WDL_SIZE)
+                .map(|i| final_wdl[i] * (1.0 - search_weight) + search_wdl[i] * search_weight),
+        );
         moves_left.push((s.moves_left / CELL_COUNT as f32).clamp(0.0, 1.0));
     }
     Packed {
@@ -588,6 +627,7 @@ fn pack(samples: &[Sample]) -> Packed {
         policy_targets: targets,
         policy_masks: masks,
         tactical,
+        global_tactical,
         value_wdl,
         moves_left,
     }
@@ -615,7 +655,7 @@ mod tests {
             moves_left: 20.0,
             generation: 0,
         };
-        let stats = train(&mut model, &[sample], 1, 1e-3, 1, &[], 0.1).unwrap();
+        let stats = train(&mut model, &[sample], 1, 1e-3, 1, &[], 0.1, 0.25).unwrap();
         assert_eq!(stats.optimizer_steps, 1);
         assert!(stats.moves_left_loss.is_finite());
         assert!(stats.moves_left_loss > 0.0);

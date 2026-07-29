@@ -4,6 +4,7 @@ use std::fmt;
 pub const BOARD_SIZE: usize = 15;
 pub const CELL_COUNT: usize = BOARD_SIZE * BOARD_SIZE;
 pub const TACTICAL_FEATURES: usize = 24;
+pub const GLOBAL_TACTICAL_FEATURES: usize = 12;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Player {
@@ -237,6 +238,32 @@ pub(crate) fn tactical_features(board: &Board, mv: Move) -> [f32; TACTICAL_FEATU
     features
 }
 
+pub(crate) fn add_global_tactical_features(
+    global: &mut [f32; GLOBAL_TACTICAL_FEATURES],
+    tactical: &[f32; TACTICAL_FEATURES],
+) {
+    global[0] += tactical[16];
+    global[1] += tactical[17];
+    global[2] += f32::from(tactical[18] > 0.0);
+    global[3] += f32::from(tactical[19] > 0.0);
+    global[4] += f32::from(tactical[20] > 0.0);
+    global[5] += f32::from(tactical[21] > 0.0);
+    global[6] += f32::from(tactical[18] >= 0.5);
+    global[7] += f32::from(tactical[19] >= 0.5);
+    global[8] += f32::from(tactical[20] >= 0.5);
+    global[9] += f32::from(tactical[21] >= 0.5);
+    global[10] = global[10].max(tactical[16] + tactical[18] * 0.5 + tactical[20] * 0.25);
+    global[11] = global[11].max(tactical[17] + tactical[19] * 0.5 + tactical[21] * 0.25);
+}
+
+pub(crate) fn normalize_global_tactical_features(global: &mut [f32; GLOBAL_TACTICAL_FEATURES]) {
+    for value in &mut global[..10] {
+        *value = (*value / 8.0).min(1.0);
+    }
+    global[10] = (global[10] / 1.375).min(1.0);
+    global[11] = (global[11] / 1.375).min(1.0);
+}
+
 fn line_shape(board: &Board, mv: Move, stone: i8, dr: i32, dc: i32) -> (usize, usize) {
     let mut run = 1;
     let mut open = 0;
@@ -349,11 +376,27 @@ mod tests {
         let features = tactical_features(&board, mv);
         assert_eq!(features[16], 1.0);
         assert!(features[18] > 0.0);
+        let mut global = [0.0; GLOBAL_TACTICAL_FEATURES];
+        for legal in board.legal_moves() {
+            add_global_tactical_features(&mut global, &tactical_features(&board, legal));
+        }
+        normalize_global_tactical_features(&mut global);
+        assert!(global[0] > 0.0);
+        assert!(global[10] > 0.0);
         for symmetry in 0..8 {
             let transformed = board.transformed(symmetry);
             let transformed_move = Move(transform_index(mv.0, symmetry));
             let other = tactical_features(&transformed, transformed_move);
             assert_eq!(&features[16..22], &other[16..22]);
+            let mut other_global = [0.0; GLOBAL_TACTICAL_FEATURES];
+            for legal in transformed.legal_moves() {
+                add_global_tactical_features(
+                    &mut other_global,
+                    &tactical_features(&transformed, legal),
+                );
+            }
+            normalize_global_tactical_features(&mut other_global);
+            assert_eq!(global, other_global);
         }
     }
 }

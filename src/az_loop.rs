@@ -51,6 +51,7 @@ struct TrainerEvent {
     train_samples: usize,
     recent_quota_rate: f32,
     actual_recent_rate: f32,
+    value_search_target_weight: f32,
 }
 
 pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()> {
@@ -123,8 +124,12 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         config.policy_softmax_temp, config.root_dirichlet_alpha, config.root_exploration_fraction
     );
     println!(
-        "aux      : moves_left_weight={:.3} ema_decay={:.6} ema_model={}",
-        config.moves_left_loss_weight, config.ema_decay, config.ema_model_path
+        "aux      : moves_left_weight={:.3} search_value_weight={:.3}@update{} ema_decay={:.6} ema_model={}",
+        config.moves_left_loss_weight,
+        config.value_search_target_weight,
+        config.value_search_target_start_update,
+        config.ema_decay,
+        config.ema_model_path
     );
     let published = Arc::new(RwLock::new(initial_ema.clone()));
     let version = Arc::new(AtomicU64::new(progress.update as u64));
@@ -230,6 +235,12 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             let train_samples = sampled.samples.len();
             let recent_quota_rate = sampled.recent_quota as f32 / train_samples.max(1) as f32;
             let actual_recent_rate = sampled.actual_recent as f32 / train_samples.max(1) as f32;
+            let value_search_target_weight =
+                if update >= trainer_config.value_search_target_start_update {
+                    trainer_config.value_search_target_weight
+                } else {
+                    0.0
+                };
             let train_stats = candle_train::train_controlled(
                 &mut model,
                 &sampled.samples,
@@ -238,6 +249,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 trainer_config.batch_size,
                 &trainer_config.gpu_devices,
                 trainer_config.moves_left_loss_weight,
+                value_search_target_weight,
                 Some(&trainer_stop),
             )?;
             if trainer_stop.load(Ordering::SeqCst) {
@@ -261,6 +273,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                     train_samples,
                     recent_quota_rate,
                     actual_recent_rate,
+                    value_search_target_weight,
                 })
                 .is_err()
             {
@@ -351,6 +364,11 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         tb.add_scalar(
             "train/moves_left_loss",
             event.train_stats.moves_left_loss,
+            progress.update,
+        );
+        tb.add_scalar(
+            "train/search_value_target_weight",
+            event.value_search_target_weight,
             progress.update,
         );
         tb.add_scalar("replay/samples", event.pool_samples as f32, progress.update);
@@ -526,11 +544,12 @@ fn print_event(
         config.replay_recent_updates
     );
     println!(
-        "train    : device={} samples={} steps={} lr={:.6} loss={:.4} policy={:.4} value={:.4} moves_left={:.4} time={:.2}s sps={:.1}",
+        "train    : device={} samples={} steps={} lr={:.6} search_value_weight={:.3} loss={:.4} policy={:.4} value={:.4} moves_left={:.4} time={:.2}s sps={:.1}",
         device,
         event.train_stats.samples,
         event.train_stats.optimizer_steps,
         event.learning_rate,
+        event.value_search_target_weight,
         event.train_stats.loss,
         event.train_stats.policy_loss,
         event.train_stats.value_loss,
