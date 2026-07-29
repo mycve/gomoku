@@ -9,7 +9,7 @@ pub const VALUE_HEAD_SIZE: usize = 96;
 pub const WDL_SIZE: usize = 3;
 pub const STONE_TYPES: usize = 2;
 pub const AXIS_FEATURES: usize = STONE_TYPES * 15;
-const FORMAT_VERSION: f32 = 4.0;
+const FORMAT_VERSION: f32 = 5.0;
 
 #[derive(Clone)]
 pub struct PolicyValueModel {
@@ -35,6 +35,24 @@ pub(crate) struct EvalAccumulator {
     black: Vec<f32>,
     white: Vec<f32>,
     move_count: usize,
+}
+
+pub(crate) struct EvalScratch {
+    hidden: Vec<f32>,
+    logits: Vec<f32>,
+    value1: Vec<f32>,
+    value2: Vec<f32>,
+}
+
+impl EvalScratch {
+    pub(crate) fn new(hidden_size: usize) -> Self {
+        Self {
+            hidden: Vec::with_capacity(hidden_size),
+            logits: Vec::with_capacity(CELL_COUNT),
+            value1: Vec::with_capacity(VALUE_HEAD_SIZE),
+            value2: Vec::with_capacity(VALUE_HEAD_SIZE),
+        }
+    }
 }
 
 impl Default for PolicyValueModel {
@@ -103,56 +121,95 @@ impl PolicyValueModel {
         accumulator: &EvalAccumulator,
         policy_temperature: f32,
     ) -> (Vec<(Move, f32)>, f32) {
+        let mut scratch = EvalScratch::new(self.hidden_size);
+        self.evaluate_accumulator_with_scratch(board, accumulator, policy_temperature, &mut scratch)
+    }
+
+    pub(crate) fn evaluate_accumulator_with_scratch(
+        &self,
+        board: &Board,
+        accumulator: &EvalAccumulator,
+        policy_temperature: f32,
+        scratch: &mut EvalScratch,
+    ) -> (Vec<(Move, f32)>, f32) {
+        crate::scope_profile!("model.evaluate_incremental");
         debug_assert_eq!(accumulator.move_count, board.move_count());
-        let hidden = self.activate_hidden(match board.to_move() {
-            Player::Black => &accumulator.black,
-            Player::White => &accumulator.white,
-        });
+        {
+            crate::scope_profile!("model.activate_norm");
+            self.activate_hidden_into(
+                match board.to_move() {
+                    Player::Black => &accumulator.black,
+                    Player::White => &accumulator.white,
+                },
+                &mut scratch.hidden,
+            );
+        }
         let moves = board.legal_moves();
         if moves.is_empty() {
             return (Vec::new(), 0.0);
         }
-        let logits: Vec<f32> = moves
+        {
+            crate::scope_profile!("model.policy_logits");
+            scratch.logits.clear();
+            scratch.logits.extend(
+                moves
+                    .iter()
+                    .map(|m| self.policy_logit(&scratch.hidden, m.0)),
+            );
+        }
+        let max = scratch
+            .logits
             .iter()
-            .map(|m| self.policy_logit(&hidden, m.0))
-            .collect();
-        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
         let inverse_temperature = policy_temperature.max(1e-3).recip();
-        let sum: f32 = logits
+        let sum: f32 = scratch
+            .logits
             .iter()
             .map(|x| ((x - max) * inverse_temperature).exp())
             .sum();
         let policy = moves
             .into_iter()
             .zip(
-                logits
-                    .into_iter()
+                scratch
+                    .logits
+                    .iter()
+                    .copied()
                     .map(|x| ((x - max) * inverse_temperature).exp() / sum),
             )
             .collect();
-        let mut v1 = self.value_head_bias.clone();
-        for h in 0..self.hidden_size {
-            for j in 0..VALUE_HEAD_SIZE {
-                v1[j] += hidden[h] * self.value_head_hidden[h * VALUE_HEAD_SIZE + j];
-            }
+        crate::scope_profile!("model.value_head");
+        scratch.value1.clear();
+        scratch.value1.extend_from_slice(&self.value_head_bias);
+        for (output, value) in scratch.value1.iter_mut().enumerate() {
+            let start = output * self.hidden_size;
+            *value += dot(
+                &scratch.hidden,
+                &self.value_head_hidden[start..start + self.hidden_size],
+            );
         }
-        for x in &mut v1 {
+        for x in &mut scratch.value1 {
             *x = x.max(0.0);
         }
-        let mut v2 = self.value_head_bias2.clone();
-        for i in 0..VALUE_HEAD_SIZE {
-            for j in 0..VALUE_HEAD_SIZE {
-                v2[j] += v1[i] * self.value_head_hidden2[i * VALUE_HEAD_SIZE + j];
-            }
+        scratch.value2.clear();
+        scratch.value2.extend_from_slice(&self.value_head_bias2);
+        for (output, value) in scratch.value2.iter_mut().enumerate() {
+            let start = output * VALUE_HEAD_SIZE;
+            *value += dot(
+                &scratch.value1,
+                &self.value_head_hidden2[start..start + VALUE_HEAD_SIZE],
+            );
         }
-        for x in &mut v2 {
+        for x in &mut scratch.value2 {
             *x = x.max(0.0);
         }
         let mut wdl = [0.0_f32; WDL_SIZE];
-        for i in 0..VALUE_HEAD_SIZE {
-            for j in 0..WDL_SIZE {
-                wdl[j] += v2[i] * self.value_head_output[i * WDL_SIZE + j];
-            }
+        for (output, logit) in wdl.iter_mut().enumerate() {
+            let start = output * VALUE_HEAD_SIZE;
+            *logit = dot(
+                &scratch.value2,
+                &self.value_head_output[start..start + VALUE_HEAD_SIZE],
+            );
         }
         let wdl_max = wdl.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let wdl_sum: f32 = wdl.iter().map(|x| (x - wdl_max).exp()).sum();
@@ -162,6 +219,7 @@ impl PolicyValueModel {
     }
 
     pub(crate) fn accumulator(&self, board: &Board) -> EvalAccumulator {
+        crate::scope_profile!("model.accumulator_root");
         let mut accumulator = EvalAccumulator {
             black: self.hidden_bias.clone(),
             white: self.hidden_bias.clone(),
@@ -191,6 +249,7 @@ impl PolicyValueModel {
         mv: Move,
         player: Player,
     ) -> EvalAccumulator {
+        crate::scope_profile!("model.accumulator_update");
         let mut child = parent.clone();
         self.add_stone(&mut child, mv, player);
         self.set_move_count(&mut child, parent.move_count + 1);
@@ -227,17 +286,17 @@ impl PolicyValueModel {
         accumulator.move_count = move_count;
     }
 
-    fn activate_hidden(&self, preactivation: &[f32]) -> Vec<f32> {
-        let mut hidden = preactivation.to_vec();
-        for x in &mut hidden {
+    fn activate_hidden_into(&self, preactivation: &[f32], hidden: &mut Vec<f32>) {
+        hidden.clear();
+        hidden.extend_from_slice(preactivation);
+        for x in hidden.iter_mut() {
             *x = x.max(0.0);
         }
         let rms = (hidden.iter().map(|x| x * x).sum::<f32>() / hidden.len().max(1) as f32 + 1.0e-6)
             .sqrt();
-        for x in &mut hidden {
+        for x in hidden.iter_mut() {
             *x /= rms;
         }
-        hidden
     }
 
     fn policy_logit(&self, hidden: &[f32], sq: usize) -> f32 {
@@ -289,7 +348,7 @@ impl PolicyValueModel {
             &vars,
             "value_head_hidden",
             &self.value_head_hidden,
-            (self.hidden_size, VALUE_HEAD_SIZE),
+            (VALUE_HEAD_SIZE, self.hidden_size),
         )?;
         insert(
             &vars,
@@ -313,7 +372,7 @@ impl PolicyValueModel {
             &vars,
             "value_head_output",
             &self.value_head_output,
-            (VALUE_HEAD_SIZE, WDL_SIZE),
+            (WDL_SIZE, VALUE_HEAD_SIZE),
         )?;
         insert(
             &vars,
@@ -330,7 +389,8 @@ impl PolicyValueModel {
             candle_core::safetensors::MmapedSafetensors::new(path.as_ref()).map_err(candle_error)?
         };
         let version = load(&tensors, "format_version")?;
-        if version.as_slice() != [FORMAT_VERSION] {
+        let version = version.first().copied().unwrap_or_default();
+        if version != 4.0 && version != FORMAT_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "不支持的五子棋模型版本",
@@ -338,7 +398,7 @@ impl PolicyValueModel {
         }
         let hidden_bias = load(&tensors, "hidden_bias")?;
         let hidden_size = hidden_bias.len();
-        let model = Self {
+        let mut model = Self {
             hidden_size,
             input_hidden: load(&tensors, "input_hidden")?,
             stone_hidden: load(&tensors, "stone_hidden")?,
@@ -355,6 +415,14 @@ impl PolicyValueModel {
             moves_left_output: load(&tensors, "moves_left_output")?,
             moves_left_bias: load(&tensors, "moves_left_bias")?,
         };
+        if version == 4.0 {
+            model.value_head_hidden =
+                transpose(&model.value_head_hidden, model.hidden_size, VALUE_HEAD_SIZE);
+            model.value_head_hidden2 =
+                transpose(&model.value_head_hidden2, VALUE_HEAD_SIZE, VALUE_HEAD_SIZE);
+            model.value_head_output =
+                transpose(&model.value_head_output, VALUE_HEAD_SIZE, WDL_SIZE);
+        }
         if model.input_hidden.len() != INPUT_SIZE * hidden_size
             || model.stone_hidden.len() != STONE_TYPES * hidden_size
             || model.rank_hidden.len() != AXIS_FEATURES * hidden_size
@@ -405,7 +473,186 @@ impl PolicyValueModel {
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+    debug_assert_eq!(a.len(), b.len());
+    #[cfg(target_arch = "aarch64")]
+    if a.len() >= 16 {
+        return unsafe { dot_neon(a, b) };
+    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        #[cfg(target_arch = "x86_64")]
+        if a.len() >= 64
+            && std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma")
+        {
+            return unsafe { dot_avx2_fma(a, b) };
+        }
+        if a.len() >= 64 && std::arch::is_x86_feature_detected!("avx2") {
+            return unsafe { dot_avx2(a, b) };
+        }
+    }
+    let mut sums = [0.0_f32; 4];
+    let chunks = a.len() / 4;
+    for index in 0..chunks {
+        let offset = index * 4;
+        sums[0] += a[offset] * b[offset];
+        sums[1] += a[offset + 1] * b[offset + 1];
+        sums[2] += a[offset + 2] * b[offset + 2];
+        sums[3] += a[offset + 3] * b[offset + 3];
+    }
+    let mut sum = (sums[0] + sums[1]) + (sums[2] + sums[3]);
+    for index in chunks * 4..a.len() {
+        sum += a[index] * b[index];
+    }
+    sum
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dot_neon(left: &[f32], right: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    let chunks = left.len() / 16;
+    let mut acc0 = vdupq_n_f32(0.0);
+    let mut acc1 = vdupq_n_f32(0.0);
+    let mut acc2 = vdupq_n_f32(0.0);
+    let mut acc3 = vdupq_n_f32(0.0);
+    for chunk in 0..chunks {
+        let index = chunk * 16;
+        unsafe {
+            acc0 = vfmaq_f32(
+                acc0,
+                vld1q_f32(left.as_ptr().add(index)),
+                vld1q_f32(right.as_ptr().add(index)),
+            );
+            acc1 = vfmaq_f32(
+                acc1,
+                vld1q_f32(left.as_ptr().add(index + 4)),
+                vld1q_f32(right.as_ptr().add(index + 4)),
+            );
+            acc2 = vfmaq_f32(
+                acc2,
+                vld1q_f32(left.as_ptr().add(index + 8)),
+                vld1q_f32(right.as_ptr().add(index + 8)),
+            );
+            acc3 = vfmaq_f32(
+                acc3,
+                vld1q_f32(left.as_ptr().add(index + 12)),
+                vld1q_f32(right.as_ptr().add(index + 12)),
+            );
+        }
+    }
+    let mut sum = vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
+    for index in chunks * 16..left.len() {
+        sum += left[index] * right[index];
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_avx2_fma(left: &[f32], right: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let chunks = left.len() / 32;
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+    for chunk in 0..chunks {
+        let index = chunk * 32;
+        unsafe {
+            acc0 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(left.as_ptr().add(index)),
+                _mm256_loadu_ps(right.as_ptr().add(index)),
+                acc0,
+            );
+            acc1 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(left.as_ptr().add(index + 8)),
+                _mm256_loadu_ps(right.as_ptr().add(index + 8)),
+                acc1,
+            );
+            acc2 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(left.as_ptr().add(index + 16)),
+                _mm256_loadu_ps(right.as_ptr().add(index + 16)),
+                acc2,
+            );
+            acc3 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(left.as_ptr().add(index + 24)),
+                _mm256_loadu_ps(right.as_ptr().add(index + 24)),
+                acc3,
+            );
+        }
+    }
+    let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+    let mut lanes = [0.0; 8];
+    unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), acc) };
+    let mut sum = lanes.iter().sum::<f32>();
+    for index in chunks * 32..left.len() {
+        sum += left[index] * right[index];
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_avx2(left: &[f32], right: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let chunks = left.len() / 8;
+    let mut acc = _mm256_setzero_ps();
+    for chunk in 0..chunks {
+        let index = chunk * 8;
+        unsafe {
+            acc = _mm256_add_ps(
+                acc,
+                _mm256_mul_ps(
+                    _mm256_loadu_ps(left.as_ptr().add(index)),
+                    _mm256_loadu_ps(right.as_ptr().add(index)),
+                ),
+            );
+        }
+    }
+    let mut lanes = [0.0; 8];
+    unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), acc) };
+    let mut sum = lanes.iter().sum::<f32>();
+    for index in chunks * 8..left.len() {
+        sum += left[index] * right[index];
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_avx2(left: &[f32], right: &[f32]) -> f32 {
+    use std::arch::x86::*;
+    let chunks = left.len() / 8;
+    let mut acc = _mm256_setzero_ps();
+    for chunk in 0..chunks {
+        let index = chunk * 8;
+        unsafe {
+            acc = _mm256_add_ps(
+                acc,
+                _mm256_mul_ps(
+                    _mm256_loadu_ps(left.as_ptr().add(index)),
+                    _mm256_loadu_ps(right.as_ptr().add(index)),
+                ),
+            );
+        }
+    }
+    let mut lanes = [0.0; 8];
+    unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), acc) };
+    let mut sum = lanes.iter().sum::<f32>();
+    for index in chunks * 8..left.len() {
+        sum += left[index] * right[index];
+    }
+    sum
+}
+fn transpose(values: &[f32], rows: usize, columns: usize) -> Vec<f32> {
+    let mut output = vec![0.0; values.len()];
+    for row in 0..rows {
+        for column in 0..columns {
+            output[column * rows + row] = values[row * columns + column];
+        }
+    }
+    output
 }
 fn candle_error(err: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, err.to_string())

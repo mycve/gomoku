@@ -31,6 +31,16 @@ cargo run --profile fast -- az-loop
 `fast` 继承 Release 优化，但使用 Thin LTO、16 个 codegen unit 和增量编译，明显缩短
 重复编译时间；最终性能测量或正式长期训练仍可使用 `--release` 的 Fat LTO 单元构建。
 
+需要定位搜索和训练热点时，启用与 ChineseAI 相同的轻量性能分析 feature：
+
+```bash
+cargo run --profile fast --features profile -- az-bench model.safetensors 400 50
+cargo run --profile fast --features profile -- az-train-bench model.safetensors data/replay.jsonl
+```
+
+程序结束时会按总耗时排序输出调用次数、总耗时、平均耗时和最大耗时。正常长期训练不要
+启用 `profile`，避免计时器带来额外开销。
+
 人工评估默认在终端原位刷新，不会重复堆叠棋盘。对局中输入 `info` 查看 Best 上次
 搜索的候选着，输入 `help` 查看命令，输入 `quit` 退出；不支持 ANSI 的控制台可增加
 `--no-clear`。
@@ -101,5 +111,6 @@ Arena 晋级替换。
 MCTS 节点还缓存黑白双视角的增量累加器，扩展子节点时只加入新落子和手数特征，
 避免每次叶子求值重新扫描整盘。
 
-模型格式现为 v4。v3 及更早模型不能直接加载；升级后请重新执行 `az-init`，并清理
-旧回放池和旧进度文件，避免缺少剩余手数标签的历史样本进入训练。
+模型格式现为 v5，价值塔采用适合 NEON/AVX2/FMA 点积的输出优先布局。现有 v4 模型
+加载时会自动转置迁移，并在下次保存时写成 v5，无需重新训练；v3 及更早模型仍不能
+直接加载。

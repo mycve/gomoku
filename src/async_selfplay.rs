@@ -119,6 +119,7 @@ fn worker_loop(
             ^ (worker as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)
             ^ game_index.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let generated = generate_one_detailed(&snapshot, search, game_seed);
+        crate::profile::flush_thread();
         let game = SelfplayGame {
             worker,
             model_version: version,

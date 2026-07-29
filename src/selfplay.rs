@@ -64,6 +64,7 @@ pub fn generate_one_detailed(
     cfg: SearchConfig,
     mut seed: u64,
 ) -> GeneratedGame {
+    crate::scope_profile!("selfplay.game");
     let mut board = Board::new();
     let mut samples = vec![];
     let mut stats = SelfplayStats {
@@ -73,7 +74,10 @@ pub fn generate_one_detailed(
     while board.outcome().is_none() {
         let mut ply_cfg = cfg;
         ply_cfg.root_noise_seed = seed ^ board.move_count() as u64;
-        let c = search(&board, model, ply_cfg);
+        let c = {
+            crate::scope_profile!("selfplay.search");
+            search(&board, model, ply_cfg)
+        };
         if c.is_empty() {
             break;
         }

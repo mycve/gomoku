@@ -92,6 +92,7 @@ impl Board {
         mv.0 < CELL_COUNT && self.cells[mv.0] == 0 && self.outcome().is_none()
     }
     pub fn play(&mut self, mv: Move) -> bool {
+        crate::scope_profile!("game.play");
         if !self.is_legal(mv) {
             return false;
         }
@@ -102,6 +103,7 @@ impl Board {
         true
     }
     pub fn legal_moves(&self) -> Vec<Move> {
+        crate::scope_profile!("game.legal_moves");
         if self.outcome().is_some() {
             return vec![];
         }
@@ -134,6 +136,7 @@ impl Board {
             .collect()
     }
     pub fn outcome(&self) -> Option<Outcome> {
+        crate::scope_profile!("game.outcome");
         if let Some(mv) = self.last {
             let stone = self.cells[mv.0];
             for (dr, dc) in [(1, 0), (0, 1), (1, 1), (1, -1)] {

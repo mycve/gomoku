@@ -70,13 +70,21 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         initial_ema.save(&config.best_model_path)?;
         initial_ema.clone()
     };
-    let workers = if config.selfplay_workers == 0 {
-        thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
+    let max_workers = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let requested_workers = if config.selfplay_workers == 0 {
+        max_workers
     } else {
         config.selfplay_workers.max(1)
     };
+    let workers = requested_workers.min(max_workers);
+    if requested_workers > max_workers {
+        println!(
+            "workers  : requested={} capped={} available_cores={}",
+            requested_workers, workers, max_workers
+        );
+    }
     let queue_capacity = if config.selfplay_queue_capacity == 0 {
         workers.saturating_mul(8).max(32)
     } else {
@@ -167,7 +175,8 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             }
         }
     });
-    let (event_tx, event_rx) = mpsc::channel::<TrainerEvent>();
+    let (event_tx, event_rx) = mpsc::sync_channel::<TrainerEvent>(0);
+    let (trainer_ack_tx, trainer_ack_rx) = mpsc::sync_channel::<()>(0);
     let trainer_stop = Arc::clone(&stop);
     let trainer_version = Arc::clone(&version);
     let trainer_config = config.clone();
@@ -240,13 +249,17 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 break;
             }
             index += 1;
+            if trainer_ack_rx.recv().is_err() {
+                break;
+            }
         }
         Ok(())
     });
-    let train_devices = candle_train::training_device_names(&config.gpu_devices)?.join(",");
+    let train_devices =
+        compact_device_names(&candle_train::training_device_names(&config.gpu_devices)?);
     let end = target_update.unwrap_or(usize::MAX);
     println!(
-        "loop     : mode=batch-async actors={} actor_queue={}(nonblocking-drop) collector_queue=1(nonblocking-drop) trainer_queue=unbounded games/update={} sims={} train_device={} batch={} arena_opening_plies={}",
+        "loop     : mode=batch-async actors={} actor_queue={}(nonblocking-drop) collector_queue=1(nonblocking-drop) trainer_queue=rendezvous games/update={} sims={} train_device={} batch={} arena_opening_plies={}",
         workers,
         queue_capacity,
         config.games_per_update,
@@ -353,6 +366,12 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 );
             }
         }
+        if progress.update >= end {
+            stop.store(true, Ordering::SeqCst);
+        }
+        trainer_ack_tx
+            .send(())
+            .map_err(|_| io::Error::other("Trainer 确认通道提前关闭"))?;
     }
     stop.store(true, Ordering::SeqCst);
     drop(event_rx);
@@ -455,6 +474,33 @@ fn current_lr(c: &AzLoopConfig, update: usize) -> f32 {
     let exponent = update.min(i32::MAX as usize) as i32;
     (c.learning_rate * c.learning_rate_decay.powi(exponent)).max(c.learning_rate_min)
 }
+
+fn compact_device_names(devices: &[String]) -> String {
+    if devices.is_empty() {
+        return "none".into();
+    }
+    let cuda_ids = devices
+        .iter()
+        .map(|name| {
+            name.strip_prefix("cuda:")
+                .and_then(|id| id.parse::<usize>().ok())
+        })
+        .collect::<Option<Vec<_>>>();
+    if let Some(ids) = cuda_ids {
+        if ids.len() == 1 {
+            return format!("cuda:{}", ids[0]);
+        }
+        if ids.windows(2).all(|pair| pair[1] == pair[0] + 1) {
+            return format!("cuda:{}-{}({}卡)", ids[0], ids[ids.len() - 1], ids.len());
+        }
+        return format!("cuda:{}卡", ids.len());
+    }
+    if devices.len() <= 2 {
+        devices.join(",")
+    } else {
+        format!("{}等{}设备", devices[0], devices.len())
+    }
+}
 fn load_or_init(path: &str) -> io::Result<PolicyValueModel> {
     if Path::new(path).exists() {
         PolicyValueModel::load(path)
@@ -504,4 +550,16 @@ fn prune_checkpoints(c: &AzLoopConfig) -> io::Result<()> {
         fs::remove_file(path)?
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compacts_sequential_cuda_devices() {
+        let devices = (0..8).map(|id| format!("cuda:{id}")).collect::<Vec<_>>();
+        assert_eq!(compact_device_names(&devices), "cuda:0-7(8卡)");
+        assert_eq!(compact_device_names(&["cuda:3".into()]), "cuda:3");
+    }
 }

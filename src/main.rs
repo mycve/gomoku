@@ -300,6 +300,7 @@ fn main() -> io::Result<()> {
         }
         Some(Command::Play(args)) => play(&load_model(&args.model)?)?,
     }
+    gomoku::profile::print_report();
     Ok(())
 }
 

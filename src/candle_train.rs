@@ -55,13 +55,17 @@ pub fn train(
             let shard_size = batch.len().div_ceil(replicas.len());
             let shards = batch.chunks(shard_size).collect::<Vec<_>>();
             let outputs = std::thread::scope(|scope| {
+                crate::scope_profile!("train.backward_parallel");
                 let handles = shards
                     .iter()
                     .enumerate()
                     .map(|(rank, shard)| {
                         let replica = &replicas[rank];
                         scope.spawn(move || {
-                            replica.backward(shard, batch.len(), moves_left_loss_weight)
+                            let result =
+                                replica.backward(shard, batch.len(), moves_left_loss_weight);
+                            crate::profile::flush_thread();
+                            result
                         })
                     })
                     .collect::<Vec<_>>();
@@ -78,15 +82,22 @@ pub fn train(
             stats.value_loss += primary.value_sum;
             stats.moves_left_loss += primary.moves_left_sum;
             for output in outputs {
+                crate::scope_profile!("train.grad_aggregate");
                 add_cpu_grads(&primary_vars, &mut primary_grads, &output.cpu_grads)?;
                 stats.samples += output.samples;
                 stats.policy_loss += output.policy_sum;
                 stats.value_loss += output.value_sum;
                 stats.moves_left_loss += output.moves_left_sum;
             }
-            optimizer.step(&primary_grads).map_err(err)?;
+            {
+                crate::scope_profile!("train.optimizer_step");
+                optimizer.step(&primary_grads).map_err(err)?;
+            }
             stats.optimizer_steps += 1;
-            broadcast(&replicas)?;
+            {
+                crate::scope_profile!("train.param_broadcast");
+                broadcast(&replicas)?;
+            }
         }
     }
     replicas[0].copy_to(model)?;
@@ -128,7 +139,7 @@ impl Replica {
             hidden_bias: var(&model.hidden_bias, (h,), device)?,
             policy_hidden: var(&model.policy_hidden, (CELL_COUNT, h), device)?,
             policy_bias: var(&model.policy_bias, (CELL_COUNT,), device)?,
-            value_head_hidden: var(&model.value_head_hidden, (h, VALUE_HEAD_SIZE), device)?,
+            value_head_hidden: var(&model.value_head_hidden, (VALUE_HEAD_SIZE, h), device)?,
             value_head_bias: var(&model.value_head_bias, (VALUE_HEAD_SIZE,), device)?,
             value_head_hidden2: var(
                 &model.value_head_hidden2,
@@ -138,7 +149,7 @@ impl Replica {
             value_head_bias2: var(&model.value_head_bias2, (VALUE_HEAD_SIZE,), device)?,
             value_head_output: var(
                 &model.value_head_output,
-                (VALUE_HEAD_SIZE, WDL_SIZE),
+                (WDL_SIZE, VALUE_HEAD_SIZE),
                 device,
             )?,
             moves_left_output: var(&model.moves_left_output, (VALUE_HEAD_SIZE, 1), device)?,
@@ -169,8 +180,12 @@ impl Replica {
         global_len: usize,
         moves_left_loss_weight: f32,
     ) -> io::Result<ShardOutput> {
-        let packed = pack(samples);
+        let packed = {
+            crate::scope_profile!("train.pack");
+            pack(samples)
+        };
         let b = samples.len();
+        crate::scope_profile!("train.tensor_h2d");
         let inputs = Tensor::from_vec(packed.inputs, (b, INPUT_SIZE), &self.device).map_err(err)?;
         let stone_counts =
             Tensor::from_vec(packed.stone_counts, (b, STONE_TYPES), &self.device).map_err(err)?;
@@ -186,14 +201,17 @@ impl Replica {
             Tensor::from_vec(packed.value_wdl, (b, WDL_SIZE), &self.device).map_err(err)?;
         let moves_left_targets =
             Tensor::from_vec(packed.moves_left, (b, 1), &self.device).map_err(err)?;
-        let hidden = inputs
-            .matmul(&self.input_hidden)
-            .and_then(|x| x.add(&stone_counts.matmul(&self.stone_hidden)?))
-            .and_then(|x| x.add(&rank_counts.matmul(&self.rank_hidden)?))
-            .and_then(|x| x.add(&file_counts.matmul(&self.file_hidden)?))
-            .and_then(|x| x.broadcast_add(&self.hidden_bias))
-            .and_then(|x| x.relu())
-            .map_err(err)?;
+        let hidden = {
+            crate::scope_profile!("train.forward");
+            inputs
+                .matmul(&self.input_hidden)
+                .and_then(|x| x.add(&stone_counts.matmul(&self.stone_hidden)?))
+                .and_then(|x| x.add(&rank_counts.matmul(&self.rank_hidden)?))
+                .and_then(|x| x.add(&file_counts.matmul(&self.file_hidden)?))
+                .and_then(|x| x.broadcast_add(&self.hidden_bias))
+                .and_then(|x| x.relu())
+                .map_err(err)?
+        };
         let rms = hidden
             .sqr()
             .and_then(|x| x.mean_keepdim(1))
@@ -213,15 +231,15 @@ impl Replica {
             .and_then(|x| x.affine(-1.0, 0.0))
             .map_err(err)?;
         let value_features = hidden
-            .matmul(&self.value_head_hidden)
+            .matmul(&self.value_head_hidden.t().map_err(err)?)
             .and_then(|x| x.broadcast_add(&self.value_head_bias))
             .and_then(|x| x.relu())
-            .and_then(|x| x.matmul(&self.value_head_hidden2))
+            .and_then(|x| x.matmul(&self.value_head_hidden2.t()?))
             .and_then(|x| x.broadcast_add(&self.value_head_bias2))
             .and_then(|x| x.relu())
             .map_err(err)?;
         let value_logits = value_features
-            .matmul(&self.value_head_output)
+            .matmul(&self.value_head_output.t().map_err(err)?)
             .map_err(err)?;
         let value_log_probs = log_softmax(&value_logits, 1).map_err(err)?;
         let value_sum_tensor = value_wdl
@@ -244,7 +262,10 @@ impl Replica {
         let policy_sum = policy_sum_tensor.to_scalar::<f32>().map_err(err)?;
         let value_sum = value_sum_tensor.to_scalar::<f32>().map_err(err)?;
         let moves_left_sum = moves_left_sum_tensor.to_scalar::<f32>().map_err(err)?;
-        let grads = loss.backward().map_err(err)?;
+        let grads = {
+            crate::scope_profile!("train.backward");
+            loss.backward().map_err(err)?
+        };
         let cpu_grads = self
             .vars()
             .iter()

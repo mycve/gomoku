@@ -1,6 +1,6 @@
 use crate::{
     game::{Board, Move, Outcome},
-    model::{EvalAccumulator, PolicyValueModel},
+    model::{EvalAccumulator, EvalScratch, PolicyValueModel},
 };
 
 #[derive(Clone, Copy)]
@@ -63,15 +63,17 @@ struct Edge {
 }
 
 pub fn search(board: &Board, model: &PolicyValueModel, cfg: SearchConfig) -> Vec<Candidate> {
+    crate::scope_profile!("mcts.search");
+    let mut scratch = EvalScratch::new(model.hidden_size);
     let mut nodes = vec![Node {
         board: board.clone(),
         accumulator: model.accumulator(board),
         children: vec![],
         expanded: false,
     }];
-    expand(&mut nodes, 0, model, cfg);
+    expand(&mut nodes, 0, model, cfg, &mut scratch);
     for _ in 0..cfg.simulations {
-        simulate(&mut nodes, 0, model, cfg);
+        simulate(&mut nodes, 0, model, cfg, &mut scratch);
     }
     let mut out: Vec<_> = nodes[0]
         .children
@@ -90,7 +92,14 @@ pub fn search(board: &Board, model: &PolicyValueModel, cfg: SearchConfig) -> Vec
     out.sort_by_key(|x| std::cmp::Reverse(x.visits));
     out
 }
-fn expand(nodes: &mut Vec<Node>, idx: usize, model: &PolicyValueModel, cfg: SearchConfig) -> f32 {
+fn expand(
+    nodes: &mut Vec<Node>,
+    idx: usize,
+    model: &PolicyValueModel,
+    cfg: SearchConfig,
+    scratch: &mut EvalScratch,
+) -> f32 {
+    crate::scope_profile!("mcts.expand");
     if let Some(out) = nodes[idx].board.outcome() {
         return match out {
             Outcome::Draw => 0.0,
@@ -103,11 +112,15 @@ fn expand(nodes: &mut Vec<Node>, idx: usize, model: &PolicyValueModel, cfg: Sear
             }
         };
     }
-    let (mut policy, value) = model.evaluate_accumulator_with_temperature(
-        &nodes[idx].board,
-        &nodes[idx].accumulator,
-        cfg.policy_softmax_temp,
-    );
+    let (mut policy, value) = {
+        crate::scope_profile!("mcts.nn_eval");
+        model.evaluate_accumulator_with_scratch(
+            &nodes[idx].board,
+            &nodes[idx].accumulator,
+            cfg.policy_softmax_temp,
+            scratch,
+        )
+    };
     if idx == 0 && cfg.root_dirichlet_alpha > 0.0 && cfg.root_exploration_fraction > 0.0 {
         let mut priors = policy.iter().map(|(_, prior)| *prior).collect::<Vec<_>>();
         apply_root_dirichlet_noise(
@@ -120,20 +133,29 @@ fn expand(nodes: &mut Vec<Node>, idx: usize, model: &PolicyValueModel, cfg: Sear
             *prior = noisy;
         }
     }
-    nodes[idx].children = policy
-        .into_iter()
-        .map(|(mv, prior)| Edge {
-            mv,
-            prior,
-            visits: 0,
-            value_sum: 0.0,
-            child: None,
-        })
-        .collect();
+    {
+        crate::scope_profile!("mcts.children_build");
+        nodes[idx].children = policy
+            .into_iter()
+            .map(|(mv, prior)| Edge {
+                mv,
+                prior,
+                visits: 0,
+                value_sum: 0.0,
+                child: None,
+            })
+            .collect();
+    }
     nodes[idx].expanded = true;
     value
 }
-fn simulate(nodes: &mut Vec<Node>, idx: usize, model: &PolicyValueModel, cfg: SearchConfig) -> f32 {
+fn simulate(
+    nodes: &mut Vec<Node>,
+    idx: usize,
+    model: &PolicyValueModel,
+    cfg: SearchConfig,
+    scratch: &mut EvalScratch,
+) -> f32 {
     if let Some(out) = nodes[idx].board.outcome() {
         return match out {
             Outcome::Draw => 0.0,
@@ -147,31 +169,37 @@ fn simulate(nodes: &mut Vec<Node>, idx: usize, model: &PolicyValueModel, cfg: Se
         };
     }
     if !nodes[idx].expanded {
-        return expand(nodes, idx, model, cfg);
+        return expand(nodes, idx, model, cfg, scratch);
     }
-    let total = nodes[idx]
-        .children
-        .iter()
-        .map(|e| e.visits)
-        .sum::<u32>()
-        .max(1) as f32;
-    let mut best = 0;
-    let mut score = f32::NEG_INFINITY;
-    for (i, e) in nodes[idx].children.iter().enumerate() {
-        let q = if e.visits == 0 {
-            0.0
-        } else {
-            e.value_sum / e.visits as f32
-        };
-        let s = q + cfg.cpuct * e.prior * total.sqrt() / (1.0 + e.visits as f32);
-        if s > score {
-            score = s;
-            best = i
+    let best = {
+        crate::scope_profile!("mcts.select_child");
+        let total = nodes[idx]
+            .children
+            .iter()
+            .map(|e| e.visits)
+            .sum::<u32>()
+            .max(1) as f32;
+        let mut best = 0;
+        let mut score = f32::NEG_INFINITY;
+        let exploration = cfg.cpuct * total.sqrt();
+        for (i, e) in nodes[idx].children.iter().enumerate() {
+            let q = if e.visits == 0 {
+                0.0
+            } else {
+                e.value_sum / e.visits as f32
+            };
+            let s = q + exploration * e.prior / (1.0 + e.visits as f32);
+            if s > score {
+                score = s;
+                best = i
+            }
         }
-    }
+        best
+    };
     let child = if let Some(c) = nodes[idx].children[best].child {
         c
     } else {
+        crate::scope_profile!("mcts.create_child");
         let mut b = nodes[idx].board.clone();
         let mv = nodes[idx].children[best].mv;
         let player = b.to_move();
@@ -187,7 +215,7 @@ fn simulate(nodes: &mut Vec<Node>, idx: usize, model: &PolicyValueModel, cfg: Se
         nodes[idx].children[best].child = Some(c);
         c
     };
-    let value = -simulate(nodes, child, model, cfg);
+    let value = -simulate(nodes, child, model, cfg, scratch);
     let e = &mut nodes[idx].children[best];
     e.visits += 1;
     e.value_sum += value;

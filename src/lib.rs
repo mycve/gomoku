@@ -5,5 +5,6 @@ pub mod candle_train;
 pub mod game;
 pub mod mcts;
 pub mod model;
+pub mod profile;
 pub mod replay;
 pub mod selfplay;
