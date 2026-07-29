@@ -1,0 +1,8 @@
+/target
+/checkpoints
+/data
+/runs
+gomoku.azloop.toml
+model.safetensors
+best.safetensors
+.idea
