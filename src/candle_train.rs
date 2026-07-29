@@ -12,6 +12,7 @@ use candle_nn::{
 use std::io;
 #[cfg(all(target_os = "linux", not(target_env = "musl")))]
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub fn training_device_names(requested: &[usize]) -> io::Result<Vec<String>> {
     Ok(make_devices(requested)?
@@ -28,6 +29,29 @@ pub fn train(
     batch_size: usize,
     requested_devices: &[usize],
     moves_left_loss_weight: f32,
+) -> io::Result<TrainStats> {
+    train_controlled(
+        model,
+        samples,
+        epochs,
+        learning_rate,
+        batch_size,
+        requested_devices,
+        moves_left_loss_weight,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn train_controlled(
+    model: &mut PolicyValueModel,
+    samples: &[Sample],
+    epochs: usize,
+    learning_rate: f32,
+    batch_size: usize,
+    requested_devices: &[usize],
+    moves_left_loss_weight: f32,
+    stop: Option<&AtomicBool>,
 ) -> io::Result<TrainStats> {
     if samples.is_empty() || epochs == 0 || learning_rate <= 0.0 {
         return Ok(TrainStats::default());
@@ -52,6 +76,10 @@ pub fn train(
     let mut stats = TrainStats::default();
     for _ in 0..epochs {
         for batch in samples.chunks(batch_size.max(1)) {
+            if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                replicas[0].copy_to(model)?;
+                return Ok(finalize_stats(stats, moves_left_loss_weight));
+            }
             let shard_size = batch.len().div_ceil(replicas.len());
             let shards = batch.chunks(shard_size).collect::<Vec<_>>();
             let outputs = std::thread::scope(|scope| {
@@ -101,13 +129,17 @@ pub fn train(
         }
     }
     replicas[0].copy_to(model)?;
+    Ok(finalize_stats(stats, moves_left_loss_weight))
+}
+
+fn finalize_stats(mut stats: TrainStats, moves_left_loss_weight: f32) -> TrainStats {
     let count = stats.samples.max(1) as f32;
     stats.policy_loss /= count;
     stats.value_loss /= count;
     stats.moves_left_loss /= count;
     stats.loss =
         stats.policy_loss + stats.value_loss + moves_left_loss_weight * stats.moves_left_loss;
-    Ok(stats)
+    stats
 }
 
 struct Replica {

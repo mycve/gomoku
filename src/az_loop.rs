@@ -5,7 +5,7 @@ use crate::{
     mcts::SearchConfig,
     model::PolicyValueModel,
     replay,
-    selfplay::{SelfplayStats, arena},
+    selfplay::{SelfplayStats, arena_controlled},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -55,8 +55,14 @@ struct TrainerEvent {
 
 pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
+    let interrupted = Arc::new(AtomicBool::new(false));
     let signal = Arc::clone(&stop);
-    ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst)).map_err(io::Error::other)?;
+    let interrupt_signal = Arc::clone(&interrupted);
+    ctrlc::set_handler(move || {
+        interrupt_signal.store(true, Ordering::SeqCst);
+        signal.store(true, Ordering::SeqCst);
+    })
+    .map_err(io::Error::other)?;
     let mut progress = load_progress(&config.progress_path)?;
     let initial_model = load_or_init(&config.model_path)?;
     let initial_ema = if Path::new(&config.ema_model_path).exists() {
@@ -69,6 +75,19 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     } else {
         initial_ema.save(&config.best_model_path)?;
         initial_ema.clone()
+    };
+    let initial_pool = if Path::new(&config.replay_path).exists() {
+        let pool = replay::load(&config.replay_path)?;
+        fs::remove_file(&config.replay_path)?;
+        println!(
+            "replay   : restored {}/{} samples from {} (file removed)",
+            pool.len(),
+            config.replay_capacity,
+            config.replay_path
+        );
+        pool
+    } else {
+        Vec::new()
     };
     let max_workers = thread::available_parallelism()
         .map(|n| n.get())
@@ -178,13 +197,14 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     let (event_tx, event_rx) = mpsc::sync_channel::<TrainerEvent>(0);
     let (trainer_ack_tx, trainer_ack_rx) = mpsc::sync_channel::<()>(0);
     let trainer_stop = Arc::clone(&stop);
+    let trainer_interrupted = Arc::clone(&interrupted);
     let trainer_version = Arc::clone(&version);
     let trainer_config = config.clone();
     let start_update = progress.update;
     let trainer = thread::spawn(move || -> io::Result<()> {
         let mut model = initial_model;
         let mut ema_model = initial_ema;
-        let mut pool = replay::load(&trainer_config.replay_path)?;
+        let mut pool = initial_pool;
         let mut index = 0usize;
         while let Ok(batch) = ready_rx.recv() {
             if trainer_stop.load(Ordering::SeqCst) {
@@ -193,12 +213,9 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             if batch.newest_version < trainer_version.load(Ordering::Acquire) {
                 continue;
             }
-            replay::append(&trainer_config.replay_path, &batch.samples)?;
             pool.extend(batch.samples.iter().cloned());
-            let mut pruned = false;
             if pool.len() > trainer_config.replay_capacity {
                 pool.drain(..pool.len() - trainer_config.replay_capacity);
-                pruned = true;
             }
             let update = start_update + index + 1;
             let lr = current_lr(&trainer_config, update - 1);
@@ -213,7 +230,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             let train_samples = sampled.samples.len();
             let recent_quota_rate = sampled.recent_quota as f32 / train_samples.max(1) as f32;
             let actual_recent_rate = sampled.actual_recent as f32 / train_samples.max(1) as f32;
-            let train_stats = candle_train::train(
+            let train_stats = candle_train::train_controlled(
                 &mut model,
                 &sampled.samples,
                 trainer_config.batch_epochs,
@@ -221,16 +238,17 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 trainer_config.batch_size,
                 &trainer_config.gpu_devices,
                 trainer_config.moves_left_loss_weight,
+                Some(&trainer_stop),
             )?;
+            if trainer_stop.load(Ordering::SeqCst) {
+                break;
+            }
             let effective_decay = trainer_config
                 .ema_decay
                 .clamp(0.0, 1.0)
                 .powi(train_stats.optimizer_steps.min(i32::MAX as usize) as i32);
             ema_model.update_ema(&model, effective_decay);
             let train_seconds = started.elapsed().as_secs_f32();
-            if pruned {
-                replay::save(&trainer_config.replay_path, &pool)?;
-            }
             if event_tx
                 .send(TrainerEvent {
                     model: ema_model.clone(),
@@ -252,6 +270,15 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             if trainer_ack_rx.recv().is_err() {
                 break;
             }
+        }
+        if trainer_interrupted.load(Ordering::SeqCst) {
+            replay::save(&trainer_config.replay_path, &pool)?;
+            println!(
+                "replay   : interrupt snapshot {} ({}/{})",
+                trainer_config.replay_path,
+                pool.len(),
+                trainer_config.replay_capacity
+            );
         }
         Ok(())
     });
@@ -275,6 +302,9 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 Ok(event) => break event,
                 Err(mpsc::RecvTimeoutError::Timeout) if stop.load(Ordering::SeqCst) => break 'main,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) if stop.load(Ordering::SeqCst) => {
+                    break 'main;
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return Err(io::Error::other("Trainer 在线程完成更新前退出"));
                 }
@@ -324,6 +354,27 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             progress.update,
         );
         tb.add_scalar("replay/samples", event.pool_samples as f32, progress.update);
+        let selfplay_seconds = event.batch.collect_seconds.max(1.0e-6);
+        tb.add_scalar(
+            "selfplay/cycle_seconds",
+            event.batch.collect_seconds,
+            progress.update,
+        );
+        tb.add_scalar(
+            "selfplay/games_per_second",
+            event.batch.games as f32 / selfplay_seconds,
+            progress.update,
+        );
+        tb.add_scalar(
+            "selfplay/samples_per_second",
+            event.batch.samples.len() as f32 / selfplay_seconds,
+            progress.update,
+        );
+        tb.add_scalar(
+            "selfplay/simulations_per_second",
+            event.batch.stats.simulations as f32 / selfplay_seconds,
+            progress.update,
+        );
         tb.add_scalar(
             "replay/train_recent_quota_rate",
             event.recent_quota_rate,
@@ -335,7 +386,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             progress.update,
         );
         if config.arena_interval > 0 && progress.update % config.arena_interval == 0 {
-            let report = arena(
+            let report = arena_controlled(
                 &event.model,
                 &best,
                 config.arena_games,
@@ -346,6 +397,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                     opening_seed: config.seed ^ progress.update as u64,
                     ..Default::default()
                 },
+                Some(&stop),
             );
             let promoted = report.score_rate() >= config.arena_promotion_rate;
             println!(
@@ -374,6 +426,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             .map_err(|_| io::Error::other("Trainer 确认通道提前关闭"))?;
     }
     stop.store(true, Ordering::SeqCst);
+    drop(trainer_ack_tx);
     drop(event_rx);
     actors.shutdown()?;
     collector
@@ -382,6 +435,9 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     trainer
         .join()
         .map_err(|_| io::Error::other("Trainer 线程异常退出"))??;
+    if !interrupted.load(Ordering::SeqCst) && Path::new(&config.replay_path).exists() {
+        fs::remove_file(&config.replay_path)?;
+    }
     tb.flush();
     println!(
         "stopped  : update={} total_games={} total_samples={}",
@@ -441,6 +497,14 @@ fn print_event(
         event.batch.oldest_version,
         event.batch.newest_version,
         event.batch.collect_seconds
+    );
+    let selfplay_seconds = event.batch.collect_seconds.max(1.0e-6);
+    println!(
+        "selfplay : cycle={:.2}s gps={:.2} samples/s={:.0} simulations/s={:.0}",
+        event.batch.collect_seconds,
+        event.batch.games as f32 / selfplay_seconds,
+        event.batch.samples.len() as f32 / selfplay_seconds,
+        event.batch.stats.simulations as f32 / selfplay_seconds
     );
     println!(
         "replay   : samples={}/{} fill={:.1}%",

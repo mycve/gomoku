@@ -94,7 +94,7 @@ Linux 多 GPU 可在配置中设置 `gpu_devices = [0, 1, 2, 3]`；留空时自�
 - `mcts.rs`：PUCT 蒙特卡洛树搜索
 - `model.rs`：可保存、可训练的策略价值模型
 - `selfplay.rs`：并行自博弈与训练
-- `replay.rs`：JSONL 回放数据
+- `replay.rs`：LZ4 压缩经验池中断快照与混合采样
 - `az_loop_config.rs`：训练配置及默认值
 - `az_loop.rs`：可续跑训练循环、检查点与竞技场晋级
 - `main.rs`：与 ChineseAI 对齐的 `az-*` 命令及人机对战入口
@@ -111,6 +111,19 @@ Arena 晋级替换。
 MCTS 节点还缓存黑白双视角的增量累加器，扩展子节点时只加入新落子和手数特征，
 避免每次叶子求值重新扫描整盘。
 
-模型格式现为 v5，价值塔采用适合 NEON/AVX2/FMA 点积的输出优先布局。现有 v4 模型
-加载时会自动转置迁移，并在下次保存时写成 v5，无需重新训练；v3 及更早模型仍不能
-直接加载。
+模型格式现为 v5，价值塔采用适合 NEON/AVX2/FMA 点积的输出优先布局。旧模型不再
+迁移；升级后请清理旧模型、进度和经验池，再用 `az-init` 开始全新训练。
+
+经验池磁盘行为与 ChineseAI 对齐：正常训练时经验池只保存在 Trainer 内存中，不再
+每个更新周期重写 50 万条 JSONL；仅在 Ctrl+C 中断时原子写入 LZ4 压缩快照。下次
+启动会加载该快照并立即删除已消费的快照文件，避免旧快照被重复加载；正常达到目标
+更新退出时不会保留中断快照。
+
+开始全新 v5 训练时，应先停止旧进程，再只删除该实验对应文件：
+
+```bash
+rm -f model.safetensors ema.safetensors best.safetensors
+rm -f data/azloop-progress.json data/replay.jsonl data/replay.jsonl.tmp
+rm -rf checkpoints runs/gomoku
+cargo run --profile fast -- az-init model.safetensors 192
+```

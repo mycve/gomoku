@@ -390,7 +390,7 @@ impl PolicyValueModel {
         };
         let version = load(&tensors, "format_version")?;
         let version = version.first().copied().unwrap_or_default();
-        if version != 4.0 && version != FORMAT_VERSION {
+        if version != FORMAT_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "不支持的五子棋模型版本",
@@ -398,7 +398,7 @@ impl PolicyValueModel {
         }
         let hidden_bias = load(&tensors, "hidden_bias")?;
         let hidden_size = hidden_bias.len();
-        let mut model = Self {
+        let model = Self {
             hidden_size,
             input_hidden: load(&tensors, "input_hidden")?,
             stone_hidden: load(&tensors, "stone_hidden")?,
@@ -415,14 +415,6 @@ impl PolicyValueModel {
             moves_left_output: load(&tensors, "moves_left_output")?,
             moves_left_bias: load(&tensors, "moves_left_bias")?,
         };
-        if version == 4.0 {
-            model.value_head_hidden =
-                transpose(&model.value_head_hidden, model.hidden_size, VALUE_HEAD_SIZE);
-            model.value_head_hidden2 =
-                transpose(&model.value_head_hidden2, VALUE_HEAD_SIZE, VALUE_HEAD_SIZE);
-            model.value_head_output =
-                transpose(&model.value_head_output, VALUE_HEAD_SIZE, WDL_SIZE);
-        }
         if model.input_hidden.len() != INPUT_SIZE * hidden_size
             || model.stone_hidden.len() != STONE_TYPES * hidden_size
             || model.rank_hidden.len() != AXIS_FEATURES * hidden_size
@@ -644,15 +636,6 @@ unsafe fn dot_avx2(left: &[f32], right: &[f32]) -> f32 {
         sum += left[index] * right[index];
     }
     sum
-}
-fn transpose(values: &[f32], rows: usize, columns: usize) -> Vec<f32> {
-    let mut output = vec![0.0; values.len()];
-    for row in 0..rows {
-        for column in 0..columns {
-            output[column * rows + row] = values[row * columns + column];
-        }
-    }
-    output
 }
 fn candle_error(err: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, err.to_string())

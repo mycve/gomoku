@@ -1,9 +1,10 @@
 use crate::game::{Board, Move};
+use lz4_flex::frame::{FrameDecoder, FrameEncoder};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, OpenOptions},
+    fs::{self, File},
     io::{self, BufRead, BufReader, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -90,38 +91,41 @@ impl SplitMix64 {
         (self.next() as usize) % len.max(1)
     }
 }
-pub fn append(path: impl AsRef<Path>, samples: &[Sample]) -> io::Result<()> {
-    if let Some(p) = path.as_ref().parent() {
-        fs::create_dir_all(p)?
-    }
-    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
-    for s in samples {
-        serde_json::to_writer(&mut f, s).map_err(io::Error::other)?;
-        writeln!(f)?
-    }
-    Ok(())
-}
 pub fn load(path: impl AsRef<Path>) -> io::Result<Vec<Sample>> {
-    let f = match std::fs::File::open(path) {
+    let file = match File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
         Err(e) => return Err(e),
     };
-    BufReader::new(f)
+    BufReader::new(FrameDecoder::new(file))
         .lines()
         .map(|l| serde_json::from_str(&l?).map_err(io::Error::other))
         .collect()
 }
 
 pub fn save(path: impl AsRef<Path>, samples: &[Sample]) -> io::Result<()> {
-    if let Some(parent) = path.as_ref().parent() {
+    let path = path.as_ref();
+    if samples.is_empty() {
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut file = std::fs::File::create(path)?;
+    let temporary = PathBuf::from(format!("{}.tmp", path.display()));
+    let file = File::create(&temporary)?;
+    let mut encoder = FrameEncoder::new(file);
     for sample in samples {
-        serde_json::to_writer(&mut file, sample).map_err(io::Error::other)?;
-        writeln!(file)?;
+        serde_json::to_writer(&mut encoder, sample).map_err(io::Error::other)?;
+        writeln!(encoder)?;
     }
+    encoder.finish().map_err(io::Error::other)?;
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    fs::rename(temporary, path)?;
     Ok(())
 }
 
@@ -155,5 +159,21 @@ mod tests {
         };
         let again = sample_mixed_recent(&pool, 1000, 0.4, 2, 7);
         assert_eq!(generations(&batch.samples), generations(&again.samples));
+    }
+
+    #[test]
+    fn lz4_snapshot_roundtrip() {
+        let path = std::env::temp_dir().join(format!(
+            "gomoku-replay-{}-{}.lz4",
+            std::process::id(),
+            20260730
+        ));
+        let samples = vec![sample(3), sample(4)];
+        save(&path, &samples).unwrap();
+        let restored = load(&path).unwrap();
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[0].generation, 3);
+        assert_eq!(restored[1].generation, 4);
+        fs::remove_file(path).unwrap();
     }
 }

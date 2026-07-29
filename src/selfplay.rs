@@ -5,6 +5,7 @@ use crate::{
     replay::Sample,
 };
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub fn generate(model: &PolicyValueModel, games: usize, cfg: SearchConfig) -> Vec<Sample> {
     (0..games)
@@ -62,7 +63,16 @@ pub struct GeneratedGame {
 pub fn generate_one_detailed(
     model: &PolicyValueModel,
     cfg: SearchConfig,
+    seed: u64,
+) -> GeneratedGame {
+    generate_one_detailed_controlled(model, cfg, seed, None)
+}
+
+pub fn generate_one_detailed_controlled(
+    model: &PolicyValueModel,
+    cfg: SearchConfig,
     mut seed: u64,
+    stop: Option<&AtomicBool>,
 ) -> GeneratedGame {
     crate::scope_profile!("selfplay.game");
     let mut board = Board::new();
@@ -71,7 +81,7 @@ pub fn generate_one_detailed(
         games: 1,
         ..Default::default()
     };
-    while board.outcome().is_none() {
+    while board.outcome().is_none() && !stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
         let mut ply_cfg = cfg;
         ply_cfg.root_noise_seed = seed ^ board.move_count() as u64;
         let c = {
@@ -265,9 +275,22 @@ pub fn arena(
     games: usize,
     cfg: SearchConfig,
 ) -> ArenaReport {
+    arena_controlled(candidate, baseline, games, cfg, None)
+}
+
+pub fn arena_controlled(
+    candidate: &PolicyValueModel,
+    baseline: &PolicyValueModel,
+    games: usize,
+    cfg: SearchConfig,
+    stop: Option<&AtomicBool>,
+) -> ArenaReport {
     (0..games)
         .into_par_iter()
         .map(|game| {
+            if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return ArenaReport::default();
+            }
             let candidate_black = game % 2 == 0;
             let mut board = Board::new();
             let opening_index = game / 2;
@@ -281,7 +304,9 @@ pub fn arena(
                 let index = random_index(&mut opening_seed, legal.len());
                 board.play(legal[index]);
             }
-            while board.outcome().is_none() {
+            while board.outcome().is_none()
+                && !stop.is_some_and(|flag| flag.load(Ordering::Relaxed))
+            {
                 let candidate_turn =
                     (board.to_move() == crate::game::Player::Black) == candidate_black;
                 let model = if candidate_turn { candidate } else { baseline };
