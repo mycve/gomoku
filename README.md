@@ -16,8 +16,14 @@ cargo run -- az-bench model.safetensors 400 20
 cargo run -- az-train-bench
 cargo run -- az-eval-best best.safetensors 800 --human-side black
 cargo run -- az-arena-best model.safetensors best.safetensors 40 400
+cargo run --profile fast -- gomocup best.safetensors --simulations 3000
 cargo run -- play
 ```
+
+`gomocup` 命令通过纯标准输入/输出实现 Gomocup/Piskvork 协议，支持 `START`、
+`BEGIN`、`TURN`、`BOARD`、`INFO timeout_turn`、`TAKEBACK`、`RESTART`、`ABOUT`
+和 `END`。协议坐标为零起始的 `x,y`；搜索同时受模拟次数上限与每步时间限制控制。
+当前规则为 15×15 freestyle Gomoku，不支持 Renju 禁手及矩形棋盘。
 
 日常开发和训练部署可使用与 ChineseAI 相同的快速优化编译模式：
 

@@ -3,6 +3,7 @@ pub mod az_loop;
 pub mod az_loop_config;
 pub mod candle_train;
 pub mod game;
+pub mod gomocup;
 pub mod mcts;
 pub mod model;
 pub mod profile;

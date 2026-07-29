@@ -2,6 +2,7 @@ use crate::{
     game::{Board, Move, Outcome},
     model::{EvalAccumulator, EvalScratch, PolicyValueModel},
 };
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy)]
 pub struct SearchConfig {
@@ -63,6 +64,24 @@ struct Edge {
 }
 
 pub fn search(board: &Board, model: &PolicyValueModel, cfg: SearchConfig) -> Vec<Candidate> {
+    search_until(board, model, cfg, None)
+}
+
+pub fn search_timed(
+    board: &Board,
+    model: &PolicyValueModel,
+    cfg: SearchConfig,
+    time_limit: Duration,
+) -> Vec<Candidate> {
+    search_until(board, model, cfg, Some(Instant::now() + time_limit))
+}
+
+fn search_until(
+    board: &Board,
+    model: &PolicyValueModel,
+    cfg: SearchConfig,
+    deadline: Option<Instant>,
+) -> Vec<Candidate> {
     crate::scope_profile!("mcts.search");
     let mut scratch = EvalScratch::new(model.hidden_size);
     let mut nodes = vec![Node {
@@ -72,7 +91,10 @@ pub fn search(board: &Board, model: &PolicyValueModel, cfg: SearchConfig) -> Vec
         expanded: false,
     }];
     expand(&mut nodes, 0, model, cfg, &mut scratch);
-    for _ in 0..cfg.simulations {
+    for simulation in 0..cfg.simulations {
+        if simulation > 0 && deadline.is_some_and(|limit| Instant::now() >= limit) {
+            break;
+        }
         simulate(&mut nodes, 0, model, cfg, &mut scratch);
     }
     let mut out: Vec<_> = nodes[0]

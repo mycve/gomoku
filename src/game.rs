@@ -90,6 +90,34 @@ impl Board {
     pub fn move_count(&self) -> usize {
         self.moves
     }
+    pub fn from_stones(stones: &[(Move, Player)]) -> Option<Self> {
+        let mut cells = vec![0; CELL_COUNT];
+        let mut black = 0usize;
+        let mut white = 0usize;
+        for &(mv, player) in stones {
+            if mv.0 >= CELL_COUNT || cells[mv.0] != 0 {
+                return None;
+            }
+            cells[mv.0] = player.stone();
+            match player {
+                Player::Black => black += 1,
+                Player::White => white += 1,
+            }
+        }
+        if black != white && black != white + 1 {
+            return None;
+        }
+        Some(Self {
+            cells,
+            to_move: if black == white {
+                Player::Black
+            } else {
+                Player::White
+            },
+            moves: stones.len(),
+            last: None,
+        })
+    }
     pub(crate) fn transformed(&self, symmetry: usize) -> Self {
         let mut cells = vec![0; CELL_COUNT];
         for (index, &stone) in self.cells.iter().enumerate() {
@@ -175,6 +203,24 @@ impl Board {
                     } else {
                         Player::White
                     }));
+                }
+            }
+        }
+        if self.last.is_none() {
+            for index in 0..CELL_COUNT {
+                let stone = self.cells[index];
+                if stone == 0 {
+                    continue;
+                }
+                let mv = Move(index);
+                for (dr, dc) in [(1, 0), (0, 1), (1, 1), (1, -1)] {
+                    if line_shape(self, mv, stone, dr, dc).0 >= 5 {
+                        return Some(Outcome::Win(if stone == 1 {
+                            Player::Black
+                        } else {
+                            Player::White
+                        }));
+                    }
                 }
             }
         }
@@ -398,5 +444,22 @@ mod tests {
             normalize_global_tactical_features(&mut other_global);
             assert_eq!(global, other_global);
         }
+    }
+    #[test]
+    fn restores_protocol_position_without_move_history() {
+        let stones = [
+            (Move::new(7, 3).unwrap(), Player::Black),
+            (Move::new(0, 0).unwrap(), Player::White),
+            (Move::new(7, 4).unwrap(), Player::Black),
+            (Move::new(0, 1).unwrap(), Player::White),
+            (Move::new(7, 5).unwrap(), Player::Black),
+            (Move::new(0, 2).unwrap(), Player::White),
+            (Move::new(7, 6).unwrap(), Player::Black),
+            (Move::new(0, 3).unwrap(), Player::White),
+            (Move::new(7, 7).unwrap(), Player::Black),
+        ];
+        let board = Board::from_stones(&stones).unwrap();
+        assert_eq!(board.to_move(), Player::White);
+        assert_eq!(board.outcome(), Some(Outcome::Win(Player::Black)));
     }
 }
