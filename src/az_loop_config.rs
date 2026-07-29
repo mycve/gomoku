@@ -59,7 +59,7 @@ impl Default for AzLoopConfig {
             best_model_path: "best.safetensors".into(),
             replay_path: "data/replay.jsonl".into(),
             progress_path: "data/azloop-progress.json".into(),
-            simulations: 400,
+            simulations: 3000,
             seed: 20260730,
             games_per_update: 1000,
             selfplay_workers: 196,
@@ -90,8 +90,8 @@ impl Default for AzLoopConfig {
             checkpoint_dir: "checkpoints".into(),
             max_checkpoints: 20,
             arena_interval: 10,
-            arena_games: 20,
-            arena_simulations: 400,
+            arena_games: 100,
+            arena_simulations: 3000,
             arena_opening_plies: 2,
             arena_promotion_rate: 0.55,
             tensorboard_logdir: "runs/gomoku".into(),
@@ -176,7 +176,7 @@ ema_model_path = "ema.safetensors"
 best_model_path = "best.safetensors"
 replay_path = "data/replay.jsonl"
 progress_path = "data/azloop-progress.json"
-simulations = 400
+simulations = 3000
 seed = 20260730
 games_per_update = 1000
 selfplay_workers = 196
@@ -207,8 +207,8 @@ checkpoint_interval = 20
 checkpoint_dir = "checkpoints"
 max_checkpoints = 20
 arena_interval = 10
-arena_games = 20
-arena_simulations = 400
+arena_games = 100
+arena_simulations = 3000
 arena_opening_plies = 2
 arena_promotion_rate = 0.550000011920929
 tensorboard_logdir = "runs/gomoku"

@@ -386,6 +386,12 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             progress.update,
         );
         if config.arena_interval > 0 && progress.update % config.arena_interval == 0 {
+            println!(
+                "arena    : starting games={} simulations={} workers={}",
+                config.arena_games,
+                config.arena_simulations,
+                rayon::current_num_threads().min(config.arena_games.max(1))
+            );
             let report = arena_controlled(
                 &event.model,
                 &best,

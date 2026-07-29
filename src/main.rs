@@ -60,7 +60,7 @@ struct AzInitArgs {
 struct AzSearchArgs {
     #[arg(default_value = "model.safetensors")]
     model: String,
-    #[arg(default_value_t = 400)]
+    #[arg(default_value_t = 3000)]
     simulations: usize,
     #[arg(default_value_t = 1.5)]
     cpuct: f32,
@@ -72,7 +72,7 @@ struct AzSearchArgs {
 struct AzBenchArgs {
     #[arg(default_value = "model.safetensors")]
     model: String,
-    #[arg(default_value_t = 400)]
+    #[arg(default_value_t = 3000)]
     simulations: usize,
     #[arg(default_value_t = 20)]
     repeat: usize,
@@ -112,9 +112,9 @@ struct AzArenaBestArgs {
     candidate: String,
     #[arg(default_value = "best.safetensors")]
     best: String,
-    #[arg(default_value_t = 40)]
+    #[arg(default_value_t = 100)]
     games: usize,
-    #[arg(default_value_t = 400)]
+    #[arg(default_value_t = 3000)]
     simulations: usize,
     #[arg(default_value_t = 1.5)]
     cpuct: f32,
@@ -133,7 +133,7 @@ enum HumanSide {
 struct AzEvalBestArgs {
     #[arg(default_value = "best.safetensors")]
     best: String,
-    #[arg(default_value_t = 800)]
+    #[arg(default_value_t = 3000)]
     simulations: usize,
     #[arg(default_value_t = 1.5)]
     cpuct: f32,
@@ -247,8 +247,12 @@ fn main() -> io::Result<()> {
             let best = load_model(&args.best)?;
             println!("best-eval: candidate={} best={}", args.candidate, args.best);
             println!(
-                "settings : games={} simulations={} cpuct={} opening_random_plies=2 confidence_z={}",
-                args.games, args.simulations, args.cpuct, args.confidence_z
+                "settings : games={} simulations={} cpuct={} opening_random_plies=2 workers={} confidence_z={}",
+                args.games,
+                args.simulations,
+                args.cpuct,
+                rayon::current_num_threads().min(args.games.max(1)),
+                args.confidence_z
             );
             let started = Instant::now();
             let report = arena(

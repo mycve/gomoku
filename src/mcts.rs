@@ -23,7 +23,7 @@ pub struct SearchConfig {
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
-            simulations: 400,
+            simulations: 3000,
             cpuct: 1.5,
             root_dirichlet_alpha: 0.0,
             root_exploration_fraction: 0.0,

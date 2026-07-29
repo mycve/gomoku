@@ -3,6 +3,7 @@ use std::fmt;
 
 pub const BOARD_SIZE: usize = 15;
 pub const CELL_COUNT: usize = BOARD_SIZE * BOARD_SIZE;
+pub const TACTICAL_FEATURES: usize = 24;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Player {
@@ -88,6 +89,18 @@ impl Board {
     pub fn move_count(&self) -> usize {
         self.moves
     }
+    pub(crate) fn transformed(&self, symmetry: usize) -> Self {
+        let mut cells = vec![0; CELL_COUNT];
+        for (index, &stone) in self.cells.iter().enumerate() {
+            cells[transform_index(index, symmetry)] = stone;
+        }
+        Self {
+            cells,
+            to_move: self.to_move,
+            moves: self.moves,
+            last: self.last.map(|mv| Move(transform_index(mv.0, symmetry))),
+        }
+    }
     pub fn is_legal(&self, mv: Move) -> bool {
         mv.0 < CELL_COUNT && self.cells[mv.0] == 0 && self.outcome().is_none()
     }
@@ -168,6 +181,102 @@ impl Board {
     }
 }
 
+pub(crate) fn tactical_features(board: &Board, mv: Move) -> [f32; TACTICAL_FEATURES] {
+    let mut features = [0.0; TACTICAL_FEATURES];
+    if mv.0 >= CELL_COUNT || board.cells[mv.0] != 0 {
+        return features;
+    }
+    let us = board.to_move().stone();
+    let directions = [(1, 0), (0, 1), (1, 1), (1, -1)];
+    let mut own_four = 0;
+    let mut opponent_four = 0;
+    let mut own_open_three = 0;
+    let mut opponent_open_three = 0;
+    for (direction, (dr, dc)) in directions.into_iter().enumerate() {
+        let (own_run, own_open) = line_shape(board, mv, us, dr, dc);
+        let (opponent_run, opponent_open) = line_shape(board, mv, -us, dr, dc);
+        let base = direction * 4;
+        features[base] = own_run.min(5) as f32 / 5.0;
+        features[base + 1] = own_open as f32 / 2.0;
+        features[base + 2] = opponent_run.min(5) as f32 / 5.0;
+        features[base + 3] = opponent_open as f32 / 2.0;
+        own_four += usize::from(own_run >= 4);
+        opponent_four += usize::from(opponent_run >= 4);
+        own_open_three += usize::from(own_run >= 3 && own_open == 2);
+        opponent_open_three += usize::from(opponent_run >= 3 && opponent_open == 2);
+    }
+    features[16] = f32::from(
+        own_four > 0
+            && directions
+                .into_iter()
+                .any(|(dr, dc)| line_shape(board, mv, us, dr, dc).0 >= 5),
+    );
+    features[17] = f32::from(
+        opponent_four > 0
+            && directions
+                .into_iter()
+                .any(|(dr, dc)| line_shape(board, mv, -us, dr, dc).0 >= 5),
+    );
+    features[18] = own_four as f32 / 4.0;
+    features[19] = opponent_four as f32 / 4.0;
+    features[20] = own_open_three as f32 / 4.0;
+    features[21] = opponent_open_three as f32 / 4.0;
+    for dr in -2i32..=2 {
+        for dc in -2i32..=2 {
+            if dr == 0 && dc == 0 {
+                continue;
+            }
+            let row = mv.row() as i32 + dr;
+            let col = mv.col() as i32 + dc;
+            if row >= 0 && col >= 0 && row < BOARD_SIZE as i32 && col < BOARD_SIZE as i32 {
+                let stone = board.cells[row as usize * BOARD_SIZE + col as usize];
+                features[if stone == us { 22 } else { 23 }] += f32::from(stone != 0) / 24.0;
+            }
+        }
+    }
+    features
+}
+
+fn line_shape(board: &Board, mv: Move, stone: i8, dr: i32, dc: i32) -> (usize, usize) {
+    let mut run = 1;
+    let mut open = 0;
+    for sign in [-1, 1] {
+        let mut row = mv.row() as i32 + dr * sign;
+        let mut col = mv.col() as i32 + dc * sign;
+        while row >= 0
+            && col >= 0
+            && row < BOARD_SIZE as i32
+            && col < BOARD_SIZE as i32
+            && board.cells[row as usize * BOARD_SIZE + col as usize] == stone
+        {
+            run += 1;
+            row += dr * sign;
+            col += dc * sign;
+        }
+        if row >= 0
+            && col >= 0
+            && row < BOARD_SIZE as i32
+            && col < BOARD_SIZE as i32
+            && board.cells[row as usize * BOARD_SIZE + col as usize] == 0
+        {
+            open += 1;
+        }
+    }
+    (run, open)
+}
+
+pub(crate) fn transform_index(index: usize, symmetry: usize) -> usize {
+    let mut row = index / BOARD_SIZE;
+    let mut col = index % BOARD_SIZE;
+    if symmetry & 4 != 0 {
+        col = BOARD_SIZE - 1 - col;
+    }
+    for _ in 0..(symmetry & 3) {
+        (row, col) = (col, BOARD_SIZE - 1 - row);
+    }
+    row * BOARD_SIZE + col
+}
+
 impl fmt::Display for Board {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "   ")?;
@@ -214,6 +323,37 @@ mod tests {
         for s in ["a1", "h8", "o15"] {
             let m = Move::parse(s).unwrap();
             assert_eq!(m.notation(), s);
+        }
+    }
+    #[test]
+    fn eight_symmetries_are_distinct_and_invertible() {
+        let point = Move::new(2, 4).unwrap().0;
+        let mut mapped = (0..8)
+            .map(|s| transform_index(point, s))
+            .collect::<Vec<_>>();
+        mapped.sort_unstable();
+        mapped.dedup();
+        assert_eq!(mapped.len(), 8);
+        for symmetry in 0..8 {
+            assert!(transform_index(point, symmetry) < CELL_COUNT);
+        }
+    }
+    #[test]
+    fn tactical_features_detect_win_and_survive_symmetry() {
+        let mut board = Board::new();
+        for col in 3..7 {
+            assert!(board.play(Move::new(7, col).unwrap()));
+            assert!(board.play(Move::new(0, col).unwrap()));
+        }
+        let mv = Move::new(7, 7).unwrap();
+        let features = tactical_features(&board, mv);
+        assert_eq!(features[16], 1.0);
+        assert!(features[18] > 0.0);
+        for symmetry in 0..8 {
+            let transformed = board.transformed(symmetry);
+            let transformed_move = Move(transform_index(mv.0, symmetry));
+            let other = tactical_features(&transformed, transformed_move);
+            assert_eq!(&features[16..22], &other[16..22]);
         }
     }
 }

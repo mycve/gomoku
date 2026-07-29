@@ -1,6 +1,9 @@
 use crate::{
-    game::CELL_COUNT,
-    model::{AXIS_FEATURES, INPUT_SIZE, PolicyValueModel, STONE_TYPES, VALUE_HEAD_SIZE, WDL_SIZE},
+    game::{CELL_COUNT, TACTICAL_FEATURES, tactical_features},
+    model::{
+        AXIS_FEATURES, DIAGONAL_FEATURES, INPUT_SIZE, PolicyValueModel, STONE_TYPES,
+        VALUE_HEAD_SIZE, WDL_SIZE,
+    },
     replay::Sample,
     selfplay::TrainStats,
 };
@@ -148,9 +151,12 @@ struct Replica {
     stone_hidden: Var,
     rank_hidden: Var,
     file_hidden: Var,
+    diagonal_hidden: Var,
+    anti_diagonal_hidden: Var,
     hidden_bias: Var,
     policy_hidden: Var,
     policy_bias: Var,
+    policy_tactical: Var,
     value_head_hidden: Var,
     value_head_bias: Var,
     value_head_hidden2: Var,
@@ -168,9 +174,12 @@ impl Replica {
             stone_hidden: var(&model.stone_hidden, (STONE_TYPES, h), device)?,
             rank_hidden: var(&model.rank_hidden, (AXIS_FEATURES, h), device)?,
             file_hidden: var(&model.file_hidden, (AXIS_FEATURES, h), device)?,
+            diagonal_hidden: var(&model.diagonal_hidden, (DIAGONAL_FEATURES, h), device)?,
+            anti_diagonal_hidden: var(&model.anti_diagonal_hidden, (DIAGONAL_FEATURES, h), device)?,
             hidden_bias: var(&model.hidden_bias, (h,), device)?,
             policy_hidden: var(&model.policy_hidden, (CELL_COUNT, h), device)?,
             policy_bias: var(&model.policy_bias, (CELL_COUNT,), device)?,
+            policy_tactical: var(&model.policy_tactical, (TACTICAL_FEATURES, 1), device)?,
             value_head_hidden: var(&model.value_head_hidden, (VALUE_HEAD_SIZE, h), device)?,
             value_head_bias: var(&model.value_head_bias, (VALUE_HEAD_SIZE,), device)?,
             value_head_hidden2: var(
@@ -194,9 +203,12 @@ impl Replica {
             self.stone_hidden.clone(),
             self.rank_hidden.clone(),
             self.file_hidden.clone(),
+            self.diagonal_hidden.clone(),
+            self.anti_diagonal_hidden.clone(),
             self.hidden_bias.clone(),
             self.policy_hidden.clone(),
             self.policy_bias.clone(),
+            self.policy_tactical.clone(),
             self.value_head_hidden.clone(),
             self.value_head_bias.clone(),
             self.value_head_hidden2.clone(),
@@ -225,10 +237,29 @@ impl Replica {
             Tensor::from_vec(packed.rank_counts, (b, AXIS_FEATURES), &self.device).map_err(err)?;
         let file_counts =
             Tensor::from_vec(packed.file_counts, (b, AXIS_FEATURES), &self.device).map_err(err)?;
+        let diagonal_counts =
+            Tensor::from_vec(packed.diagonal_counts, (b, DIAGONAL_FEATURES), &self.device)
+                .map_err(err)?;
+        let anti_diagonal_counts = Tensor::from_vec(
+            packed.anti_diagonal_counts,
+            (b, DIAGONAL_FEATURES),
+            &self.device,
+        )
+        .map_err(err)?;
         let targets =
             Tensor::from_vec(packed.policy_targets, (b, CELL_COUNT), &self.device).map_err(err)?;
         let masks =
             Tensor::from_vec(packed.policy_masks, (b, CELL_COUNT), &self.device).map_err(err)?;
+        let tactical = Tensor::from_vec(
+            packed.tactical,
+            (b * CELL_COUNT, TACTICAL_FEATURES),
+            &self.device,
+        )
+        .map_err(err)?;
+        let tactical_logits = tactical
+            .matmul(&self.policy_tactical)
+            .and_then(|x| x.reshape((b, CELL_COUNT)))
+            .map_err(err)?;
         let value_wdl =
             Tensor::from_vec(packed.value_wdl, (b, WDL_SIZE), &self.device).map_err(err)?;
         let moves_left_targets =
@@ -240,6 +271,8 @@ impl Replica {
                 .and_then(|x| x.add(&stone_counts.matmul(&self.stone_hidden)?))
                 .and_then(|x| x.add(&rank_counts.matmul(&self.rank_hidden)?))
                 .and_then(|x| x.add(&file_counts.matmul(&self.file_hidden)?))
+                .and_then(|x| x.add(&diagonal_counts.matmul(&self.diagonal_hidden)?))
+                .and_then(|x| x.add(&anti_diagonal_counts.matmul(&self.anti_diagonal_hidden)?))
                 .and_then(|x| x.broadcast_add(&self.hidden_bias))
                 .and_then(|x| x.relu())
                 .map_err(err)?
@@ -254,6 +287,7 @@ impl Replica {
         let logits = hidden
             .matmul(&self.policy_hidden.t().map_err(err)?)
             .and_then(|x| x.broadcast_add(&self.policy_bias))
+            .and_then(|x| x.add(&tactical_logits))
             .and_then(|x| x.add(&masks))
             .map_err(err)?;
         let log_probs = log_softmax(&logits, 1).map_err(err)?;
@@ -349,16 +383,19 @@ impl Replica {
         m.stone_hidden = v[1].clone();
         m.rank_hidden = v[2].clone();
         m.file_hidden = v[3].clone();
-        m.hidden_bias = v[4].clone();
-        m.policy_hidden = v[5].clone();
-        m.policy_bias = v[6].clone();
-        m.value_head_hidden = v[7].clone();
-        m.value_head_bias = v[8].clone();
-        m.value_head_hidden2 = v[9].clone();
-        m.value_head_bias2 = v[10].clone();
-        m.value_head_output = v[11].clone();
-        m.moves_left_output = v[12].clone();
-        m.moves_left_bias = v[13].clone();
+        m.diagonal_hidden = v[4].clone();
+        m.anti_diagonal_hidden = v[5].clone();
+        m.hidden_bias = v[6].clone();
+        m.policy_hidden = v[7].clone();
+        m.policy_bias = v[8].clone();
+        m.policy_tactical = v[9].clone();
+        m.value_head_hidden = v[10].clone();
+        m.value_head_bias = v[11].clone();
+        m.value_head_hidden2 = v[12].clone();
+        m.value_head_bias2 = v[13].clone();
+        m.value_head_output = v[14].clone();
+        m.moves_left_output = v[15].clone();
+        m.moves_left_bias = v[16].clone();
         Ok(())
     }
 }
@@ -471,8 +508,11 @@ struct Packed {
     stone_counts: Vec<f32>,
     rank_counts: Vec<f32>,
     file_counts: Vec<f32>,
+    diagonal_counts: Vec<f32>,
+    anti_diagonal_counts: Vec<f32>,
     policy_targets: Vec<f32>,
     policy_masks: Vec<f32>,
+    tactical: Vec<f32>,
     value_wdl: Vec<f32>,
     moves_left: Vec<f32>,
 }
@@ -481,8 +521,11 @@ fn pack(samples: &[Sample]) -> Packed {
     let mut stone_counts = vec![0.0; samples.len() * STONE_TYPES];
     let mut rank_counts = vec![0.0; samples.len() * AXIS_FEATURES];
     let mut file_counts = vec![0.0; samples.len() * AXIS_FEATURES];
+    let mut diagonal_counts = vec![0.0; samples.len() * DIAGONAL_FEATURES];
+    let mut anti_diagonal_counts = vec![0.0; samples.len() * DIAGONAL_FEATURES];
     let mut targets = vec![0.0; samples.len() * CELL_COUNT];
     let mut masks = vec![-1e9; samples.len() * CELL_COUNT];
+    let mut tactical = vec![0.0; samples.len() * CELL_COUNT * TACTICAL_FEATURES];
     let mut value_wdl = Vec::with_capacity(samples.len() * WDL_SIZE);
     let mut moves_left = Vec::with_capacity(samples.len());
     for (row, s) in samples.iter().enumerate() {
@@ -493,16 +536,23 @@ fn pack(samples: &[Sample]) -> Packed {
                 stone_counts[row * STONE_TYPES] += 1.0;
                 rank_counts[row * AXIS_FEATURES + sq / 15] += 1.0;
                 file_counts[row * AXIS_FEATURES + sq % 15] += 1.0;
+                diagonal_counts[row * DIAGONAL_FEATURES + sq / 15 + 14 - sq % 15] += 1.0;
+                anti_diagonal_counts[row * DIAGONAL_FEATURES + sq / 15 + sq % 15] += 1.0;
             } else if stone == -us {
                 inputs[row * INPUT_SIZE + CELL_COUNT + sq] = 1.0;
                 stone_counts[row * STONE_TYPES + 1] += 1.0;
                 rank_counts[row * AXIS_FEATURES + 15 + sq / 15] += 1.0;
                 file_counts[row * AXIS_FEATURES + 15 + sq % 15] += 1.0;
+                diagonal_counts[row * DIAGONAL_FEATURES + 29 + sq / 15 + 14 - sq % 15] += 1.0;
+                anti_diagonal_counts[row * DIAGONAL_FEATURES + 29 + sq / 15 + sq % 15] += 1.0;
             }
         }
         inputs[row * INPUT_SIZE + INPUT_SIZE - 1] = s.board.move_count() as f32 / CELL_COUNT as f32;
         for m in s.board.legal_moves() {
-            masks[row * CELL_COUNT + m.0] = 0.0
+            masks[row * CELL_COUNT + m.0] = 0.0;
+            let offset = (row * CELL_COUNT + m.0) * TACTICAL_FEATURES;
+            tactical[offset..offset + TACTICAL_FEATURES]
+                .copy_from_slice(&tactical_features(&s.board, m));
         }
         let sum: f32 = s.policy.iter().map(|(_, p)| p.max(0.0)).sum();
         for &(m, p) in &s.policy {
@@ -510,13 +560,22 @@ fn pack(samples: &[Sample]) -> Packed {
                 targets[row * CELL_COUNT + m.0] = p.max(0.0) / sum
             }
         }
-        value_wdl.extend_from_slice(if s.value > 0.5 {
-            &[1.0, 0.0, 0.0]
+        let search_value = s.search_value.clamp(-1.0, 1.0);
+        let search_draw = (1.0 - search_value.abs()) * 0.25;
+        let search_decisive = 1.0 - search_draw;
+        let search_wdl = [
+            search_decisive * (1.0 + search_value) * 0.5,
+            search_draw,
+            search_decisive * (1.0 - search_value) * 0.5,
+        ];
+        let final_wdl = if s.value > 0.5 {
+            [1.0, 0.0, 0.0]
         } else if s.value < -0.5 {
-            &[0.0, 0.0, 1.0]
+            [0.0, 0.0, 1.0]
         } else {
-            &[0.0, 1.0, 0.0]
-        });
+            [0.0, 1.0, 0.0]
+        };
+        value_wdl.extend((0..WDL_SIZE).map(|i| final_wdl[i] * 0.75 + search_wdl[i] * 0.25));
         moves_left.push((s.moves_left / CELL_COUNT as f32).clamp(0.0, 1.0));
     }
     Packed {
@@ -524,8 +583,11 @@ fn pack(samples: &[Sample]) -> Packed {
         stone_counts,
         rank_counts,
         file_counts,
+        diagonal_counts,
+        anti_diagonal_counts,
         policy_targets: targets,
         policy_masks: masks,
+        tactical,
         value_wdl,
         moves_left,
     }
@@ -549,6 +611,7 @@ mod tests {
             board: Board::new(),
             policy: vec![(Move::new(7, 7).unwrap(), 1.0)],
             value: 0.0,
+            search_value: 0.0,
             moves_left: 20.0,
             generation: 0,
         };

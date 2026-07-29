@@ -1,4 +1,4 @@
-use crate::game::{Board, Move};
+use crate::game::{Board, Move, transform_index};
 use lz4_flex::frame::{FrameDecoder, FrameEncoder};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -13,9 +13,28 @@ pub struct Sample {
     pub policy: Vec<(Move, f32)>,
     pub value: f32,
     #[serde(default)]
+    pub search_value: f32,
+    #[serde(default)]
     pub moves_left: f32,
     #[serde(default)]
     pub generation: u64,
+}
+
+impl Sample {
+    fn transformed(&self, symmetry: usize) -> Self {
+        Self {
+            board: self.board.transformed(symmetry),
+            policy: self
+                .policy
+                .iter()
+                .map(|&(mv, probability)| (Move(transform_index(mv.0, symmetry)), probability))
+                .collect(),
+            value: self.value,
+            search_value: self.search_value,
+            moves_left: self.moves_left,
+            generation: self.generation,
+        }
+    }
 }
 
 pub struct MixedSampleBatch {
@@ -58,10 +77,12 @@ pub fn sample_mixed_recent(
     let mut rng = SplitMix64(seed);
     let mut samples = Vec::with_capacity(count);
     for _ in 0..recent_quota {
-        samples.push(pool[recent[rng.index(recent.len())]].clone());
+        let sample = &pool[recent[rng.index(recent.len())]];
+        samples.push(sample.transformed(rng.index(8)));
     }
     for _ in recent_quota..count {
-        samples.push(pool[rng.index(pool.len())].clone());
+        let sample = &pool[rng.index(pool.len())];
+        samples.push(sample.transformed(rng.index(8)));
     }
     for index in (1..samples.len()).rev() {
         let other = rng.index(index + 1);
@@ -138,6 +159,7 @@ mod tests {
             board: Board::new(),
             policy: Vec::new(),
             value: 0.0,
+            search_value: 0.0,
             moves_left: 1.0,
             generation,
         }

@@ -1,4 +1,6 @@
-use crate::game::{Board, CELL_COUNT, Move, Player};
+use crate::game::{
+    BOARD_SIZE, Board, CELL_COUNT, Move, Player, TACTICAL_FEATURES, tactical_features,
+};
 use candle_core::{DType, Device, Shape, Var};
 use candle_nn::VarMap;
 use std::{fs, io, path::Path};
@@ -9,7 +11,8 @@ pub const VALUE_HEAD_SIZE: usize = 96;
 pub const WDL_SIZE: usize = 3;
 pub const STONE_TYPES: usize = 2;
 pub const AXIS_FEATURES: usize = STONE_TYPES * 15;
-const FORMAT_VERSION: f32 = 5.0;
+pub const DIAGONAL_FEATURES: usize = STONE_TYPES * (BOARD_SIZE * 2 - 1);
+const FORMAT_VERSION: f32 = 7.0;
 
 #[derive(Clone)]
 pub struct PolicyValueModel {
@@ -18,9 +21,12 @@ pub struct PolicyValueModel {
     pub(crate) stone_hidden: Vec<f32>,
     pub(crate) rank_hidden: Vec<f32>,
     pub(crate) file_hidden: Vec<f32>,
+    pub(crate) diagonal_hidden: Vec<f32>,
+    pub(crate) anti_diagonal_hidden: Vec<f32>,
     pub(crate) hidden_bias: Vec<f32>,
     pub(crate) policy_hidden: Vec<f32>,
     pub(crate) policy_bias: Vec<f32>,
+    pub(crate) policy_tactical: Vec<f32>,
     pub(crate) value_head_hidden: Vec<f32>,
     pub(crate) value_head_bias: Vec<f32>,
     pub(crate) value_head_hidden2: Vec<f32>,
@@ -85,9 +91,12 @@ impl PolicyValueModel {
             stone_hidden: vec![0.0; STONE_TYPES * hidden_size],
             rank_hidden: vec![0.0; AXIS_FEATURES * hidden_size],
             file_hidden: vec![0.0; AXIS_FEATURES * hidden_size],
+            diagonal_hidden: vec![0.0; DIAGONAL_FEATURES * hidden_size],
+            anti_diagonal_hidden: vec![0.0; DIAGONAL_FEATURES * hidden_size],
             hidden_bias: vec![0.0; hidden_size],
             policy_hidden,
             policy_bias,
+            policy_tactical: vec![0.0; TACTICAL_FEATURES],
             value_head_hidden: (0..hidden_size * VALUE_HEAD_SIZE)
                 .map(|_| rng.weight((2.0 / hidden_size as f32).sqrt() * 0.5))
                 .collect(),
@@ -154,7 +163,7 @@ impl PolicyValueModel {
             scratch.logits.extend(
                 moves
                     .iter()
-                    .map(|m| self.policy_logit(&scratch.hidden, m.0)),
+                    .map(|m| self.policy_logit(board, &scratch.hidden, *m)),
             );
         }
         let max = scratch
@@ -265,12 +274,18 @@ impl PolicyValueModel {
             let exact = (side * CELL_COUNT + mv.0) * self.hidden_size;
             let rank = (side * 15 + mv.row()) * self.hidden_size;
             let file = (side * 15 + mv.col()) * self.hidden_size;
+            let diagonal = (side * (BOARD_SIZE * 2 - 1) + mv.row() + BOARD_SIZE - 1 - mv.col())
+                * self.hidden_size;
+            let anti_diagonal =
+                (side * (BOARD_SIZE * 2 - 1) + mv.row() + mv.col()) * self.hidden_size;
             let stone = side * self.hidden_size;
             for h in 0..self.hidden_size {
                 hidden[h] += self.input_hidden[exact + h]
                     + self.stone_hidden[stone + h]
                     + self.rank_hidden[rank + h]
-                    + self.file_hidden[file + h];
+                    + self.file_hidden[file + h]
+                    + self.diagonal_hidden[diagonal + h]
+                    + self.anti_diagonal_hidden[anti_diagonal + h];
             }
         }
     }
@@ -299,11 +314,12 @@ impl PolicyValueModel {
         }
     }
 
-    fn policy_logit(&self, hidden: &[f32], sq: usize) -> f32 {
+    fn policy_logit(&self, board: &Board, hidden: &[f32], mv: Move) -> f32 {
         dot(
             hidden,
-            &self.policy_hidden[sq * self.hidden_size..(sq + 1) * self.hidden_size],
-        ) + self.policy_bias[sq]
+            &self.policy_hidden[mv.0 * self.hidden_size..(mv.0 + 1) * self.hidden_size],
+        ) + self.policy_bias[mv.0]
+            + dot(&tactical_features(board, mv), &self.policy_tactical)
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
@@ -336,6 +352,18 @@ impl PolicyValueModel {
             &self.file_hidden,
             (AXIS_FEATURES, self.hidden_size),
         )?;
+        insert(
+            &vars,
+            "diagonal_hidden",
+            &self.diagonal_hidden,
+            (DIAGONAL_FEATURES, self.hidden_size),
+        )?;
+        insert(
+            &vars,
+            "anti_diagonal_hidden",
+            &self.anti_diagonal_hidden,
+            (DIAGONAL_FEATURES, self.hidden_size),
+        )?;
         insert(&vars, "hidden_bias", &self.hidden_bias, (self.hidden_size,))?;
         insert(
             &vars,
@@ -344,6 +372,12 @@ impl PolicyValueModel {
             (CELL_COUNT, self.hidden_size),
         )?;
         insert(&vars, "policy_bias", &self.policy_bias, (CELL_COUNT,))?;
+        insert(
+            &vars,
+            "policy_tactical",
+            &self.policy_tactical,
+            (TACTICAL_FEATURES,),
+        )?;
         insert(
             &vars,
             "value_head_hidden",
@@ -404,9 +438,12 @@ impl PolicyValueModel {
             stone_hidden: load(&tensors, "stone_hidden")?,
             rank_hidden: load(&tensors, "rank_hidden")?,
             file_hidden: load(&tensors, "file_hidden")?,
+            diagonal_hidden: load(&tensors, "diagonal_hidden")?,
+            anti_diagonal_hidden: load(&tensors, "anti_diagonal_hidden")?,
             hidden_bias,
             policy_hidden: load(&tensors, "policy_hidden")?,
             policy_bias: load(&tensors, "policy_bias")?,
+            policy_tactical: load(&tensors, "policy_tactical")?,
             value_head_hidden: load(&tensors, "value_head_hidden")?,
             value_head_bias: load(&tensors, "value_head_bias")?,
             value_head_hidden2: load(&tensors, "value_head_hidden2")?,
@@ -419,8 +456,11 @@ impl PolicyValueModel {
             || model.stone_hidden.len() != STONE_TYPES * hidden_size
             || model.rank_hidden.len() != AXIS_FEATURES * hidden_size
             || model.file_hidden.len() != AXIS_FEATURES * hidden_size
+            || model.diagonal_hidden.len() != DIAGONAL_FEATURES * hidden_size
+            || model.anti_diagonal_hidden.len() != DIAGONAL_FEATURES * hidden_size
             || model.policy_hidden.len() != CELL_COUNT * hidden_size
             || model.policy_bias.len() != CELL_COUNT
+            || model.policy_tactical.len() != TACTICAL_FEATURES
             || model.value_head_hidden.len() != hidden_size * VALUE_HEAD_SIZE
             || model.value_head_bias.len() != VALUE_HEAD_SIZE
             || model.value_head_hidden2.len() != VALUE_HEAD_SIZE * VALUE_HEAD_SIZE
@@ -451,9 +491,12 @@ impl PolicyValueModel {
         blend!(stone_hidden);
         blend!(rank_hidden);
         blend!(file_hidden);
+        blend!(diagonal_hidden);
+        blend!(anti_diagonal_hidden);
         blend!(hidden_bias);
         blend!(policy_hidden);
         blend!(policy_bias);
+        blend!(policy_tactical);
         blend!(value_head_hidden);
         blend!(value_head_bias);
         blend!(value_head_hidden2);
