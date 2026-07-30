@@ -1,6 +1,6 @@
 use crate::{
     game::{BOARD_SIZE, Board, Move, Outcome},
-    mcts::{SearchConfig, search},
+    mcts::{ProvenOutcome, SearchConfig, search},
     model::PolicyValueModel,
     replay::Sample,
 };
@@ -98,8 +98,25 @@ pub fn generate_one_detailed_controlled(
         if c.is_empty() {
             break;
         }
-        let sum = c.iter().map(|x| x.visits).sum::<u32>().max(1) as f32;
-        let policy: Vec<_> = c.iter().map(|x| (x.mv, x.visits as f32 / sum)).collect();
+        let proven_win = c
+            .iter()
+            .find(|candidate| candidate.proven == Some(ProvenOutcome::Win))
+            .map(|candidate| candidate.mv);
+        let policy: Vec<_> = if let Some(winning_move) = proven_win {
+            c.iter()
+                .map(|x| (x.mv, f32::from(x.mv == winning_move)))
+                .collect()
+        } else {
+            let visit_sum = c.iter().map(|x| x.visits).sum::<u32>();
+            if visit_sum > 0 {
+                c.iter()
+                    .map(|x| (x.mv, x.visits as f32 / visit_sum as f32))
+                    .collect()
+            } else {
+                let prior_sum = c.iter().map(|x| x.prior).sum::<f32>().max(1e-9);
+                c.iter().map(|x| (x.mv, x.prior / prior_sum)).collect()
+            }
+        };
         let mut top = [0.0_f32; 2];
         for &(_, p) in &policy {
             if p > 0.0 {
@@ -118,14 +135,16 @@ pub fn generate_one_detailed_controlled(
         stats.policy_top1_sum += top[0];
         stats.policy_top2_sum += top[0] + top[1];
         let temperature = temperature_for_ply(cfg, board.move_count());
-        let mv = sample_with_temperature(
-            &c,
-            temperature,
-            cfg.temperature_value_cutoff,
-            cfg.temperature_visit_offset,
-            &mut seed,
-        );
-        if temperature > 1e-6 {
+        let mv = proven_win.unwrap_or_else(|| {
+            sample_with_temperature(
+                &c,
+                temperature,
+                cfg.temperature_value_cutoff,
+                cfg.temperature_visit_offset,
+                &mut seed,
+            )
+        });
+        if temperature > 1e-6 && proven_win.is_none() {
             stats.sampled_moves += 1;
             stats.sampled_best_moves += usize::from(mv == c[0].mv);
             let played_q = c.iter().find(|x| x.mv == mv).map(|x| x.q).unwrap_or(0.0);
@@ -223,11 +242,17 @@ fn sample_with_temperature(
     if temperature <= 1e-6 {
         return c[0].mv;
     }
+    let no_visits = c.iter().all(|candidate| candidate.visits == 0);
+    let sampling_weight = |candidate: &crate::mcts::Candidate| {
+        if no_visits {
+            candidate.prior.max(1e-9)
+        } else {
+            (candidate.visits as f32 + visit_offset).max(1e-9)
+        }
+    };
     let anchor_q = c
         .iter()
-        .max_by(|a, b| {
-            (a.visits as f32 + visit_offset).total_cmp(&(b.visits as f32 + visit_offset))
-        })
+        .max_by(|a, b| sampling_weight(a).total_cmp(&sampling_weight(b)))
         .map(|x| x.q)
         .unwrap_or(0.0);
     let min_q = anchor_q - 2.0 * value_cutoff;
@@ -237,9 +262,7 @@ fn sample_with_temperature(
             if value_cutoff > 0.0 && value_cutoff < 1.0 && x.q < min_q {
                 0.0
             } else {
-                (x.visits as f32 + visit_offset)
-                    .max(1e-9)
-                    .powf(temperature.max(1e-3).recip())
+                sampling_weight(x).powf(temperature.max(1e-3).recip())
             }
         })
         .collect::<Vec<_>>();

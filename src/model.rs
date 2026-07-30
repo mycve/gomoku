@@ -10,7 +10,52 @@ pub const WDL_SIZE: usize = 3;
 pub const STONE_TYPES: usize = 2;
 pub const AXIS_FEATURES: usize = STONE_TYPES * 15;
 pub const DIAGONAL_FEATURES: usize = STONE_TYPES * (BOARD_SIZE * 2 - 1);
-const FORMAT_VERSION: f32 = 9.0;
+pub const LOCAL_AXES: usize = 4;
+pub const LOCAL_RADIUS: usize = 4;
+pub const LOCAL_RAY_PATTERNS: usize = 4usize.pow(LOCAL_RADIUS as u32);
+pub const LOCAL_AXIS_PATTERNS: usize = LOCAL_RAY_PATTERNS * (LOCAL_RAY_PATTERNS + 1) / 2;
+pub const LOCAL_AXIS_FEATURE_SIZE: usize = 2;
+pub const LOCAL_CANDIDATE_SIZE: usize = LOCAL_AXIS_FEATURE_SIZE * 2;
+pub const VALUE_LOCAL_SIZE: usize = LOCAL_CANDIDATE_SIZE * 2;
+const FORMAT_VERSION: f32 = 10.0;
+const LOCAL_BOUNDARY: u8 = u8::MAX;
+const LOCAL_NEIGHBORS: [u8; CELL_COUNT * LOCAL_AXES * 2 * LOCAL_RADIUS] = build_local_neighbors();
+
+const fn build_local_neighbors() -> [u8; CELL_COUNT * LOCAL_AXES * 2 * LOCAL_RADIUS] {
+    let mut table = [LOCAL_BOUNDARY; CELL_COUNT * LOCAL_AXES * 2 * LOCAL_RADIUS];
+    let directions = [(1_i32, 0_i32), (0, 1), (1, 1), (1, -1)];
+    let mut cell = 0;
+    while cell < CELL_COUNT {
+        let row = (cell / BOARD_SIZE) as i32;
+        let col = (cell % BOARD_SIZE) as i32;
+        let mut axis = 0;
+        while axis < LOCAL_AXES {
+            let mut ray = 0;
+            while ray < 2 {
+                let sign = if ray == 0 { -1 } else { 1 };
+                let mut distance = 1;
+                while distance <= LOCAL_RADIUS {
+                    let next_row = row + directions[axis].0 * distance as i32 * sign;
+                    let next_col = col + directions[axis].1 * distance as i32 * sign;
+                    let slot =
+                        (((cell * LOCAL_AXES + axis) * 2 + ray) * LOCAL_RADIUS) + distance - 1;
+                    if next_row >= 0
+                        && next_col >= 0
+                        && next_row < BOARD_SIZE as i32
+                        && next_col < BOARD_SIZE as i32
+                    {
+                        table[slot] = (next_row as usize * BOARD_SIZE + next_col as usize) as u8;
+                    }
+                    distance += 1;
+                }
+                ray += 1;
+            }
+            axis += 1;
+        }
+        cell += 1;
+    }
+    table
+}
 
 #[derive(Clone)]
 pub struct PolicyValueModel {
@@ -24,7 +69,10 @@ pub struct PolicyValueModel {
     pub(crate) hidden_bias: Vec<f32>,
     pub(crate) policy_hidden: Vec<f32>,
     pub(crate) policy_bias: Vec<f32>,
+    pub(crate) local_axis_embedding: Vec<f32>,
+    pub(crate) policy_local: Vec<f32>,
     pub(crate) value_head_hidden: Vec<f32>,
+    pub(crate) value_local_output: Vec<f32>,
     pub(crate) value_head_bias: Vec<f32>,
     pub(crate) value_head_hidden2: Vec<f32>,
     pub(crate) value_head_bias2: Vec<f32>,
@@ -41,6 +89,8 @@ pub(crate) struct EvalAccumulator {
 pub(crate) struct EvalScratch {
     hidden: Vec<f32>,
     logits: Vec<f32>,
+    local_candidate: Vec<f32>,
+    local_value: Vec<f32>,
     value1: Vec<f32>,
     value2: Vec<f32>,
 }
@@ -50,6 +100,8 @@ impl EvalScratch {
         Self {
             hidden: Vec::with_capacity(hidden_size),
             logits: Vec::with_capacity(CELL_COUNT),
+            local_candidate: vec![0.0; LOCAL_CANDIDATE_SIZE],
+            local_value: vec![0.0; VALUE_LOCAL_SIZE],
             value1: Vec::with_capacity(VALUE_HEAD_SIZE),
             value2: Vec::with_capacity(VALUE_HEAD_SIZE),
         }
@@ -86,9 +138,14 @@ impl PolicyValueModel {
             hidden_bias: vec![0.0; hidden_size],
             policy_hidden,
             policy_bias,
+            local_axis_embedding: (0..LOCAL_AXIS_PATTERNS * LOCAL_AXIS_FEATURE_SIZE)
+                .map(|_| rng.weight((2.0 / LOCAL_AXIS_FEATURE_SIZE as f32).sqrt() * 0.25))
+                .collect(),
+            policy_local: vec![0.0; LOCAL_CANDIDATE_SIZE],
             value_head_hidden: (0..hidden_size * VALUE_HEAD_SIZE)
                 .map(|_| rng.weight((2.0 / hidden_size as f32).sqrt() * 0.5))
                 .collect(),
+            value_local_output: vec![0.0; WDL_SIZE * VALUE_LOCAL_SIZE],
             value_head_bias: vec![0.0; VALUE_HEAD_SIZE],
             value_head_hidden2: (0..VALUE_HEAD_SIZE * VALUE_HEAD_SIZE)
                 .map(|_| rng.weight((2.0 / VALUE_HEAD_SIZE as f32).sqrt() * 0.5))
@@ -147,8 +204,20 @@ impl PolicyValueModel {
         {
             crate::scope_profile!("model.policy_logits");
             scratch.logits.clear();
+            scratch.local_value.fill(0.0);
+            scratch.local_value[LOCAL_CANDIDATE_SIZE..].fill(f32::NEG_INFINITY);
             for &mv in &moves {
-                scratch.logits.push(self.policy_logit(&scratch.hidden, mv));
+                self.local_candidate_into(board, mv, &mut scratch.local_candidate);
+                scratch.logits.push(self.policy_logit(
+                    &scratch.hidden,
+                    &scratch.local_candidate,
+                    mv,
+                ));
+                for (i, &value) in scratch.local_candidate.iter().enumerate() {
+                    scratch.local_value[i] += value;
+                    scratch.local_value[LOCAL_CANDIDATE_SIZE + i] =
+                        scratch.local_value[LOCAL_CANDIDATE_SIZE + i].max(value);
+                }
             }
         }
         let max = scratch
@@ -163,7 +232,8 @@ impl PolicyValueModel {
             .map(|x| ((x - max) * inverse_temperature).exp())
             .sum();
         let policy = moves
-            .into_iter()
+            .iter()
+            .copied()
             .zip(
                 scratch
                     .logits
@@ -173,6 +243,10 @@ impl PolicyValueModel {
             )
             .collect();
         crate::scope_profile!("model.value_head");
+        let inverse_moves = 1.0 / moves.len() as f32;
+        for x in &mut scratch.local_value[..LOCAL_CANDIDATE_SIZE] {
+            *x *= inverse_moves;
+        }
         scratch.value1.clear();
         scratch.value1.extend_from_slice(&self.value_head_bias);
         for (output, value) in scratch.value1.iter_mut().enumerate() {
@@ -203,6 +277,10 @@ impl PolicyValueModel {
             *logit = dot(
                 &scratch.value2,
                 &self.value_head_output[start..start + VALUE_HEAD_SIZE],
+            ) + dot(
+                &scratch.local_value,
+                &self.value_local_output
+                    [output * VALUE_LOCAL_SIZE..(output + 1) * VALUE_LOCAL_SIZE],
             );
         }
         let wdl_max = wdl.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -264,8 +342,8 @@ impl PolicyValueModel {
             let anti_diagonal =
                 (side * (BOARD_SIZE * 2 - 1) + mv.row() + mv.col()) * self.hidden_size;
             let stone = side * self.hidden_size;
-            for h in 0..self.hidden_size {
-                hidden[h] += self.input_hidden[exact + h]
+            for (h, value) in hidden.iter_mut().enumerate() {
+                *value += self.input_hidden[exact + h]
                     + self.stone_hidden[stone + h]
                     + self.rank_hidden[rank + h]
                     + self.file_hidden[file + h]
@@ -299,11 +377,28 @@ impl PolicyValueModel {
         }
     }
 
-    fn policy_logit(&self, hidden: &[f32], mv: Move) -> f32 {
+    fn local_candidate_into(&self, board: &Board, mv: Move, output: &mut [f32]) {
+        output.fill(0.0);
+        let (mean, max) = output.split_at_mut(LOCAL_AXIS_FEATURE_SIZE);
+        max.fill(f32::NEG_INFINITY);
+        for (dr, dc) in [(1, 0), (0, 1), (1, 1), (1, -1)] {
+            let (first_code, second_code) = local_ray_codes(board, mv, dr, dc);
+            let pattern = second_code * (second_code + 1) / 2 + first_code;
+            let axis_feature = &self.local_axis_embedding
+                [pattern * LOCAL_AXIS_FEATURE_SIZE..(pattern + 1) * LOCAL_AXIS_FEATURE_SIZE];
+            for i in 0..LOCAL_AXIS_FEATURE_SIZE {
+                mean[i] += axis_feature[i] / LOCAL_AXES as f32;
+                max[i] = max[i].max(axis_feature[i]);
+            }
+        }
+    }
+
+    fn policy_logit(&self, hidden: &[f32], local: &[f32], mv: Move) -> f32 {
         dot(
             hidden,
             &self.policy_hidden[mv.0 * self.hidden_size..(mv.0 + 1) * self.hidden_size],
-        ) + self.policy_bias[mv.0]
+        ) + dot(local, &self.policy_local)
+            + self.policy_bias[mv.0]
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
@@ -358,6 +453,18 @@ impl PolicyValueModel {
         insert(&vars, "policy_bias", &self.policy_bias, (CELL_COUNT,))?;
         insert(
             &vars,
+            "local_axis_embedding",
+            &self.local_axis_embedding,
+            (LOCAL_AXIS_PATTERNS, LOCAL_AXIS_FEATURE_SIZE),
+        )?;
+        insert(
+            &vars,
+            "policy_local",
+            &self.policy_local,
+            (LOCAL_CANDIDATE_SIZE,),
+        )?;
+        insert(
+            &vars,
             "value_head_hidden",
             &self.value_head_hidden,
             (VALUE_HEAD_SIZE, self.hidden_size),
@@ -367,6 +474,12 @@ impl PolicyValueModel {
             "value_head_bias",
             &self.value_head_bias,
             (VALUE_HEAD_SIZE,),
+        )?;
+        insert(
+            &vars,
+            "value_local_output",
+            &self.value_local_output,
+            (WDL_SIZE, VALUE_LOCAL_SIZE),
         )?;
         insert(
             &vars,
@@ -414,7 +527,10 @@ impl PolicyValueModel {
             hidden_bias,
             policy_hidden: load(&tensors, "policy_hidden")?,
             policy_bias: load(&tensors, "policy_bias")?,
+            local_axis_embedding: load(&tensors, "local_axis_embedding")?,
+            policy_local: load(&tensors, "policy_local")?,
             value_head_hidden: load(&tensors, "value_head_hidden")?,
+            value_local_output: load(&tensors, "value_local_output")?,
             value_head_bias: load(&tensors, "value_head_bias")?,
             value_head_hidden2: load(&tensors, "value_head_hidden2")?,
             value_head_bias2: load(&tensors, "value_head_bias2")?,
@@ -428,7 +544,10 @@ impl PolicyValueModel {
             || model.anti_diagonal_hidden.len() != DIAGONAL_FEATURES * hidden_size
             || model.policy_hidden.len() != CELL_COUNT * hidden_size
             || model.policy_bias.len() != CELL_COUNT
+            || model.local_axis_embedding.len() != LOCAL_AXIS_PATTERNS * LOCAL_AXIS_FEATURE_SIZE
+            || model.policy_local.len() != LOCAL_CANDIDATE_SIZE
             || model.value_head_hidden.len() != hidden_size * VALUE_HEAD_SIZE
+            || model.value_local_output.len() != WDL_SIZE * VALUE_LOCAL_SIZE
             || model.value_head_bias.len() != VALUE_HEAD_SIZE
             || model.value_head_hidden2.len() != VALUE_HEAD_SIZE * VALUE_HEAD_SIZE
             || model.value_head_bias2.len() != VALUE_HEAD_SIZE
@@ -461,11 +580,50 @@ impl PolicyValueModel {
         blend!(hidden_bias);
         blend!(policy_hidden);
         blend!(policy_bias);
+        blend!(local_axis_embedding);
+        blend!(policy_local);
         blend!(value_head_hidden);
+        blend!(value_local_output);
         blend!(value_head_bias);
         blend!(value_head_hidden2);
         blend!(value_head_bias2);
         blend!(value_head_output);
+    }
+}
+
+pub(crate) fn local_ray_codes(board: &Board, mv: Move, dr: i32, dc: i32) -> (usize, usize) {
+    let us = board.to_move().stone();
+    let axis = match (dr, dc) {
+        (1, 0) | (-1, 0) => 0,
+        (0, 1) | (0, -1) => 1,
+        (1, 1) | (-1, -1) => 2,
+        (1, -1) | (-1, 1) => 3,
+        _ => unreachable!("invalid local-pattern axis"),
+    };
+    let encode = |ray: usize| {
+        let mut code = 0;
+        let mut place = 1;
+        let start = ((mv.0 * LOCAL_AXES + axis) * 2 + ray) * LOCAL_RADIUS;
+        for &cell in &LOCAL_NEIGHBORS[start..start + LOCAL_RADIUS] {
+            let state = if cell == LOCAL_BOUNDARY {
+                3
+            } else {
+                match board.cells()[cell as usize] {
+                    stone if stone == us => 1,
+                    stone if stone == -us => 2,
+                    _ => 0,
+                }
+            };
+            code += state * place;
+            place *= 4;
+        }
+        code as usize
+    };
+    let rays = (encode(0), encode(1));
+    if rays.0 <= rays.1 {
+        rays
+    } else {
+        (rays.1, rays.0)
     }
 }
 
@@ -696,5 +854,33 @@ mod tests {
         let expected = before * 0.75 + online.policy_bias[0] * 0.25;
         assert!((ema.policy_bias[0] - expected).abs() < 1e-6);
         assert_eq!(ema.policy_bias.len(), CELL_COUNT);
+    }
+
+    #[test]
+    fn local_axis_encoding_is_reflection_invariant() {
+        let mut board = Board::new();
+        for text in ["h8", "g8", "i8", "a1", "j8", "a2"] {
+            assert!(board.play(Move::parse(text).unwrap()));
+        }
+        let candidate = Move::parse("k8").unwrap();
+        let forward = local_ray_codes(&board, candidate, 0, 1);
+        let backward = local_ray_codes(&board, candidate, 0, -1);
+        assert_eq!(forward, backward);
+    }
+
+    #[test]
+    fn v10_model_roundtrip_preserves_local_parameters() {
+        let path = std::env::temp_dir().join(format!(
+            "gomoku-v10-roundtrip-{}-{}.safetensors",
+            std::process::id(),
+            SplitMix64(11).next()
+        ));
+        let model = PolicyValueModel::random(8, 3);
+        model.save(&path).unwrap();
+        let restored = PolicyValueModel::load(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(restored.local_axis_embedding, model.local_axis_embedding);
+        assert_eq!(restored.policy_local, model.policy_local);
+        assert_eq!(restored.value_local_output, model.value_local_output);
     }
 }

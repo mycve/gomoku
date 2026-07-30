@@ -50,12 +50,39 @@ pub struct Candidate {
     pub visits: u32,
     pub q: f32,
     pub prior: f32,
+    pub proven: Option<ProvenOutcome>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProvenOutcome {
+    Win,
+    Draw,
+    Loss,
+}
+
+impl ProvenOutcome {
+    fn negate(self) -> Self {
+        match self {
+            Self::Win => Self::Loss,
+            Self::Draw => Self::Draw,
+            Self::Loss => Self::Win,
+        }
+    }
+
+    fn value(self) -> f32 {
+        match self {
+            Self::Win => 1.0,
+            Self::Draw => 0.0,
+            Self::Loss => -1.0,
+        }
+    }
 }
 struct Node {
     board: Board,
     accumulator: EvalAccumulator,
     children: Vec<Edge>,
     expanded: bool,
+    proven: Option<ProvenOutcome>,
 }
 struct Edge {
     mv: Move,
@@ -63,6 +90,7 @@ struct Edge {
     visits: u32,
     value_sum: f32,
     child: Option<usize>,
+    proven: Option<ProvenOutcome>,
 }
 
 pub fn search(board: &Board, model: &PolicyValueModel, cfg: SearchConfig) -> Vec<Candidate> {
@@ -91,10 +119,37 @@ fn search_until(
         accumulator: model.accumulator(board),
         children: vec![],
         expanded: false,
+        proven: None,
     }];
     expand(&mut nodes, 0, model, cfg, &mut scratch);
-    for simulation in 0..cfg.simulations {
+    prove_root_tactics(&mut nodes);
+    let mut completed = 0;
+    if nodes[0].proven.is_none()
+        && cfg.simulations >= nodes[0].children.len()
+        && !nodes[0].children.is_empty()
+    {
+        let mut root_edges = (0..nodes[0].children.len()).collect::<Vec<_>>();
+        root_edges.sort_by(|&a, &b| {
+            nodes[0].children[b]
+                .prior
+                .total_cmp(&nodes[0].children[a].prior)
+        });
+        for edge in root_edges {
+            if completed > 0 && deadline.is_some_and(|limit| Instant::now() >= limit) {
+                break;
+            }
+            simulate_edge(&mut nodes, 0, edge, model, cfg, &mut scratch);
+            completed += 1;
+            if nodes[0].proven == Some(ProvenOutcome::Win) {
+                break;
+            }
+        }
+    }
+    for simulation in completed..cfg.simulations {
         if simulation > 0 && deadline.is_some_and(|limit| Instant::now() >= limit) {
+            break;
+        }
+        if nodes[0].proven.is_some() {
             break;
         }
         simulate(&mut nodes, 0, model, cfg, &mut scratch);
@@ -105,36 +160,40 @@ fn search_until(
         .map(|e| Candidate {
             mv: e.mv,
             visits: e.visits,
-            q: if e.visits == 0 {
+            q: if let Some(proven) = e.proven {
+                proven.value()
+            } else if e.visits == 0 {
                 0.0
             } else {
                 e.value_sum / e.visits as f32
             },
             prior: e.prior,
+            proven: e.proven.or_else(|| {
+                e.child
+                    .and_then(|child| nodes[child].proven)
+                    .map(ProvenOutcome::negate)
+            }),
         })
         .collect();
-    out.sort_by_key(|x| std::cmp::Reverse(x.visits));
+    out.sort_by(|a, b| {
+        proven_rank(b.proven)
+            .cmp(&proven_rank(a.proven))
+            .then_with(|| b.visits.cmp(&a.visits))
+            .then_with(|| b.prior.total_cmp(&a.prior))
+    });
     out
 }
 fn expand(
-    nodes: &mut Vec<Node>,
+    nodes: &mut [Node],
     idx: usize,
     model: &PolicyValueModel,
     cfg: SearchConfig,
     scratch: &mut EvalScratch,
 ) -> f32 {
     crate::scope_profile!("mcts.expand");
-    if let Some(out) = nodes[idx].board.outcome() {
-        return match out {
-            Outcome::Draw => 0.0,
-            Outcome::Win(p) => {
-                if p == nodes[idx].board.to_move() {
-                    1.0
-                } else {
-                    -1.0
-                }
-            }
-        };
+    if let Some(proven) = terminal_proven(&nodes[idx].board) {
+        nodes[idx].proven = Some(proven);
+        return proven.value();
     }
     let (mut policy, value) = {
         crate::scope_profile!("mcts.nn_eval");
@@ -167,6 +226,7 @@ fn expand(
                 visits: 0,
                 value_sum: 0.0,
                 child: None,
+                proven: None,
             })
             .collect();
     }
@@ -180,17 +240,12 @@ fn simulate(
     cfg: SearchConfig,
     scratch: &mut EvalScratch,
 ) -> f32 {
-    if let Some(out) = nodes[idx].board.outcome() {
-        return match out {
-            Outcome::Draw => 0.0,
-            Outcome::Win(p) => {
-                if p == nodes[idx].board.to_move() {
-                    1.0
-                } else {
-                    -1.0
-                }
-            }
-        };
+    if let Some(proven) = nodes[idx].proven {
+        return proven.value();
+    }
+    if let Some(proven) = terminal_proven(&nodes[idx].board) {
+        nodes[idx].proven = Some(proven);
+        return proven.value();
     }
     if !nodes[idx].expanded {
         return expand(nodes, idx, model, cfg, scratch);
@@ -207,6 +262,9 @@ fn simulate(
         let mut score = f32::NEG_INFINITY;
         let exploration = cfg.cpuct * total.sqrt();
         for (i, e) in nodes[idx].children.iter().enumerate() {
+            if e.proven == Some(ProvenOutcome::Loss) {
+                continue;
+            }
             let q = if e.visits == 0 {
                 0.0
             } else {
@@ -220,12 +278,31 @@ fn simulate(
         }
         best
     };
-    let child = if let Some(c) = nodes[idx].children[best].child {
+    simulate_edge(nodes, idx, best, model, cfg, scratch)
+}
+
+fn simulate_edge(
+    nodes: &mut Vec<Node>,
+    idx: usize,
+    edge: usize,
+    model: &PolicyValueModel,
+    cfg: SearchConfig,
+    scratch: &mut EvalScratch,
+) -> f32 {
+    if let Some(proven) = nodes[idx].children[edge].proven {
+        let value = proven.value();
+        let selected = &mut nodes[idx].children[edge];
+        selected.visits += 1;
+        selected.value_sum += value;
+        update_proven(nodes, idx);
+        return value;
+    }
+    let child = if let Some(c) = nodes[idx].children[edge].child {
         c
     } else {
         crate::scope_profile!("mcts.create_child");
         let mut b = nodes[idx].board.clone();
-        let mv = nodes[idx].children[best].mv;
+        let mv = nodes[idx].children[edge].mv;
         let player = b.to_move();
         let accumulator = model.accumulator_after_move(&nodes[idx].accumulator, mv, player);
         b.play(mv);
@@ -235,15 +312,83 @@ fn simulate(
             accumulator,
             children: vec![],
             expanded: false,
+            proven: None,
         });
-        nodes[idx].children[best].child = Some(c);
+        nodes[idx].children[edge].child = Some(c);
         c
     };
     let value = -simulate(nodes, child, model, cfg, scratch);
-    let e = &mut nodes[idx].children[best];
+    let e = &mut nodes[idx].children[edge];
     e.visits += 1;
     e.value_sum += value;
+    update_proven(nodes, idx);
     value
+}
+
+fn terminal_proven(board: &Board) -> Option<ProvenOutcome> {
+    board.outcome().map(|outcome| match outcome {
+        Outcome::Draw => ProvenOutcome::Draw,
+        Outcome::Win(player) if player == board.to_move() => ProvenOutcome::Win,
+        Outcome::Win(_) => ProvenOutcome::Loss,
+    })
+}
+
+fn prove_root_tactics(nodes: &mut [Node]) {
+    if nodes.is_empty() || !nodes[0].expanded {
+        return;
+    }
+    let root = nodes[0].board.clone();
+    for edge in &mut nodes[0].children {
+        let mut after_move = root.clone();
+        debug_assert!(after_move.play(edge.mv));
+        edge.proven = match after_move.outcome() {
+            Some(Outcome::Win(_)) => Some(ProvenOutcome::Win),
+            Some(Outcome::Draw) => Some(ProvenOutcome::Draw),
+            None => {
+                let opponent_wins = after_move.legal_moves().into_iter().any(|reply| {
+                    let mut after_reply = after_move.clone();
+                    after_reply.play(reply)
+                        && matches!(after_reply.outcome(), Some(Outcome::Win(_)))
+                });
+                opponent_wins.then_some(ProvenOutcome::Loss)
+            }
+        };
+    }
+    update_proven(nodes, 0);
+}
+
+fn update_proven(nodes: &mut [Node], idx: usize) {
+    let outcomes = nodes[idx]
+        .children
+        .iter()
+        .map(|edge| {
+            edge.proven.or_else(|| {
+                edge.child
+                    .and_then(|child| nodes[child].proven)
+                    .map(ProvenOutcome::negate)
+            })
+        })
+        .collect::<Vec<_>>();
+    nodes[idx].proven = if outcomes.contains(&Some(ProvenOutcome::Win)) {
+        Some(ProvenOutcome::Win)
+    } else if outcomes.iter().all(Option::is_some) {
+        if outcomes.contains(&Some(ProvenOutcome::Draw)) {
+            Some(ProvenOutcome::Draw)
+        } else {
+            Some(ProvenOutcome::Loss)
+        }
+    } else {
+        None
+    };
+}
+
+fn proven_rank(outcome: Option<ProvenOutcome>) -> u8 {
+    match outcome {
+        Some(ProvenOutcome::Win) => 3,
+        None => 2,
+        Some(ProvenOutcome::Draw) => 1,
+        Some(ProvenOutcome::Loss) => 0,
+    }
 }
 
 fn apply_root_dirichlet_noise(priors: &mut [f32], alpha: f32, fraction: f32, seed: u64) {
@@ -309,5 +454,48 @@ mod tests {
         assert_eq!(first, same);
         assert_ne!(first, other);
         assert!((first.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn solver_prioritizes_a_proven_root_win() {
+        let mut board = Board::new();
+        for text in ["h8", "g8", "i8", "a1", "j8", "a2", "k8", "b1"] {
+            assert!(board.play(Move::parse(text).unwrap()));
+        }
+        let result = search(
+            &board,
+            &PolicyValueModel::random(8, 7),
+            SearchConfig {
+                simulations: 128,
+                ..Default::default()
+            },
+        );
+        assert_eq!(result[0].mv, Move::parse("l8").unwrap());
+        assert_eq!(result[0].proven, Some(ProvenOutcome::Win));
+        assert_eq!(result[0].q, 1.0);
+    }
+
+    #[test]
+    fn solver_rejects_moves_that_allow_an_immediate_reply_win() {
+        let mut board = Board::new();
+        for text in ["f8", "g8", "a1", "h8", "a2", "i8", "a3", "j8"] {
+            assert!(board.play(Move::parse(text).unwrap()));
+        }
+        let result = search(
+            &board,
+            &PolicyValueModel::random(8, 13),
+            SearchConfig {
+                simulations: 128,
+                ..Default::default()
+            },
+        );
+        assert_eq!(result[0].mv, Move::parse("k8").unwrap());
+        assert_ne!(result[0].proven, Some(ProvenOutcome::Loss));
+        assert!(
+            result
+                .iter()
+                .filter(|candidate| candidate.mv != Move::parse("k8").unwrap())
+                .all(|candidate| candidate.proven == Some(ProvenOutcome::Loss))
+        );
     }
 }

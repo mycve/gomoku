@@ -160,7 +160,7 @@ fn main() -> io::Result<()> {
             PolicyValueModel::random(args.hidden, args.seed).save(&args.output)?;
             println!("model    : initialized {}", args.output);
             println!(
-                "arch     : input=451 hidden={} rmsnorm policy=225 value=96x96xWDL3",
+                "arch     : input=451 hidden={} rmsnorm local=4axesx8cells-pattern2 policy=225 value=96x96xWDL3",
                 args.hidden
             );
             println!("board    : 15x15 freestyle gomoku");
@@ -347,11 +347,12 @@ fn print_search(board: &Board, model: &PolicyValueModel, simulations: usize, cpu
     );
     for c in result.into_iter().take(10) {
         println!(
-            "candidate: {} visits={} q={:.3} prior={:.3}",
+            "candidate: {} visits={} q={:.3} prior={:.3} proven={:?}",
             c.mv.notation(),
             c.visits,
             c.q,
-            c.prior
+            c.prior,
+            c.proven
         );
     }
 }

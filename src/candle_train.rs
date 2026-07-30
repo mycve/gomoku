@@ -1,8 +1,9 @@
 use crate::{
     game::CELL_COUNT,
     model::{
-        AXIS_FEATURES, DIAGONAL_FEATURES, INPUT_SIZE, PolicyValueModel, STONE_TYPES,
-        VALUE_HEAD_SIZE, WDL_SIZE,
+        AXIS_FEATURES, DIAGONAL_FEATURES, INPUT_SIZE, LOCAL_AXES, LOCAL_AXIS_FEATURE_SIZE,
+        LOCAL_AXIS_PATTERNS, LOCAL_CANDIDATE_SIZE, PolicyValueModel, STONE_TYPES, VALUE_HEAD_SIZE,
+        VALUE_LOCAL_SIZE, WDL_SIZE, local_ray_codes,
     },
     replay::Sample,
     selfplay::TrainStats,
@@ -195,7 +196,10 @@ struct Replica {
     hidden_bias: Var,
     policy_hidden: Var,
     policy_bias: Var,
+    local_axis_embedding: Var,
+    policy_local: Var,
     value_head_hidden: Var,
+    value_local_output: Var,
     value_head_bias: Var,
     value_head_hidden2: Var,
     value_head_bias2: Var,
@@ -215,7 +219,18 @@ impl Replica {
             hidden_bias: var(&model.hidden_bias, (h,), device)?,
             policy_hidden: var(&model.policy_hidden, (CELL_COUNT, h), device)?,
             policy_bias: var(&model.policy_bias, (CELL_COUNT,), device)?,
+            local_axis_embedding: var(
+                &model.local_axis_embedding,
+                (LOCAL_AXIS_PATTERNS, LOCAL_AXIS_FEATURE_SIZE),
+                device,
+            )?,
+            policy_local: var(&model.policy_local, (LOCAL_CANDIDATE_SIZE,), device)?,
             value_head_hidden: var(&model.value_head_hidden, (VALUE_HEAD_SIZE, h), device)?,
+            value_local_output: var(
+                &model.value_local_output,
+                (WDL_SIZE, VALUE_LOCAL_SIZE),
+                device,
+            )?,
             value_head_bias: var(&model.value_head_bias, (VALUE_HEAD_SIZE,), device)?,
             value_head_hidden2: var(
                 &model.value_head_hidden2,
@@ -241,7 +256,10 @@ impl Replica {
             self.hidden_bias.clone(),
             self.policy_hidden.clone(),
             self.policy_bias.clone(),
+            self.local_axis_embedding.clone(),
+            self.policy_local.clone(),
             self.value_head_hidden.clone(),
+            self.value_local_output.clone(),
             self.value_head_bias.clone(),
             self.value_head_hidden2.clone(),
             self.value_head_bias2.clone(),
@@ -277,6 +295,15 @@ impl Replica {
             Tensor::from_vec(packed.policy_masks, (b, CELL_COUNT), &self.device).map_err(err)?;
         let value_wdl =
             Tensor::from_vec(packed.value_wdl, (b, WDL_SIZE), &self.device).map_err(err)?;
+        let local_axis_indices = Tensor::from_vec(
+            packed.local_axis_indices,
+            (b * CELL_COUNT * LOCAL_AXES,),
+            &self.device,
+        )
+        .map_err(err)?;
+        let local_legal_mask =
+            Tensor::from_vec(packed.local_legal_mask, (b, CELL_COUNT, 1), &self.device)
+                .map_err(err)?;
         let hidden = {
             crate::scope_profile!("train.forward");
             inputs
@@ -297,9 +324,31 @@ impl Replica {
             .and_then(|x| x.sqrt())
             .map_err(err)?;
         let hidden = hidden.broadcast_div(&rms).map_err(err)?;
+        let local_axes = self
+            .local_axis_embedding
+            .as_tensor()
+            .index_select(&local_axis_indices, 0)
+            .and_then(|x| x.reshape((b, CELL_COUNT, LOCAL_AXES, LOCAL_AXIS_FEATURE_SIZE)))
+            .map_err(err)?;
+        let local_mean = local_axes.mean(2).map_err(err)?;
+        let local_max = local_axes.max(2).map_err(err)?;
+        let local_candidates = Tensor::cat(&[&local_mean, &local_max], 2).map_err(err)?;
+        let local_policy_logits = local_candidates
+            .reshape((b * CELL_COUNT, LOCAL_CANDIDATE_SIZE))
+            .and_then(|x| {
+                x.matmul(
+                    &self
+                        .policy_local
+                        .as_tensor()
+                        .reshape((LOCAL_CANDIDATE_SIZE, 1))?,
+                )
+            })
+            .and_then(|x| x.reshape((b, CELL_COUNT)))
+            .map_err(err)?;
         let logits = hidden
             .matmul(&self.policy_hidden.t().map_err(err)?)
             .and_then(|x| x.broadcast_add(&self.policy_bias))
+            .and_then(|x| x.add(&local_policy_logits))
             .and_then(|x| x.add(&masks))
             .map_err(err)?;
         let log_probs = log_softmax(&logits, 1).map_err(err)?;
@@ -308,6 +357,19 @@ impl Replica {
             .and_then(|x| x.sum_all())
             .and_then(|x| x.affine(-1.0, 0.0))
             .map_err(err)?;
+        let legal_counts = local_legal_mask.sum(1).map_err(err)?;
+        let masked_local_candidates = local_candidates
+            .broadcast_mul(&local_legal_mask)
+            .map_err(err)?;
+        let local_board_mean = masked_local_candidates
+            .sum(1)
+            .and_then(|x| x.broadcast_div(&legal_counts))
+            .map_err(err)?;
+        let local_board_max = local_candidates
+            .broadcast_add(&masks.unsqueeze(2).map_err(err)?)
+            .and_then(|x| x.max(1))
+            .map_err(err)?;
+        let local_value = Tensor::cat(&[&local_board_mean, &local_board_max], 1).map_err(err)?;
         let value_features = hidden
             .matmul(&self.value_head_hidden.t().map_err(err)?)
             .and_then(|x| x.broadcast_add(&self.value_head_bias))
@@ -318,6 +380,7 @@ impl Replica {
             .map_err(err)?;
         let value_logits = value_features
             .matmul(&self.value_head_output.t().map_err(err)?)
+            .and_then(|x| x.add(&local_value.matmul(&self.value_local_output.t()?)?))
             .map_err(err)?;
         let value_log_probs = log_softmax(&value_logits, 1).map_err(err)?;
         let value_sum_tensor = value_wdl
@@ -402,11 +465,14 @@ impl Replica {
         m.hidden_bias = v[6].clone();
         m.policy_hidden = v[7].clone();
         m.policy_bias = v[8].clone();
-        m.value_head_hidden = v[9].clone();
-        m.value_head_bias = v[10].clone();
-        m.value_head_hidden2 = v[11].clone();
-        m.value_head_bias2 = v[12].clone();
-        m.value_head_output = v[13].clone();
+        m.local_axis_embedding = v[9].clone();
+        m.policy_local = v[10].clone();
+        m.value_head_hidden = v[11].clone();
+        m.value_local_output = v[12].clone();
+        m.value_head_bias = v[13].clone();
+        m.value_head_hidden2 = v[14].clone();
+        m.value_head_bias2 = v[15].clone();
+        m.value_head_output = v[16].clone();
         Ok(())
     }
 }
@@ -522,6 +588,8 @@ struct Packed {
     anti_diagonal_counts: Vec<f32>,
     policy_targets: Vec<f32>,
     policy_masks: Vec<f32>,
+    local_axis_indices: Vec<u32>,
+    local_legal_mask: Vec<f32>,
     value_wdl: Vec<f32>,
 }
 fn pack(samples: &[Sample]) -> Packed {
@@ -533,6 +601,8 @@ fn pack(samples: &[Sample]) -> Packed {
     let mut anti_diagonal_counts = vec![0.0; samples.len() * DIAGONAL_FEATURES];
     let mut targets = vec![0.0; samples.len() * CELL_COUNT];
     let mut masks = vec![-1e9; samples.len() * CELL_COUNT];
+    let mut local_axis_indices = vec![0_u32; samples.len() * CELL_COUNT * LOCAL_AXES];
+    let mut local_legal_mask = vec![0.0; samples.len() * CELL_COUNT];
     let mut value_wdl = Vec::with_capacity(samples.len() * WDL_SIZE);
     for (row, s) in samples.iter().enumerate() {
         let us = s.board.to_move().stone();
@@ -556,6 +626,12 @@ fn pack(samples: &[Sample]) -> Packed {
         inputs[row * INPUT_SIZE + INPUT_SIZE - 1] = s.board.move_count() as f32 / CELL_COUNT as f32;
         for m in s.board.legal_moves() {
             masks[row * CELL_COUNT + m.0] = 0.0;
+            local_legal_mask[row * CELL_COUNT + m.0] = 1.0;
+            for (axis, (dr, dc)) in [(1, 0), (0, 1), (1, 1), (1, -1)].into_iter().enumerate() {
+                let (first, second) = local_ray_codes(&s.board, m, dr, dc);
+                let pattern = second * (second + 1) / 2 + first;
+                local_axis_indices[(row * CELL_COUNT + m.0) * LOCAL_AXES + axis] = pattern as u32;
+            }
         }
         let sum: f32 = s.policy.iter().map(|(_, p)| p.max(0.0)).sum();
         for &(m, p) in &s.policy {
@@ -581,6 +657,8 @@ fn pack(samples: &[Sample]) -> Packed {
         anti_diagonal_counts,
         policy_targets: targets,
         policy_masks: masks,
+        local_axis_indices,
+        local_legal_mask,
         value_wdl,
     }
 }
@@ -599,15 +677,21 @@ mod tests {
     #[test]
     fn trains_policy_and_value_on_available_device() {
         let mut model = PolicyValueModel::random(16, 9);
+        let before_local = model.local_axis_embedding.clone();
+        let mut board = Board::new();
+        assert!(board.play(Move::new(7, 7).unwrap()));
+        assert!(board.play(Move::new(7, 8).unwrap()));
         let sample = Sample {
-            board: Board::new(),
-            policy: vec![(Move::new(7, 7).unwrap(), 1.0)],
-            value: 0.0,
+            board,
+            policy: vec![(Move::new(8, 7).unwrap(), 1.0)],
+            value: 1.0,
             generation: 0,
         };
-        let stats = train(&mut model, &[sample], 1, 1e-3, 1, &[]).unwrap();
-        assert_eq!(stats.optimizer_steps, 1);
+        let stats = train(&mut model, &[sample], 2, 1e-3, 1, &[]).unwrap();
+        assert_eq!(stats.optimizer_steps, 2);
         assert!(stats.policy_loss.is_finite());
         assert!(stats.value_loss.is_finite());
+        assert!(model.policy_local.iter().any(|&weight| weight != 0.0));
+        assert_ne!(model.local_axis_embedding, before_local);
     }
 }
