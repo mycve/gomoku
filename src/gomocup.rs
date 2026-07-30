@@ -1,6 +1,6 @@
 use crate::{
     game::{BOARD_SIZE, Board, Move, Player},
-    mcts::{SearchConfig, search_timed},
+    mcts::{SearchConfig, search, search_timed},
     model::PolicyValueModel,
 };
 use std::{
@@ -176,10 +176,8 @@ pub fn run(model: &PolicyValueModel, config: GomocupConfig) -> io::Result<()> {
                 if let Some((key, value)) = argument.split_once(char::is_whitespace) {
                     if key.eq_ignore_ascii_case("timeout_turn") {
                         if let Ok(ms) = value.trim().parse::<u64>() {
-                            // Gomocup GUI 常用 0 表示未设置或不限制，不能把它压成 1ms。
-                            if ms > 0 {
-                                timeout_turn_ms = ms;
-                            }
+                            // 协议规定 0 表示尽快落子，而不是无限时。
+                            timeout_turn_ms = ms;
                         }
                     }
                 }
@@ -206,24 +204,26 @@ fn play_and_respond(
     if board.outcome().is_some() {
         return respond(output, "ERROR game is already over");
     }
-    let safety_ms = (timeout_turn_ms / 20).clamp(5, 100);
-    let limit = Duration::from_millis(timeout_turn_ms.saturating_sub(safety_ms).max(1));
-    let result = search_timed(
-        board,
-        model,
-        SearchConfig {
-            simulations: config.simulations,
-            cpuct: config.cpuct,
-            ..Default::default()
+    let search_config = SearchConfig {
+        simulations: if timeout_turn_ms == 0 {
+            1
+        } else {
+            config.simulations
         },
-        limit,
-    );
-    // 即使 GUI 给出的时限短到搜索尚未完成，也必须按协议返回一个合法坐标。
-    let mv = result
-        .first()
-        .map(|candidate| candidate.mv)
-        .or_else(|| board.legal_moves().into_iter().next())
-        .ok_or_else(|| io::Error::other("合法局面没有可用落子"))?;
+        cpuct: config.cpuct,
+        ..Default::default()
+    };
+    let result = if timeout_turn_ms == 0 {
+        search(board, model, search_config)
+    } else {
+        let safety_ms = (timeout_turn_ms / 20).clamp(5, 100);
+        let limit = Duration::from_millis(timeout_turn_ms.saturating_sub(safety_ms).max(1));
+        search_timed(board, model, search_config, limit)
+    };
+    let Some(best) = result.first() else {
+        return respond(output, "ERROR no legal move");
+    };
+    let mv = best.mv;
     let player = board.to_move();
     board.play(mv);
     stones.push((mv, player));

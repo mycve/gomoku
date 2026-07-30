@@ -10,7 +10,7 @@ use std::{
 
 /// 可交付的 Gomocup/Piskvork 五子棋协议引擎。
 #[derive(Parser)]
-#[command(name = "gomoku-engine", version, about)]
+#[command(name = "pbrain-gomoku", version, about)]
 struct Args {
     /// Safetensors 模型路径。
     #[arg(default_value = "model.safetensors")]
