@@ -4,7 +4,6 @@ use gomoku::{
     az_loop_config::{DEFAULT_CONFIG_PATH, load_or_create},
     candle_train,
     game::{Board, Move, Outcome, Player},
-    gomocup::{self, GomocupConfig},
     mcts::{SearchConfig, search},
     model::PolicyValueModel,
     replay,
@@ -45,8 +44,6 @@ enum Command {
     AzArenaBest(AzArenaBestArgs),
     /// 终端人机对战（玩家执黑）。
     Play(PlayArgs),
-    /// 通过标准输入/输出运行 Gomocup/Piskvork 协议。
-    Gomocup(GomocupArgs),
 }
 
 #[derive(Args)]
@@ -151,16 +148,6 @@ struct AzEvalBestArgs {
 struct PlayArgs {
     #[arg(default_value = "model.safetensors")]
     model: String,
-}
-
-#[derive(Args)]
-struct GomocupArgs {
-    #[arg(default_value = "best.safetensors")]
-    model: String,
-    #[arg(long, default_value_t = 3000)]
-    simulations: usize,
-    #[arg(long, default_value_t = 1.5)]
-    cpuct: f32,
 }
 
 fn main() -> io::Result<()> {
@@ -317,15 +304,6 @@ fn main() -> io::Result<()> {
             )?;
         }
         Some(Command::Play(args)) => play(&load_model(&args.model)?)?,
-        Some(Command::Gomocup(args)) => {
-            return gomocup::run(
-                &load_model(&args.model)?,
-                GomocupConfig {
-                    simulations: args.simulations,
-                    cpuct: args.cpuct,
-                },
-            );
-        }
     }
     gomoku::profile::print_report();
     Ok(())

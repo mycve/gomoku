@@ -16,14 +16,30 @@ cargo run -- az-bench model.safetensors 400 20
 cargo run -- az-train-bench
 cargo run -- az-eval-best best.safetensors 800 --human-side black
 cargo run -- az-arena-best model.safetensors best.safetensors 40 400
-cargo run --profile fast -- gomocup best.safetensors --simulations 3000
+cargo run --profile fast --bin gomoku-engine
 cargo run -- play
 ```
 
-`gomocup` 命令通过纯标准输入/输出实现 Gomocup/Piskvork 协议，支持 `START`、
+独立的 `gomoku-engine` 可执行文件通过纯标准输入/输出实现 Gomocup/Piskvork 协议，支持 `START`、
 `BEGIN`、`TURN`、`BOARD`、`INFO timeout_turn`、`TAKEBACK`、`RESTART`、`ABOUT`
-和 `END`。协议坐标为零起始的 `x,y`；搜索同时受模拟次数上限与每步时间限制控制。
+和 `END`。协议坐标为零起始的 `x,y`；默认模拟次数上限为 50,000，搜索同时受模拟
+次数上限与每步时间限制控制。默认优先加载 `model.safetensors`，不存在时自动加载
+同目录的 `best.safetensors`。
 当前规则为 15×15 freestyle Gomoku，不支持 Renju 禁手及矩形棋盘。
+
+交付引擎时只需编译并复制独立二进制与模型，不包含训练命令入口：
+
+```bash
+cargo build --profile fast --bin gomoku-engine
+cp target/fast/gomoku-engine ./dist/
+cp best.safetensors ./dist/
+```
+
+GUI 中的引擎命令设置为：
+
+```bash
+gomoku-engine
+```
 
 日常开发和训练部署可使用与 ChineseAI 相同的快速优化编译模式：
 
