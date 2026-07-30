@@ -15,9 +15,6 @@ struct Args {
     /// Safetensors 模型路径。
     #[arg(default_value = "model.safetensors")]
     model: PathBuf,
-    /// 每步搜索模拟次数上限；仍受协议 timeout_turn 限制。
-    #[arg(long, default_value_t = 50000)]
-    simulations: usize,
     /// PUCT 探索常数。
     #[arg(long, default_value_t = 1.5)]
     cpuct: f32,
@@ -32,13 +29,7 @@ fn main() -> io::Result<()> {
             format!("无法加载模型 `{}`: {error}", model_path.display()),
         )
     })?;
-    gomocup::run(
-        &model,
-        GomocupConfig {
-            simulations: args.simulations.max(1),
-            cpuct: args.cpuct,
-        },
-    )
+    gomocup::run(&model, GomocupConfig { cpuct: args.cpuct })
 }
 
 fn resolve_model_path(requested: &Path) -> PathBuf {

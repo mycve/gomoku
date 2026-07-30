@@ -23,9 +23,10 @@ cargo run -- play
 独立的 `pbrain-gomoku` 可执行文件通过纯标准输入/输出实现 Gomocup/Piskvork 协议。Piskvork
 以必需的 `pbrain-` 文件名前缀识别标准输入/输出新协议。引擎支持 `START`、
 `BEGIN`、`TURN`、`BOARD`、`INFO timeout_turn`、`TAKEBACK`、`RESTART`、`ABOUT`
-和 `END`。协议坐标为零起始的 `x,y`；默认模拟次数上限为 50,000，搜索同时受模拟
-次数上限与每步时间限制控制。默认优先加载 `model.safetensors`，不存在时自动加载
-同目录的 `best.safetensors`。
+和 `END`。协议坐标为零起始的 `x,y`；正常对局只按 `timeout_turn` 与 `time_left`
+确定搜索截止时间，不再设置固定模拟次数上限。`timeout_turn = 0` 按协议要求尽快
+落子。默认优先加载 `model.safetensors`，不存在时自动加载同目录的
+`best.safetensors`。
 当前规则为 15×15 freestyle Gomoku，不支持 Renju 禁手及非 15×15 棋盘。
 
 交付引擎时只需编译并复制独立二进制与模型，不包含训练命令入口：

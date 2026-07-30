@@ -9,7 +9,6 @@ use std::{
 };
 
 pub struct GomocupConfig {
-    pub simulations: usize,
     pub cpuct: f32,
 }
 
@@ -222,11 +221,7 @@ fn play_and_respond(
         board.move_count(),
     );
     let search_config = SearchConfig {
-        simulations: if budget_ms == 0 {
-            1
-        } else {
-            config.simulations
-        },
+        simulations: if budget_ms == 0 { 1 } else { usize::MAX },
         cpuct: config.cpuct,
         ..Default::default()
     };
