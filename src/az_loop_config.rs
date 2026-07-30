@@ -48,6 +48,7 @@ pub struct AzLoopConfig {
     pub arena_simulations: usize,
     pub arena_opening_plies: usize,
     pub arena_promotion_rate: f32,
+    pub arena_promotion_confidence_z: f32,
     pub tensorboard_logdir: String,
 }
 
@@ -96,6 +97,7 @@ impl Default for AzLoopConfig {
             arena_simulations: 3000,
             arena_opening_plies: 2,
             arena_promotion_rate: 0.55,
+            arena_promotion_confidence_z: 1.28,
             tensorboard_logdir: "runs/gomoku".into(),
         }
     }
@@ -133,6 +135,10 @@ impl AzLoopConfig {
             ("ema_decay", self.ema_decay),
             ("arena_promotion_rate", self.arena_promotion_rate),
             (
+                "arena_promotion_confidence_z",
+                self.arena_promotion_confidence_z,
+            ),
+            (
                 "replay_recent_sample_fraction",
                 self.replay_recent_sample_fraction,
             ),
@@ -163,6 +169,7 @@ impl AzLoopConfig {
             || !(0.0..=1.0).contains(&self.root_exploration_fraction)
             || !(0.0..=1.0).contains(&self.ema_decay)
             || !(0.0..=1.0).contains(&self.arena_promotion_rate)
+            || self.arena_promotion_confidence_z < 0.0
             || !(0.0..=1.0).contains(&self.replay_recent_sample_fraction)
         {
             return Err(io::Error::other(
@@ -220,6 +227,7 @@ arena_games = 100
 arena_simulations = 3000
 arena_opening_plies = 2
 arena_promotion_rate = 0.550000011920929
+arena_promotion_confidence_z = 1.2799999713897705
 tensorboard_logdir = "runs/gomoku"
 "#;
 
@@ -238,5 +246,6 @@ mod tests {
         assert_eq!(config.train_samples_per_update, 50_000);
         assert!(DEFAULT_CONFIG_TEXT.contains("learning_rate = 0.0008\n"));
         assert!(DEFAULT_CONFIG_TEXT.contains("arena_promotion_rate = 0.550000011920929\n"));
+        assert_eq!(config.arena_promotion_confidence_z, 1.28);
     }
 }

@@ -36,106 +36,153 @@ pub fn train(
     requested_devices: &[usize],
     moves_left_loss_weight: f32,
 ) -> io::Result<TrainStats> {
-    train_controlled(
+    let mut session = TrainingSession::new(model, None, requested_devices, learning_rate)?;
+    session.train_controlled(
         model,
+        None,
         samples,
         epochs,
         learning_rate,
         batch_size,
-        requested_devices,
         moves_left_loss_weight,
+        1.0,
         None,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn train_controlled(
-    model: &mut PolicyValueModel,
-    samples: &[Sample],
-    epochs: usize,
-    learning_rate: f32,
-    batch_size: usize,
-    requested_devices: &[usize],
-    moves_left_loss_weight: f32,
-    stop: Option<&AtomicBool>,
-) -> io::Result<TrainStats> {
-    if samples.is_empty() || epochs == 0 || learning_rate <= 0.0 {
-        return Ok(TrainStats::default());
+pub struct TrainingSession {
+    replicas: Vec<Replica>,
+    ema: Option<Replica>,
+    optimizer: AdamW,
+}
+
+impl TrainingSession {
+    pub fn new(
+        model: &PolicyValueModel,
+        ema_model: Option<&PolicyValueModel>,
+        requested_devices: &[usize],
+        learning_rate: f32,
+    ) -> io::Result<Self> {
+        let devices = make_devices(requested_devices)?;
+        let replicas = devices
+            .iter()
+            .map(|(device, _)| Replica::new(model, device))
+            .collect::<io::Result<Vec<_>>>()?;
+        let ema = ema_model
+            .map(|model| Replica::new(model, &devices[0].0))
+            .transpose()?;
+        let optimizer = AdamW::new(
+            replicas[0].vars(),
+            ParamsAdamW {
+                lr: learning_rate as f64,
+                beta1: 0.9,
+                beta2: 0.999,
+                eps: 1e-8,
+                weight_decay: 1e-4,
+            },
+        )
+        .map_err(err)?;
+        Ok(Self {
+            replicas,
+            ema,
+            optimizer,
+        })
     }
-    let devices = make_devices(requested_devices)?;
-    let replicas = devices
-        .iter()
-        .map(|(device, _)| Replica::new(model, device))
-        .collect::<io::Result<Vec<_>>>()?;
-    let primary_vars = replicas[0].vars();
-    let mut optimizer = AdamW::new(
-        primary_vars.clone(),
-        ParamsAdamW {
-            lr: learning_rate as f64,
-            beta1: 0.9,
-            beta2: 0.999,
-            eps: 1e-8,
-            weight_decay: 1e-4,
-        },
-    )
-    .map_err(err)?;
-    let mut stats = TrainStats::default();
-    for _ in 0..epochs {
-        for batch in samples.chunks(batch_size.max(1)) {
-            if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-                replicas[0].copy_to(model)?;
-                return Ok(finalize_stats(stats, moves_left_loss_weight));
-            }
-            let shard_size = batch.len().div_ceil(replicas.len());
-            let shards = batch.chunks(shard_size).collect::<Vec<_>>();
-            let outputs = std::thread::scope(|scope| {
-                crate::scope_profile!("train.backward_parallel");
-                let handles = shards
-                    .iter()
-                    .enumerate()
-                    .map(|(rank, shard)| {
-                        let replica = &replicas[rank];
-                        scope.spawn(move || {
-                            let result =
-                                replica.backward(shard, batch.len(), moves_left_loss_weight);
-                            crate::profile::flush_thread();
-                            result
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn train_controlled(
+        &mut self,
+        model: &mut PolicyValueModel,
+        ema_model: Option<&mut PolicyValueModel>,
+        samples: &[Sample],
+        epochs: usize,
+        learning_rate: f32,
+        batch_size: usize,
+        moves_left_loss_weight: f32,
+        ema_decay: f32,
+        stop: Option<&AtomicBool>,
+    ) -> io::Result<TrainStats> {
+        if samples.is_empty() || epochs == 0 || learning_rate <= 0.0 {
+            return Ok(TrainStats::default());
+        }
+        self.optimizer.set_learning_rate(learning_rate as f64);
+        let mut stats = TrainStats::default();
+        for _ in 0..epochs {
+            for batch in samples.chunks(batch_size.max(1)) {
+                if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                    self.copy_models(model, ema_model)?;
+                    return Ok(finalize_stats(stats, moves_left_loss_weight));
+                }
+                let shard_size = batch.len().div_ceil(self.replicas.len());
+                let shards = batch.chunks(shard_size).collect::<Vec<_>>();
+                let outputs = std::thread::scope(|scope| {
+                    crate::scope_profile!("train.backward_parallel");
+                    let handles = shards
+                        .iter()
+                        .enumerate()
+                        .map(|(rank, shard)| {
+                            let replica = &self.replicas[rank];
+                            scope.spawn(move || {
+                                let result =
+                                    replica.backward(shard, batch.len(), moves_left_loss_weight);
+                                crate::profile::flush_thread();
+                                result
+                            })
                         })
-                    })
-                    .collect::<Vec<_>>();
-                handles
-                    .into_iter()
-                    .map(|h| h.join().map_err(|_| io::Error::other("GPU 训练线程异常"))?)
-                    .collect::<io::Result<Vec<_>>>()
-            })?;
-            let mut outputs = outputs.into_iter();
-            let primary = outputs.next().expect("训练批次至少有一个分片");
-            let mut primary_grads = primary.grads;
-            stats.samples += primary.samples;
-            stats.policy_loss += primary.policy_sum;
-            stats.value_loss += primary.value_sum;
-            stats.moves_left_loss += primary.moves_left_sum;
-            for output in outputs {
-                crate::scope_profile!("train.grad_aggregate");
-                add_cpu_grads(&primary_vars, &mut primary_grads, &output.cpu_grads)?;
-                stats.samples += output.samples;
-                stats.policy_loss += output.policy_sum;
-                stats.value_loss += output.value_sum;
-                stats.moves_left_loss += output.moves_left_sum;
-            }
-            {
-                crate::scope_profile!("train.optimizer_step");
-                optimizer.step(&primary_grads).map_err(err)?;
-            }
-            stats.optimizer_steps += 1;
-            {
-                crate::scope_profile!("train.param_broadcast");
-                broadcast(&replicas)?;
+                        .collect::<Vec<_>>();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().map_err(|_| io::Error::other("GPU 训练线程异常"))?)
+                        .collect::<io::Result<Vec<_>>>()
+                })?;
+                let mut outputs = outputs.into_iter();
+                let primary = outputs.next().expect("训练批次至少有一个分片");
+                let mut primary_grads = primary.grads;
+                stats.samples += primary.samples;
+                stats.policy_loss += primary.policy_sum;
+                stats.value_loss += primary.value_sum;
+                stats.moves_left_loss += primary.moves_left_sum;
+                for output in outputs {
+                    crate::scope_profile!("train.grad_aggregate");
+                    add_cpu_grads(
+                        &self.replicas[0].vars(),
+                        &mut primary_grads,
+                        &output.cpu_grads,
+                    )?;
+                    stats.samples += output.samples;
+                    stats.policy_loss += output.policy_sum;
+                    stats.value_loss += output.value_sum;
+                    stats.moves_left_loss += output.moves_left_sum;
+                }
+                {
+                    crate::scope_profile!("train.optimizer_step");
+                    self.optimizer.step(&primary_grads).map_err(err)?;
+                }
+                stats.optimizer_steps += 1;
+                if let Some(ema) = &self.ema {
+                    ema.update_ema_from(&self.replicas[0], ema_decay)?;
+                }
+                {
+                    crate::scope_profile!("train.param_broadcast");
+                    broadcast(&self.replicas)?;
+                }
             }
         }
+        self.copy_models(model, ema_model)?;
+        Ok(finalize_stats(stats, moves_left_loss_weight))
     }
-    replicas[0].copy_to(model)?;
-    Ok(finalize_stats(stats, moves_left_loss_weight))
+
+    fn copy_models(
+        &self,
+        model: &mut PolicyValueModel,
+        ema_model: Option<&mut PolicyValueModel>,
+    ) -> io::Result<()> {
+        self.replicas[0].copy_to(model)?;
+        if let (Some(ema), Some(ema_model)) = (&self.ema, ema_model) {
+            ema.copy_to(ema_model)?;
+        }
+        Ok(())
+    }
 }
 
 fn finalize_stats(mut stats: TrainStats, moves_left_loss_weight: f32) -> TrainStats {
@@ -391,6 +438,18 @@ impl Replica {
                 &Tensor::from_vec(data.clone(), var.shape().clone(), &self.device).map_err(err)?,
             )
             .map_err(err)?
+        }
+        Ok(())
+    }
+    fn update_ema_from(&self, source: &Self, decay: f32) -> io::Result<()> {
+        let decay = decay.clamp(0.0, 1.0) as f64;
+        for (ema, online) in self.vars().iter().zip(source.vars()) {
+            let blended = ema
+                .as_tensor()
+                .affine(decay, 0.0)
+                .and_then(|x| x.add(&online.as_tensor().affine(1.0 - decay, 0.0)?))
+                .map_err(err)?;
+            ema.set(&blended).map_err(err)?;
         }
         Ok(())
     }

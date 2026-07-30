@@ -236,6 +236,8 @@ pub struct ArenaReport {
     pub wins_as_white: usize,
     pub losses_as_white: usize,
     pub draws_as_white: usize,
+    pub paired_openings: usize,
+    pub paired_score_square_sum: f32,
 }
 
 impl ArenaReport {
@@ -246,6 +248,13 @@ impl ArenaReport {
         (self.wins as f32 + self.draws as f32 * 0.5) / self.games().max(1) as f32
     }
     pub fn score_rate_standard_error(self) -> f32 {
+        if self.paired_openings > 1 && self.paired_openings * 2 == self.games() {
+            let pairs = self.paired_openings as f32;
+            let mean = self.score_rate();
+            let sample_variance =
+                ((self.paired_score_square_sum - pairs * mean * mean) / (pairs - 1.0)).max(0.0);
+            return (sample_variance / pairs).sqrt();
+        }
         let games = self.games();
         if games <= 1 {
             return 0.5;
@@ -285,15 +294,13 @@ pub fn arena_controlled(
     cfg: SearchConfig,
     stop: Option<&AtomicBool>,
 ) -> ArenaReport {
-    (0..games)
+    (0..games.div_ceil(2))
         .into_par_iter()
-        .map(|game| {
+        .map(|opening_index| {
             if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
                 return ArenaReport::default();
             }
-            let candidate_black = game % 2 == 0;
             let mut board = Board::new();
-            let opening_index = game / 2;
             let mut opening_seed =
                 cfg.opening_seed ^ (opening_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
             for _ in 0..cfg.opening_random_plies {
@@ -304,56 +311,80 @@ pub fn arena_controlled(
                 let index = random_index(&mut opening_seed, legal.len());
                 board.play(legal[index]);
             }
-            while board.outcome().is_none()
-                && !stop.is_some_and(|flag| flag.load(Ordering::Relaxed))
-            {
-                let candidate_turn =
-                    (board.to_move() == crate::game::Player::Black) == candidate_black;
-                let model = if candidate_turn { candidate } else { baseline };
-                let result = search(&board, model, cfg);
-                if result.is_empty() {
-                    break;
+            let mut report = play_arena_game(board.clone(), true, candidate, baseline, cfg, stop);
+            if opening_index * 2 + 1 < games {
+                let second = play_arena_game(board, false, candidate, baseline, cfg, stop);
+                report = merge_arena_reports(report, second);
+                if report.games() == 2 {
+                    let pair_score = report.score_rate();
+                    report.paired_openings = 1;
+                    report.paired_score_square_sum = pair_score * pair_score;
                 }
-                board.play(result[0].mv);
             }
-            match board.outcome() {
-                Some(Outcome::Win(player)) => {
-                    let candidate_won = (player == crate::game::Player::Black) == candidate_black;
-                    if candidate_won {
-                        ArenaReport {
-                            wins: 1,
-                            wins_as_black: usize::from(candidate_black),
-                            wins_as_white: usize::from(!candidate_black),
-                            ..Default::default()
-                        }
-                    } else {
-                        ArenaReport {
-                            losses: 1,
-                            losses_as_black: usize::from(candidate_black),
-                            losses_as_white: usize::from(!candidate_black),
-                            ..Default::default()
-                        }
-                    }
-                }
-                _ => ArenaReport {
-                    draws: 1,
-                    draws_as_black: usize::from(candidate_black),
-                    draws_as_white: usize::from(!candidate_black),
+            report
+        })
+        .reduce(ArenaReport::default, merge_arena_reports)
+}
+
+fn play_arena_game(
+    mut board: Board,
+    candidate_black: bool,
+    candidate: &PolicyValueModel,
+    baseline: &PolicyValueModel,
+    cfg: SearchConfig,
+    stop: Option<&AtomicBool>,
+) -> ArenaReport {
+    while board.outcome().is_none() && !stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        let candidate_turn = (board.to_move() == crate::game::Player::Black) == candidate_black;
+        let model = if candidate_turn { candidate } else { baseline };
+        let result = search(&board, model, cfg);
+        if result.is_empty() {
+            break;
+        }
+        board.play(result[0].mv);
+    }
+    match board.outcome() {
+        Some(Outcome::Win(player)) => {
+            let candidate_won = (player == crate::game::Player::Black) == candidate_black;
+            if candidate_won {
+                ArenaReport {
+                    wins: 1,
+                    wins_as_black: usize::from(candidate_black),
+                    wins_as_white: usize::from(!candidate_black),
                     ..Default::default()
-                },
+                }
+            } else {
+                ArenaReport {
+                    losses: 1,
+                    losses_as_black: usize::from(candidate_black),
+                    losses_as_white: usize::from(!candidate_black),
+                    ..Default::default()
+                }
             }
-        })
-        .reduce(ArenaReport::default, |a, b| ArenaReport {
-            wins: a.wins + b.wins,
-            losses: a.losses + b.losses,
-            draws: a.draws + b.draws,
-            wins_as_black: a.wins_as_black + b.wins_as_black,
-            losses_as_black: a.losses_as_black + b.losses_as_black,
-            draws_as_black: a.draws_as_black + b.draws_as_black,
-            wins_as_white: a.wins_as_white + b.wins_as_white,
-            losses_as_white: a.losses_as_white + b.losses_as_white,
-            draws_as_white: a.draws_as_white + b.draws_as_white,
-        })
+        }
+        _ => ArenaReport {
+            draws: 1,
+            draws_as_black: usize::from(candidate_black),
+            draws_as_white: usize::from(!candidate_black),
+            ..Default::default()
+        },
+    }
+}
+
+fn merge_arena_reports(a: ArenaReport, b: ArenaReport) -> ArenaReport {
+    ArenaReport {
+        wins: a.wins + b.wins,
+        losses: a.losses + b.losses,
+        draws: a.draws + b.draws,
+        wins_as_black: a.wins_as_black + b.wins_as_black,
+        losses_as_black: a.losses_as_black + b.losses_as_black,
+        draws_as_black: a.draws_as_black + b.draws_as_black,
+        wins_as_white: a.wins_as_white + b.wins_as_white,
+        losses_as_white: a.losses_as_white + b.losses_as_white,
+        draws_as_white: a.draws_as_white + b.draws_as_white,
+        paired_openings: a.paired_openings + b.paired_openings,
+        paired_score_square_sum: a.paired_score_square_sum + b.paired_score_square_sum,
+    }
 }
 
 fn random_index(seed: &mut u64, len: usize) -> usize {
@@ -380,5 +411,18 @@ mod tests {
         assert_eq!(temperature_for_ply(cfg, 9), 0.9);
         assert!((temperature_for_ply(cfg, 20) - 0.6).abs() < 1e-6);
         assert_eq!(temperature_for_ply(cfg, 30), 0.3);
+    }
+
+    #[test]
+    fn arena_standard_error_uses_paired_openings() {
+        let report = ArenaReport {
+            wins: 3,
+            losses: 3,
+            paired_openings: 3,
+            paired_score_square_sum: 1.25,
+            ..Default::default()
+        };
+        let expected = (0.25_f32 / 3.0).sqrt();
+        assert!((report.score_rate_standard_error() - expected).abs() < 1.0e-6);
     }
 }

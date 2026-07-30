@@ -210,6 +210,12 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     let trainer = thread::spawn(move || -> io::Result<()> {
         let mut model = initial_model;
         let mut ema_model = initial_ema;
+        let mut training = candle_train::TrainingSession::new(
+            &model,
+            Some(&ema_model),
+            &trainer_config.gpu_devices,
+            current_lr(&trainer_config, start_update),
+        )?;
         let mut pool = initial_pool;
         let mut index = 0usize;
         while let Ok(batch) = ready_rx.recv() {
@@ -236,24 +242,20 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             let train_samples = sampled.samples.len();
             let recent_quota_rate = sampled.recent_quota as f32 / train_samples.max(1) as f32;
             let actual_recent_rate = sampled.actual_recent as f32 / train_samples.max(1) as f32;
-            let train_stats = candle_train::train_controlled(
+            let train_stats = training.train_controlled(
                 &mut model,
+                Some(&mut ema_model),
                 &sampled.samples,
                 trainer_config.batch_epochs,
                 lr,
                 trainer_config.batch_size,
-                &trainer_config.gpu_devices,
                 trainer_config.moves_left_loss_weight,
+                trainer_config.ema_decay,
                 Some(&trainer_stop),
             )?;
             if trainer_stop.load(Ordering::SeqCst) {
                 break;
             }
-            let effective_decay = trainer_config
-                .ema_decay
-                .clamp(0.0, 1.0)
-                .powi(train_stats.optimizer_steps.min(i32::MAX as usize) as i32);
-            ema_model.update_ema(&model, effective_decay);
             let train_seconds = started.elapsed().as_secs_f32();
             if event_tx
                 .send(TrainerEvent {
@@ -547,23 +549,37 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 Some(&stop),
             );
             let arena_seconds = arena_started.elapsed().as_secs_f32();
-            let promoted = report.score_rate() >= config.arena_promotion_rate;
+            let lower_bound = report.score_rate_lower_bound(config.arena_promotion_confidence_z);
+            let promoted = report.score_rate() >= config.arena_promotion_rate && lower_bound > 0.5;
+            let black_games =
+                (report.wins_as_black + report.losses_as_black + report.draws_as_black).max(1)
+                    as f32;
+            let white_games =
+                (report.wins_as_white + report.losses_as_white + report.draws_as_white).max(1)
+                    as f32;
+            let score_as_black =
+                (report.wins_as_black as f32 + report.draws_as_black as f32 * 0.5) / black_games;
+            let score_as_white =
+                (report.wins_as_white as f32 + report.draws_as_white as f32 * 0.5) / white_games;
             println!(
-                "arena    : W/L/D={}/{}/{} score={:.2}% elo={:+.1} promoted={}",
+                "arena    : W/L/D={}/{}/{} score={:.2}% lower={:.2}% elo={:+.1} promoted={}",
                 report.wins,
                 report.losses,
                 report.draws,
                 report.score_rate() * 100.0,
+                lower_bound * 100.0,
                 report.elo_diff(),
                 promoted
             );
+            println!(
+                "arena    : paired_openings={} candidate_black={:.2}% candidate_white={:.2}%",
+                report.paired_openings,
+                score_as_black * 100.0,
+                score_as_white * 100.0
+            );
             let arena_games = report.games().max(1) as f32;
             tb.add_scalar("arena/score_rate", report.score_rate(), progress.update);
-            tb.add_scalar(
-                "arena/score_lower_bound_90",
-                report.score_rate_lower_bound(1.28),
-                progress.update,
-            );
+            tb.add_scalar("arena/score_lower_bound_90", lower_bound, progress.update);
             tb.add_scalar(
                 "arena/score_standard_error",
                 report.score_rate_standard_error(),
@@ -592,22 +608,8 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 progress.update,
             );
             tb.add_scalar("arena/promoted", f32::from(promoted), progress.update);
-            let black_games =
-                (report.wins_as_black + report.losses_as_black + report.draws_as_black).max(1)
-                    as f32;
-            let white_games =
-                (report.wins_as_white + report.losses_as_white + report.draws_as_white).max(1)
-                    as f32;
-            tb.add_scalar(
-                "arena/score_as_black",
-                (report.wins_as_black as f32 + report.draws_as_black as f32 * 0.5) / black_games,
-                progress.update,
-            );
-            tb.add_scalar(
-                "arena/score_as_white",
-                (report.wins_as_white as f32 + report.draws_as_white as f32 * 0.5) / white_games,
-                progress.update,
-            );
+            tb.add_scalar("arena/score_as_black", score_as_black, progress.update);
+            tb.add_scalar("arena/score_as_white", score_as_white, progress.update);
             if promoted {
                 best = event.model.clone();
                 best.save(&config.best_model_path)?;

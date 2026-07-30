@@ -65,6 +65,11 @@ pub fn sample_mixed_recent(
         .enumerate()
         .filter_map(|(index, sample)| (sample.generation >= oldest_recent).then_some(index))
         .collect::<Vec<_>>();
+    let historical = pool
+        .iter()
+        .enumerate()
+        .filter_map(|(index, sample)| (sample.generation < oldest_recent).then_some(index))
+        .collect::<Vec<_>>();
     let recent_quota = if recent.is_empty() {
         0
     } else {
@@ -78,7 +83,12 @@ pub fn sample_mixed_recent(
         samples.push(sample.transformed(rng.index(8)));
     }
     for _ in recent_quota..count {
-        let sample = &pool[rng.index(pool.len())];
+        let source = if historical.is_empty() {
+            &recent
+        } else {
+            &historical
+        };
+        let sample = &pool[source[rng.index(source.len())]];
         samples.push(sample.transformed(rng.index(8)));
     }
     for index in (1..samples.len()).rev() {
@@ -168,7 +178,7 @@ mod tests {
         let batch = sample_mixed_recent(&pool, 1000, 0.4, 2, 7);
         assert_eq!(batch.samples.len(), 1000);
         assert_eq!(batch.recent_quota, 400);
-        assert!(batch.actual_recent >= 400);
+        assert_eq!(batch.actual_recent, 400);
         let generations = |samples: &[Sample]| {
             samples
                 .iter()
@@ -177,6 +187,15 @@ mod tests {
         };
         let again = sample_mixed_recent(&pool, 1000, 0.4, 2, 7);
         assert_eq!(generations(&batch.samples), generations(&again.samples));
+    }
+
+    #[test]
+    fn mixed_sampling_falls_back_when_there_is_no_history() {
+        let pool = vec![sample(10); 10];
+        let batch = sample_mixed_recent(&pool, 100, 0.4, 5, 7);
+        assert_eq!(batch.samples.len(), 100);
+        assert_eq!(batch.recent_quota, 40);
+        assert_eq!(batch.actual_recent, 100);
     }
 
     #[test]
