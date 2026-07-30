@@ -65,7 +65,8 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     .map_err(io::Error::other)?;
     let mut progress = load_progress(&config.progress_path)?;
     let initial_model = load_or_init(&config.model_path)?;
-    let initial_ema = if Path::new(&config.ema_model_path).exists() {
+    let ema_checkpoint_exists = Path::new(&config.ema_model_path).exists();
+    let initial_ema = if ema_checkpoint_exists {
         PolicyValueModel::load(&config.ema_model_path)?
     } else {
         initial_model.clone()
@@ -128,8 +129,14 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         config.selfplay_random_opening_probability * 100.0
     );
     println!(
-        "targets  : policy=mcts_visits value=terminal_wdl ema_decay={:.6} ema_model={}",
-        config.ema_decay, config.ema_model_path
+        "targets  : policy=mcts_visits value=terminal_wdl ema_decay={:.6} ema_model={} ema_state={}",
+        config.ema_decay,
+        config.ema_model_path,
+        if ema_checkpoint_exists {
+            "restored"
+        } else {
+            "copy_first_update"
+        }
     );
     let published = Arc::new(RwLock::new(initial_ema.clone()));
     let version = Arc::new(AtomicU64::new(progress.update as u64));
@@ -215,6 +222,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     let trainer = thread::spawn(move || -> io::Result<()> {
         let mut model = initial_model;
         let mut ema_model = initial_ema;
+        let mut ema_initialized = ema_checkpoint_exists;
         let mut training = candle_train::TrainingSession::new(
             &model,
             Some(&ema_model),
@@ -247,6 +255,8 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             let train_samples = sampled.samples.len();
             let recent_quota_rate = sampled.recent_quota as f32 / train_samples.max(1) as f32;
             let actual_recent_rate = sampled.actual_recent as f32 / train_samples.max(1) as f32;
+            let effective_ema_decay =
+                ema_decay_for_update(trainer_config.ema_decay, ema_initialized);
             let train_stats = training.train_controlled(
                 &mut model,
                 Some(&mut ema_model),
@@ -254,11 +264,14 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 trainer_config.batch_epochs,
                 lr,
                 trainer_config.batch_size,
-                trainer_config.ema_decay,
+                effective_ema_decay,
                 Some(&trainer_stop),
             )?;
             if trainer_stop.load(Ordering::SeqCst) {
                 break;
+            }
+            if train_stats.optimizer_steps > 0 {
+                ema_initialized = true;
             }
             let train_seconds = started.elapsed().as_secs_f32();
             if event_tx
@@ -761,6 +774,10 @@ fn current_lr(c: &AzLoopConfig, update: usize) -> f32 {
     (c.learning_rate * c.learning_rate_decay.powi(exponent)).max(c.learning_rate_min)
 }
 
+fn ema_decay_for_update(configured_decay: f32, initialized: bool) -> f32 {
+    if initialized { configured_decay } else { 0.0 }
+}
+
 fn compact_device_names(devices: &[String]) -> String {
     if devices.is_empty() {
         return "none".into();
@@ -847,5 +864,11 @@ mod tests {
         let devices = (0..8).map(|id| format!("cuda:{id}")).collect::<Vec<_>>();
         assert_eq!(compact_device_names(&devices), "cuda:0-7(8卡)");
         assert_eq!(compact_device_names(&["cuda:3".into()]), "cuda:3");
+    }
+
+    #[test]
+    fn ema_first_update_copies_online_model() {
+        assert_eq!(ema_decay_for_update(0.999, false), 0.0);
+        assert_eq!(ema_decay_for_update(0.999, true), 0.999);
     }
 }
