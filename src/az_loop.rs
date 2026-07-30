@@ -438,6 +438,21 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             progress.update,
         );
         tb.add_scalar(
+            "selfplay/average_plies_black_win",
+            event.batch.stats.black_win_plies as f32 / event.batch.stats.black_wins.max(1) as f32,
+            progress.update,
+        );
+        tb.add_scalar(
+            "selfplay/average_plies_white_win",
+            event.batch.stats.white_win_plies as f32 / event.batch.stats.white_wins.max(1) as f32,
+            progress.update,
+        );
+        tb.add_scalar(
+            "selfplay/average_plies_draw",
+            event.batch.stats.draw_plies as f32 / event.batch.stats.draws.max(1) as f32,
+            progress.update,
+        );
+        tb.add_scalar(
             "selfplay/random_opening_rate",
             event.batch.stats.random_opening_games as f32 / games,
             progress.update,
@@ -594,10 +609,11 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 promoted
             );
             println!(
-                "arena    : paired_openings={} candidate_black={:.2}% candidate_white={:.2}%",
+                "arena    : paired_openings={} candidate_black={:.2}% candidate_white={:.2}% avg_plies={:.1}",
                 report.paired_openings,
                 score_as_black * 100.0,
-                score_as_white * 100.0
+                score_as_white * 100.0,
+                report.plies as f32 / report.games().max(1) as f32
             );
             let arena_games = report.games().max(1) as f32;
             tb.add_scalar("arena/score_rate", report.score_rate(), progress.update);
@@ -608,6 +624,26 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 progress.update,
             );
             tb.add_scalar("arena/elo_diff", report.elo_diff(), progress.update);
+            tb.add_scalar(
+                "arena/average_plies",
+                report.plies as f32 / arena_games,
+                progress.update,
+            );
+            tb.add_scalar(
+                "arena/average_plies_win",
+                report.win_plies as f32 / report.wins.max(1) as f32,
+                progress.update,
+            );
+            tb.add_scalar(
+                "arena/average_plies_loss",
+                report.loss_plies as f32 / report.losses.max(1) as f32,
+                progress.update,
+            );
+            tb.add_scalar(
+                "arena/average_plies_draw",
+                report.draw_plies as f32 / report.draws.max(1) as f32,
+                progress.update,
+            );
             tb.add_scalar(
                 "arena/win_rate",
                 report.wins as f32 / arena_games,

@@ -157,6 +157,7 @@ impl AzLoopConfig {
         if self.simulations == 0
             || self.selfplay_samples_per_update == 0
             || self.replay_warmup_samples == 0
+            || self.batch_epochs == 0
             || self.batch_size == 0
             || self.train_samples_per_update == 0
         {
@@ -168,6 +169,10 @@ impl AzLoopConfig {
             || self.learning_rate_min < 0.0
             || !(0.0..=1.0).contains(&self.learning_rate_decay)
             || self.cpuct <= 0.0
+            || self.temperature_start < 0.0
+            || self.temperature_endgame < 0.0
+            || self.temperature_value_cutoff < 0.0
+            || self.root_dirichlet_alpha < 0.0
             || self.policy_softmax_temp <= 0.0
             || !(0.0..=1.0).contains(&self.root_exploration_fraction)
             || !(0.0..=1.0).contains(&self.ema_decay)
@@ -178,6 +183,11 @@ impl AzLoopConfig {
         {
             return Err(io::Error::other(
                 "配置中的学习率、搜索或比例参数超出合法范围",
+            ));
+        }
+        if self.arena_interval > 0 && (self.arena_games == 0 || self.arena_simulations == 0) {
+            return Err(io::Error::other(
+                "启用 Arena 时 arena_games 和 arena_simulations 必须大于 0",
             ));
         }
         if self.replay_warmup_samples > self.replay_capacity {

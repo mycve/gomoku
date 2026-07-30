@@ -160,7 +160,7 @@ fn main() -> io::Result<()> {
             PolicyValueModel::random(args.hidden, args.seed).save(&args.output)?;
             println!("model    : initialized {}", args.output);
             println!(
-                "arch     : input=451 hidden={} rmsnorm local=4axesx8cells-pattern2 policy=225 value=96x96xWDL3",
+                "arch     : input=451 hidden={} rmsnorm local=4axesx8cells(residual2+ray2) policy=225+bilinear4 value=mean+max+smoothmax->96x96xWDL3",
                 args.hidden
             );
             println!("board    : 15x15 freestyle gomoku");
@@ -268,14 +268,15 @@ fn main() -> io::Result<()> {
             );
             let seconds = started.elapsed().as_secs_f32();
             println!(
-                "result   : W/L/D={}/{}/{} score={:.2}% stderr={:.2}% lower={:.2}% elo={:+.1}",
+                "result   : W/L/D={}/{}/{} score={:.2}% stderr={:.2}% lower={:.2}% elo={:+.1} avg_plies={:.1}",
                 report.wins,
                 report.losses,
                 report.draws,
                 report.score_rate() * 100.0,
                 report.score_rate_standard_error() * 100.0,
                 report.score_rate_lower_bound(args.confidence_z) * 100.0,
-                report.elo_diff()
+                report.elo_diff(),
+                report.plies as f32 / report.games().max(1) as f32
             );
             println!(
                 "as-black : W/L/D={}/{}/{}",

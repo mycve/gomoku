@@ -41,7 +41,7 @@ impl Move {
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.trim().to_ascii_lowercase();
         let mut chars = s.chars();
-        let col = chars.next()? as usize - 'a' as usize;
+        let col = (chars.next()? as usize).checked_sub('a' as usize)?;
         let row = chars.as_str().parse::<usize>().ok()?.checked_sub(1)?;
         Self::new(row, col)
     }
@@ -147,32 +147,10 @@ impl Board {
         if self.outcome().is_some() {
             return vec![];
         }
-        if self.moves == 0 {
-            return vec![Move::new(BOARD_SIZE / 2, BOARD_SIZE / 2).unwrap()];
-        }
-        let mut near = [false; CELL_COUNT];
-        for i in 0..CELL_COUNT {
-            if self.cells[i] == 0 {
-                continue;
-            }
-            let r = i / BOARD_SIZE;
-            let c = i % BOARD_SIZE;
-            for dr in -2i32..=2 {
-                for dc in -2i32..=2 {
-                    let nr = r as i32 + dr;
-                    let nc = c as i32 + dc;
-                    if nr >= 0 && nc >= 0 && nr < BOARD_SIZE as i32 && nc < BOARD_SIZE as i32 {
-                        let j = nr as usize * BOARD_SIZE + nc as usize;
-                        if self.cells[j] == 0 {
-                            near[j] = true;
-                        }
-                    }
-                }
-            }
-        }
-        near.iter()
+        self.cells
+            .iter()
             .enumerate()
-            .filter_map(|(i, &v)| v.then_some(Move(i)))
+            .filter_map(|(index, &stone)| (stone == 0).then_some(Move(index)))
             .collect()
     }
     pub fn outcome(&self) -> Option<Outcome> {
@@ -307,12 +285,32 @@ mod tests {
         }
         assert_eq!(b.outcome(), Some(Outcome::Win(Player::Black)));
     }
+
+    #[test]
+    fn legal_moves_include_every_empty_point() {
+        let mut board = Board::new();
+        assert_eq!(board.legal_moves().len(), CELL_COUNT);
+        assert!(board.play(Move::new(7, 7).unwrap()));
+        let legal = board.legal_moves();
+        assert_eq!(legal.len(), CELL_COUNT - 1);
+        assert!(legal.contains(&Move::new(0, 0).unwrap()));
+        assert!(legal.contains(&Move::new(14, 14).unwrap()));
+        assert!(!legal.contains(&Move::new(7, 7).unwrap()));
+    }
     #[test]
     fn notation_roundtrip() {
         for s in ["a1", "h8", "o15"] {
             let m = Move::parse(s).unwrap();
             assert_eq!(m.notation(), s);
         }
+    }
+
+    #[test]
+    fn notation_parser_rejects_out_of_range_input_without_panicking() {
+        assert!(Move::parse("@1").is_none());
+        assert!(Move::parse("p1").is_none());
+        assert!(Move::parse("a0").is_none());
+        assert!(Move::parse("中1").is_none());
     }
     #[test]
     fn eight_symmetries_are_distinct_and_invertible() {

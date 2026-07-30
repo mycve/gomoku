@@ -25,6 +25,9 @@ pub struct SelfplayStats {
     pub white_wins: usize,
     pub draws: usize,
     pub plies: usize,
+    pub black_win_plies: usize,
+    pub white_win_plies: usize,
+    pub draw_plies: usize,
     pub random_opening_games: usize,
     pub random_opening_plies: usize,
     pub searches: usize,
@@ -45,6 +48,9 @@ impl SelfplayStats {
         self.white_wins += other.white_wins;
         self.draws += other.draws;
         self.plies += other.plies;
+        self.black_win_plies += other.black_win_plies;
+        self.white_win_plies += other.white_win_plies;
+        self.draw_plies += other.draw_plies;
         self.random_opening_games += other.random_opening_games;
         self.random_opening_plies += other.random_opening_plies;
         self.searches += other.searches;
@@ -142,9 +148,18 @@ pub fn generate_one_detailed_controlled(
     let out = board.outcome();
     stats.plies = board.move_count();
     match out {
-        Some(Outcome::Win(crate::game::Player::Black)) => stats.black_wins = 1,
-        Some(Outcome::Win(crate::game::Player::White)) => stats.white_wins = 1,
-        _ => stats.draws = 1,
+        Some(Outcome::Win(crate::game::Player::Black)) => {
+            stats.black_wins = 1;
+            stats.black_win_plies = stats.plies;
+        }
+        Some(Outcome::Win(crate::game::Player::White)) => {
+            stats.white_wins = 1;
+            stats.white_win_plies = stats.plies;
+        }
+        _ => {
+            stats.draws = 1;
+            stats.draw_plies = stats.plies;
+        }
     }
     for s in &mut samples {
         s.value = match out {
@@ -162,10 +177,18 @@ pub fn generate_one_detailed_controlled(
 }
 
 fn apply_random_opening(board: &mut Board, probability: f32, seed: &mut u64) -> usize {
-    const REGION_SIZES: [usize; 3] = [3, 4, 5];
     const OPENING_PLIES: usize = 2;
 
     if board.move_count() != 0 || probability <= 0.0 || random_unit(seed) >= probability.min(1.0) {
+        return 0;
+    }
+
+    apply_region_opening(board, OPENING_PLIES, seed)
+}
+
+fn apply_region_opening(board: &mut Board, plies: usize, seed: &mut u64) -> usize {
+    const REGION_SIZES: [usize; 3] = [3, 4, 5];
+    if board.move_count() != 0 || plies == 0 {
         return 0;
     }
 
@@ -180,7 +203,7 @@ fn apply_random_opening(board: &mut Board, probability: f32, seed: &mut u64) -> 
     }
 
     let mut played = 0;
-    for _ in 0..OPENING_PLIES {
+    for _ in 0..plies {
         if available.is_empty() {
             break;
         }
@@ -279,6 +302,10 @@ pub struct ArenaReport {
     pub draws_as_white: usize,
     pub paired_openings: usize,
     pub paired_score_square_sum: f32,
+    pub plies: usize,
+    pub win_plies: usize,
+    pub loss_plies: usize,
+    pub draw_plies: usize,
 }
 
 impl ArenaReport {
@@ -344,14 +371,7 @@ pub fn arena_controlled(
             let mut board = Board::new();
             let mut opening_seed =
                 cfg.opening_seed ^ (opening_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            for _ in 0..cfg.opening_random_plies {
-                let legal = board.legal_moves();
-                if legal.is_empty() {
-                    break;
-                }
-                let index = random_index(&mut opening_seed, legal.len());
-                board.play(legal[index]);
-            }
+            apply_region_opening(&mut board, cfg.opening_random_plies, &mut opening_seed);
             let mut report = play_arena_game(board.clone(), true, candidate, baseline, cfg, stop);
             if opening_index * 2 + 1 < games {
                 let second = play_arena_game(board, false, candidate, baseline, cfg, stop);
@@ -384,6 +404,7 @@ fn play_arena_game(
         }
         board.play(result[0].mv);
     }
+    let plies = board.move_count();
     match board.outcome() {
         Some(Outcome::Win(player)) => {
             let candidate_won = (player == crate::game::Player::Black) == candidate_black;
@@ -392,6 +413,8 @@ fn play_arena_game(
                     wins: 1,
                     wins_as_black: usize::from(candidate_black),
                     wins_as_white: usize::from(!candidate_black),
+                    plies,
+                    win_plies: plies,
                     ..Default::default()
                 }
             } else {
@@ -399,6 +422,8 @@ fn play_arena_game(
                     losses: 1,
                     losses_as_black: usize::from(candidate_black),
                     losses_as_white: usize::from(!candidate_black),
+                    plies,
+                    loss_plies: plies,
                     ..Default::default()
                 }
             }
@@ -407,6 +432,8 @@ fn play_arena_game(
             draws: 1,
             draws_as_black: usize::from(candidate_black),
             draws_as_white: usize::from(!candidate_black),
+            plies,
+            draw_plies: plies,
             ..Default::default()
         },
     }
@@ -425,6 +452,10 @@ fn merge_arena_reports(a: ArenaReport, b: ArenaReport) -> ArenaReport {
         draws_as_white: a.draws_as_white + b.draws_as_white,
         paired_openings: a.paired_openings + b.paired_openings,
         paired_score_square_sum: a.paired_score_square_sum + b.paired_score_square_sum,
+        plies: a.plies + b.plies,
+        win_plies: a.win_plies + b.win_plies,
+        loss_plies: a.loss_plies + b.loss_plies,
+        draw_plies: a.draw_plies + b.draw_plies,
     }
 }
 
