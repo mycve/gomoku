@@ -44,7 +44,21 @@ pub fn run(model: &PolicyValueModel, config: GomocupConfig) -> io::Result<()> {
                     respond(&mut output, "OK")?;
                 }
             }
-            "RECTSTART" => respond(&mut output, "ERROR rectangular boards are unsupported")?,
+            "RECTSTART" => {
+                let supported = argument.split_once(',').and_then(|(width, height)| {
+                    Some((
+                        width.trim().parse::<usize>().ok()?,
+                        height.trim().parse().ok()?,
+                    ))
+                }) == Some((BOARD_SIZE, BOARD_SIZE));
+                if supported {
+                    board = Board::new();
+                    stones.clear();
+                    respond(&mut output, "OK")?;
+                } else {
+                    respond(&mut output, "ERROR unsupported board size")?;
+                }
+            }
             "RESTART" => {
                 board = Board::new();
                 stones.clear();
@@ -162,7 +176,10 @@ pub fn run(model: &PolicyValueModel, config: GomocupConfig) -> io::Result<()> {
                 if let Some((key, value)) = argument.split_once(char::is_whitespace) {
                     if key.eq_ignore_ascii_case("timeout_turn") {
                         if let Ok(ms) = value.trim().parse::<u64>() {
-                            timeout_turn_ms = ms.max(1);
+                            // Gomocup GUI 常用 0 表示未设置或不限制，不能把它压成 1ms。
+                            if ms > 0 {
+                                timeout_turn_ms = ms;
+                            }
                         }
                     }
                 }
@@ -201,13 +218,16 @@ fn play_and_respond(
         },
         limit,
     );
-    let Some(best) = result.first() else {
-        return respond(output, "ERROR no legal move");
-    };
+    // 即使 GUI 给出的时限短到搜索尚未完成，也必须按协议返回一个合法坐标。
+    let mv = result
+        .first()
+        .map(|candidate| candidate.mv)
+        .or_else(|| board.legal_moves().into_iter().next())
+        .ok_or_else(|| io::Error::other("合法局面没有可用落子"))?;
     let player = board.to_move();
-    board.play(best.mv);
-    stones.push((best.mv, player));
-    respond(output, &format!("{},{}", best.mv.col(), best.mv.row()))
+    board.play(mv);
+    stones.push((mv, player));
+    respond(output, &format!("{},{}", mv.col(), mv.row()))
 }
 
 fn parse_move(text: &str) -> Option<Move> {

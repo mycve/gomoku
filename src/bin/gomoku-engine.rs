@@ -42,6 +42,10 @@ fn main() -> io::Result<()> {
 }
 
 fn resolve_model_path(requested: &Path) -> PathBuf {
+    resolve_model_path_from(requested, std::env::current_exe().ok().as_deref())
+}
+
+fn resolve_model_path_from(requested: &Path, executable: Option<&Path>) -> PathBuf {
     if requested.exists() {
         return requested.to_path_buf();
     }
@@ -50,10 +54,28 @@ fn resolve_model_path(requested: &Path) -> PathBuf {
         .unwrap_or_else(|| Path::new(""))
         .join("best.safetensors");
     if fallback.exists() {
-        fallback
-    } else {
-        requested.to_path_buf()
+        return fallback;
     }
+    if requested.is_relative() {
+        let requested_name = requested
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("model.safetensors"));
+        let mut directory = executable.and_then(Path::parent);
+        // GUI 通常改变工作目录；依次查找可执行文件同目录及其父目录，兼容交付目录和 target 构建目录。
+        for _ in 0..=3 {
+            let Some(current) = directory else {
+                break;
+            };
+            for name in [requested_name, std::ffi::OsStr::new("best.safetensors")] {
+                let candidate = current.join(name);
+                if candidate.exists() {
+                    return candidate;
+                }
+            }
+            directory = current.parent();
+        }
+    }
+    requested.to_path_buf()
 }
 
 #[cfg(test)]
@@ -71,6 +93,26 @@ mod tests {
         std::fs::write(&best, []).unwrap();
         assert_eq!(
             resolve_model_path(&directory.join("model.safetensors")),
+            best
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn gui_working_directory_can_find_model_near_executable() {
+        let directory = std::env::temp_dir().join(format!(
+            "gomoku-engine-executable-model-{}",
+            std::process::id()
+        ));
+        let bin = directory.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let best = directory.join("best.safetensors");
+        std::fs::write(&best, []).unwrap();
+        assert_eq!(
+            resolve_model_path_from(
+                Path::new("gui-missing-directory/model.safetensors"),
+                Some(&bin.join("engine"))
+            ),
             best
         );
         std::fs::remove_dir_all(directory).unwrap();
