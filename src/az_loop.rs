@@ -89,6 +89,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     } else {
         Vec::new()
     };
+    let initial_pool_samples = initial_pool.len();
     let max_workers = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
@@ -155,7 +156,11 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     let (ready_tx, ready_rx) = mpsc::sync_channel::<PendingBatch>(1);
     let collector_stop = Arc::clone(&stop);
     let collector_version = Arc::clone(&version);
-    let games_per_update = config.games_per_update.max(1);
+    let selfplay_samples_per_update = config.selfplay_samples_per_update.max(1);
+    let mut collector_sample_target = config
+        .replay_warmup_samples
+        .saturating_sub(initial_pool_samples)
+        .max(selfplay_samples_per_update);
     let collector = thread::spawn(move || {
         let mut pending = PendingBatch {
             oldest_version: u64::MAX,
@@ -176,7 +181,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 started = Instant::now();
             }
             merge_game(&mut pending, game);
-            if pending.games < games_per_update {
+            if pending.samples.len() < collector_sample_target {
                 continue;
             }
             pending.collect_seconds = started.elapsed().as_secs_f32();
@@ -185,7 +190,8 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 ..Default::default()
             };
             match ready_tx.try_send(std::mem::replace(&mut pending, next)) {
-                Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                Ok(()) => collector_sample_target = selfplay_samples_per_update,
+                Err(mpsc::TrySendError::Full(_)) => {}
                 Err(mpsc::TrySendError::Disconnected(_)) => break,
             }
             started = Instant::now();
@@ -286,10 +292,11 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         compact_device_names(&candle_train::training_device_names(&config.gpu_devices)?);
     let end = target_update.unwrap_or(usize::MAX);
     println!(
-        "loop     : mode=batch-async actors={} actor_queue={}(nonblocking-drop) collector_queue=1(nonblocking-drop) trainer_queue=rendezvous games/update={} sims={} train_device={} batch={} arena_opening_plies={}",
+        "loop     : mode=batch-async actors={} actor_queue={}(nonblocking-drop) collector_queue=1(nonblocking-drop) trainer_queue=rendezvous warmup={} samples/update>={} sims={} train_device={} batch={} arena_opening_plies={}",
         workers,
         queue_capacity,
-        config.games_per_update,
+        config.replay_warmup_samples,
+        config.selfplay_samples_per_update,
         config.simulations,
         train_devices,
         config.batch_size,
@@ -504,6 +511,11 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             progress.update,
         );
         tb.add_scalar(
+            "replay/train_to_new_sample_ratio",
+            event.train_samples as f32 / event.batch.samples.len().max(1) as f32,
+            progress.update,
+        );
+        tb.add_scalar(
             "progress/total_games",
             progress.total_games as f32,
             progress.update,
@@ -706,6 +718,11 @@ fn print_event(
         event.recent_quota_rate * 100.0,
         event.actual_recent_rate * 100.0,
         config.replay_recent_updates
+    );
+    println!(
+        "balance  : new_samples={} train/new={:.2}",
+        event.batch.samples.len(),
+        event.train_samples as f32 / event.batch.samples.len().max(1) as f32
     );
     println!(
         "train    : device={} samples={} steps={} lr={:.6} loss={:.4} policy={:.4} value={:.4} moves_left={:.4} time={:.2}s sps={:.1}",

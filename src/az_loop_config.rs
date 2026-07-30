@@ -14,7 +14,7 @@ pub struct AzLoopConfig {
     pub progress_path: String,
     pub simulations: usize,
     pub seed: u64,
-    pub games_per_update: usize,
+    pub selfplay_samples_per_update: usize,
     pub selfplay_workers: usize,
     pub selfplay_queue_capacity: usize,
     pub learning_rate: f32,
@@ -36,6 +36,7 @@ pub struct AzLoopConfig {
     pub moves_left_loss_weight: f32,
     pub ema_decay: f32,
     pub replay_capacity: usize,
+    pub replay_warmup_samples: usize,
     pub train_samples_per_update: usize,
     pub replay_recent_sample_fraction: f32,
     pub replay_recent_updates: u64,
@@ -61,7 +62,7 @@ impl Default for AzLoopConfig {
             progress_path: "data/azloop-progress.json".into(),
             simulations: 3000,
             seed: 20260730,
-            games_per_update: 1000,
+            selfplay_samples_per_update: 50_000,
             selfplay_workers: 196,
             selfplay_queue_capacity: 0,
             learning_rate: 0.0008,
@@ -83,6 +84,7 @@ impl Default for AzLoopConfig {
             moves_left_loss_weight: 0.1,
             ema_decay: 0.999,
             replay_capacity: 500_000,
+            replay_warmup_samples: 100_000,
             train_samples_per_update: 50_000,
             replay_recent_sample_fraction: 0.4,
             replay_recent_updates: 5,
@@ -144,12 +146,13 @@ impl AzLoopConfig {
             return Err(io::Error::other("仅支持 format_version = 1"));
         }
         if self.simulations == 0
-            || self.games_per_update == 0
+            || self.selfplay_samples_per_update == 0
+            || self.replay_warmup_samples == 0
             || self.batch_size == 0
             || self.train_samples_per_update == 0
         {
             return Err(io::Error::other(
-                "simulations、games_per_update、batch_size 和 train_samples_per_update 必须大于 0",
+                "simulations、selfplay_samples_per_update、replay_warmup_samples、batch_size 和 train_samples_per_update 必须大于 0",
             ));
         }
         if self.learning_rate <= 0.0
@@ -166,6 +169,11 @@ impl AzLoopConfig {
                 "配置中的学习率、搜索或比例参数超出合法范围",
             ));
         }
+        if self.replay_warmup_samples > self.replay_capacity {
+            return Err(io::Error::other(
+                "replay_warmup_samples 不能超过 replay_capacity",
+            ));
+        }
         Ok(())
     }
 }
@@ -178,7 +186,7 @@ replay_path = "data/replay.jsonl"
 progress_path = "data/azloop-progress.json"
 simulations = 3000
 seed = 20260730
-games_per_update = 1000
+selfplay_samples_per_update = 50000
 selfplay_workers = 196
 selfplay_queue_capacity = 0
 learning_rate = 0.0008
@@ -200,6 +208,7 @@ policy_softmax_temp = 1.45
 moves_left_loss_weight = 0.1
 ema_decay = 0.999
 replay_capacity = 500000
+replay_warmup_samples = 100000
 train_samples_per_update = 50000
 replay_recent_sample_fraction = 0.4
 replay_recent_updates = 5
@@ -222,9 +231,10 @@ mod tests {
     fn default_text_is_exact_and_valid() {
         let config: AzLoopConfig = toml::from_str(DEFAULT_CONFIG_TEXT).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.games_per_update, 1000);
+        assert_eq!(config.selfplay_samples_per_update, 50_000);
         assert_eq!(config.selfplay_workers, 196);
         assert_eq!(config.replay_capacity, 500_000);
+        assert_eq!(config.replay_warmup_samples, 100_000);
         assert_eq!(config.train_samples_per_update, 50_000);
         assert!(DEFAULT_CONFIG_TEXT.contains("learning_rate = 0.0008\n"));
         assert!(DEFAULT_CONFIG_TEXT.contains("arena_promotion_rate = 0.550000011920929\n"));
