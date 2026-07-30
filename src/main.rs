@@ -347,12 +347,11 @@ fn print_search(board: &Board, model: &PolicyValueModel, simulations: usize, cpu
     );
     for c in result.into_iter().take(10) {
         println!(
-            "candidate: {} visits={} q={:.3} prior={:.3} proven={:?}",
+            "candidate: {} visits={} q={:.3} prior={:.3}",
             c.mv.notation(),
             c.visits,
             c.q,
-            c.prior,
-            c.proven
+            c.prior
         );
     }
 }
