@@ -93,8 +93,8 @@ struct AzTrainBenchArgs {
     learning_rate: f32,
     #[arg(default_value_t = 256)]
     batch_size: usize,
-    #[arg(long, value_delimiter = ',')]
-    gpu_devices: Vec<usize>,
+    #[arg(long, default_value_t = 0)]
+    gpu_device: usize,
 }
 
 #[derive(Args)]
@@ -160,7 +160,7 @@ fn main() -> io::Result<()> {
             PolicyValueModel::random(args.hidden, args.seed).save(&args.output)?;
             println!("model    : initialized {}", args.output);
             println!(
-                "arch     : input=451 hidden={} rmsnorm local=4axesx8cells(residual2+ray2) policy=225+bilinear4 value=mean+max+smoothmax->96x96xWDL3",
+                "arch     : input=451 hidden={} rmsnorm local=4axesx8cells-pattern2 policy=225 value=96x96xWDL3",
                 args.hidden
             );
             println!("board    : 15x15 freestyle gomoku");
@@ -207,14 +207,14 @@ fn main() -> io::Result<()> {
                 )));
             }
             let started = Instant::now();
-            let devices = candle_train::training_device_names(&args.gpu_devices)?;
+            let device = candle_train::training_device_name(args.gpu_device)?;
             let stats = candle_train::train(
                 &mut model,
                 &samples,
                 args.epochs,
                 args.learning_rate,
                 args.batch_size,
-                &args.gpu_devices,
+                args.gpu_device,
             )?;
             let seconds = started.elapsed().as_secs_f64();
             println!(
@@ -222,7 +222,7 @@ fn main() -> io::Result<()> {
                 samples.len(),
                 args.epochs,
                 args.batch_size,
-                devices.join(",")
+                device
             );
             println!(
                 "speed    : {:.0} samples/s",

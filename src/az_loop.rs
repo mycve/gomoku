@@ -226,7 +226,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         let mut training = candle_train::TrainingSession::new(
             &model,
             Some(&ema_model),
-            &trainer_config.gpu_devices,
+            trainer_config.gpu_device,
             current_lr(&trainer_config, start_update),
         )?;
         let mut pool = initial_pool;
@@ -307,8 +307,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         }
         Ok(())
     });
-    let train_devices =
-        compact_device_names(&candle_train::training_device_names(&config.gpu_devices)?);
+    let train_device = candle_train::training_device_name(config.gpu_device)?;
     let end = target_update.unwrap_or(usize::MAX);
     println!(
         "loop     : mode=batch-async actors={} actor_queue={}(nonblocking-drop) collector_queue=1(nonblocking-drop) trainer_queue=rendezvous warmup={} samples/update>={} sims={} train_device={} batch={} arena_opening_plies={}",
@@ -317,7 +316,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         config.replay_warmup_samples,
         config.selfplay_samples_per_update,
         config.simulations,
-        train_devices,
+        train_device,
         config.batch_size,
         config.arena_opening_plies
     );
@@ -360,7 +359,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             &progress,
             &event,
             workers,
-            &train_devices,
+            &train_device,
             checkpoint.as_deref(),
         );
         tb.add_scalar("train/loss", event.train_stats.loss, progress.update);
@@ -814,32 +813,6 @@ fn ema_decay_for_update(configured_decay: f32, initialized: bool) -> f32 {
     if initialized { configured_decay } else { 0.0 }
 }
 
-fn compact_device_names(devices: &[String]) -> String {
-    if devices.is_empty() {
-        return "none".into();
-    }
-    let cuda_ids = devices
-        .iter()
-        .map(|name| {
-            name.strip_prefix("cuda:")
-                .and_then(|id| id.parse::<usize>().ok())
-        })
-        .collect::<Option<Vec<_>>>();
-    if let Some(ids) = cuda_ids {
-        if ids.len() == 1 {
-            return format!("cuda:{}", ids[0]);
-        }
-        if ids.windows(2).all(|pair| pair[1] == pair[0] + 1) {
-            return format!("cuda:{}-{}({}卡)", ids[0], ids[ids.len() - 1], ids.len());
-        }
-        return format!("cuda:{}卡", ids.len());
-    }
-    if devices.len() <= 2 {
-        devices.join(",")
-    } else {
-        format!("{}等{}设备", devices[0], devices.len())
-    }
-}
 fn load_or_init(path: &str) -> io::Result<PolicyValueModel> {
     if Path::new(path).exists() {
         PolicyValueModel::load(path)
@@ -894,13 +867,6 @@ fn prune_checkpoints(c: &AzLoopConfig) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn compacts_sequential_cuda_devices() {
-        let devices = (0..8).map(|id| format!("cuda:{id}")).collect::<Vec<_>>();
-        assert_eq!(compact_device_names(&devices), "cuda:0-7(8卡)");
-        assert_eq!(compact_device_names(&["cuda:3".into()]), "cuda:3");
-    }
 
     #[test]
     fn ema_first_update_copies_online_model() {

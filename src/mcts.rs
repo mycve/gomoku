@@ -330,15 +330,7 @@ mod tests {
             one.iter().filter(|candidate| candidate.visits > 0).count(),
             1
         );
-        assert_eq!(one.len(), crate::game::CELL_COUNT - 1);
-        assert!(
-            one.iter()
-                .any(|candidate| candidate.mv == Move::new(0, 0).unwrap())
-        );
-        assert!(
-            one.iter()
-                .any(|candidate| candidate.mv == Move::new(14, 14).unwrap())
-        );
+        assert_eq!(one.len(), 24);
 
         let full = search(
             &board,

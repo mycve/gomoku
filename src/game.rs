@@ -3,6 +3,7 @@ use std::fmt;
 
 pub const BOARD_SIZE: usize = 15;
 pub const CELL_COUNT: usize = BOARD_SIZE * BOARD_SIZE;
+pub const SEARCH_CANDIDATE_RADIUS: i32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Player {
@@ -142,8 +143,9 @@ impl Board {
         self.to_move = self.to_move.other();
         true
     }
-    pub fn legal_moves(&self) -> Vec<Move> {
-        crate::scope_profile!("game.legal_moves");
+    /// 返回规则允许的全部落点，不包含任何搜索剪枝或启发式。
+    pub fn rule_legal_moves(&self) -> Vec<Move> {
+        crate::scope_profile!("game.rule_legal_moves");
         if self.outcome().is_some() {
             return vec![];
         }
@@ -152,6 +154,49 @@ impl Board {
             .enumerate()
             .filter_map(|(index, &stone)| (stone == 0).then_some(Move(index)))
             .collect()
+    }
+    /// 返回引擎实际评估的候选点；这是性能启发式，不代表规则合法性。
+    pub fn search_candidates(&self) -> Vec<Move> {
+        if self.outcome().is_some() {
+            return vec![];
+        }
+        if self.moves == 0 {
+            return vec![Move::new(BOARD_SIZE / 2, BOARD_SIZE / 2).unwrap()];
+        }
+        let mut near = [false; CELL_COUNT];
+        for index in 0..CELL_COUNT {
+            if self.cells[index] == 0 {
+                continue;
+            }
+            let row = index / BOARD_SIZE;
+            let col = index % BOARD_SIZE;
+            for dr in -SEARCH_CANDIDATE_RADIUS..=SEARCH_CANDIDATE_RADIUS {
+                for dc in -SEARCH_CANDIDATE_RADIUS..=SEARCH_CANDIDATE_RADIUS {
+                    let next_row = row as i32 + dr;
+                    let next_col = col as i32 + dc;
+                    if next_row >= 0
+                        && next_col >= 0
+                        && next_row < BOARD_SIZE as i32
+                        && next_col < BOARD_SIZE as i32
+                    {
+                        let candidate = next_row as usize * BOARD_SIZE + next_col as usize;
+                        if self.cells[candidate] == 0 {
+                            near[candidate] = true;
+                        }
+                    }
+                }
+            }
+        }
+        let candidates = near
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &is_near)| is_near.then_some(Move(index)))
+            .collect::<Vec<_>>();
+        assert!(
+            self.moves == CELL_COUNT || !candidates.is_empty(),
+            "非终局且棋盘未满时，半径 {SEARCH_CANDIDATE_RADIUS} 搜索候选不能为空"
+        );
+        candidates
     }
     pub fn outcome(&self) -> Option<Outcome> {
         crate::scope_profile!("game.outcome");
@@ -287,15 +332,30 @@ mod tests {
     }
 
     #[test]
-    fn legal_moves_include_every_empty_point() {
+    fn rule_legal_moves_include_every_empty_point() {
         let mut board = Board::new();
-        assert_eq!(board.legal_moves().len(), CELL_COUNT);
+        assert_eq!(board.rule_legal_moves().len(), CELL_COUNT);
         assert!(board.play(Move::new(7, 7).unwrap()));
-        let legal = board.legal_moves();
+        let legal = board.rule_legal_moves();
         assert_eq!(legal.len(), CELL_COUNT - 1);
         assert!(legal.contains(&Move::new(0, 0).unwrap()));
         assert!(legal.contains(&Move::new(14, 14).unwrap()));
         assert!(!legal.contains(&Move::new(7, 7).unwrap()));
+    }
+
+    #[test]
+    fn search_candidates_use_explicit_radius_two_without_changing_rules() {
+        let board = Board::new();
+        assert_eq!(board.search_candidates(), vec![Move::new(7, 7).unwrap()]);
+        let mut board = board;
+        assert!(board.play(Move::new(7, 7).unwrap()));
+        assert_eq!(board.search_candidates().len(), 24);
+        assert!(
+            !board
+                .search_candidates()
+                .contains(&Move::new(0, 0).unwrap())
+        );
+        assert!(board.rule_legal_moves().contains(&Move::new(0, 0).unwrap()));
     }
     #[test]
     fn notation_roundtrip() {

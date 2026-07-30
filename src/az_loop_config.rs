@@ -23,7 +23,7 @@ pub struct AzLoopConfig {
     pub learning_rate_decay: f32,
     pub batch_epochs: usize,
     pub batch_size: usize,
-    pub gpu_devices: Vec<usize>,
+    pub gpu_device: usize,
     pub cpuct: f32,
     pub temperature_start: f32,
     pub temperature_endgame: f32,
@@ -55,7 +55,7 @@ pub struct AzLoopConfig {
 impl Default for AzLoopConfig {
     fn default() -> Self {
         Self {
-            format_version: 2,
+            format_version: 3,
             model_path: "model.safetensors".into(),
             ema_model_path: "ema.safetensors".into(),
             best_model_path: "best.safetensors".into(),
@@ -72,7 +72,7 @@ impl Default for AzLoopConfig {
             learning_rate_decay: 0.90,
             batch_epochs: 1,
             batch_size: 256,
-            gpu_devices: Vec::new(),
+            gpu_device: 0,
             cpuct: 1.5,
             temperature_start: 0.9,
             temperature_endgame: 0.35,
@@ -151,8 +151,8 @@ impl AzLoopConfig {
                 return Err(io::Error::other(format!("配置 `{name}` 必须是有限数值")));
             }
         }
-        if self.format_version != 2 {
-            return Err(io::Error::other("仅支持 format_version = 2"));
+        if self.format_version != 3 {
+            return Err(io::Error::other("仅支持 format_version = 3"));
         }
         if self.simulations == 0
             || self.selfplay_samples_per_update == 0
@@ -199,7 +199,7 @@ impl AzLoopConfig {
     }
 }
 
-const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 2
+const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 3
 model_path = "model.safetensors"
 ema_model_path = "ema.safetensors"
 best_model_path = "best.safetensors"
@@ -216,7 +216,7 @@ learning_rate_min = 0.0002
 learning_rate_decay = 0.90
 batch_epochs = 1
 batch_size = 256
-gpu_devices = []
+gpu_device = 0
 cpuct = 1.5
 temperature_start = 0.9
 temperature_endgame = 0.35
@@ -253,7 +253,8 @@ mod tests {
     fn default_text_is_exact_and_valid() {
         let config: AzLoopConfig = toml::from_str(DEFAULT_CONFIG_TEXT).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.format_version, 2);
+        assert_eq!(config.format_version, 3);
+        assert_eq!(config.gpu_device, 0);
         assert_eq!(config.selfplay_samples_per_update, 50_000);
         assert_eq!(config.selfplay_workers, 196);
         assert_eq!(config.selfplay_random_opening_probability, 0.25);
