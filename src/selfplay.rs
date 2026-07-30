@@ -1,5 +1,5 @@
 use crate::{
-    game::{Board, Outcome},
+    game::{BOARD_SIZE, Board, Move, Outcome},
     mcts::{SearchConfig, search},
     model::PolicyValueModel,
     replay::Sample,
@@ -25,6 +25,8 @@ pub struct SelfplayStats {
     pub white_wins: usize,
     pub draws: usize,
     pub plies: usize,
+    pub random_opening_games: usize,
+    pub random_opening_plies: usize,
     pub searches: usize,
     pub simulations: usize,
     pub entropy_sum: f32,
@@ -43,6 +45,8 @@ impl SelfplayStats {
         self.white_wins += other.white_wins;
         self.draws += other.draws;
         self.plies += other.plies;
+        self.random_opening_games += other.random_opening_games;
+        self.random_opening_plies += other.random_opening_plies;
         self.searches += other.searches;
         self.simulations += other.simulations;
         self.entropy_sum += other.entropy_sum;
@@ -81,6 +85,9 @@ pub fn generate_one_detailed_controlled(
         games: 1,
         ..Default::default()
     };
+    let opening_plies = apply_random_opening(&mut board, cfg.random_opening_probability, &mut seed);
+    stats.random_opening_games = usize::from(opening_plies > 0);
+    stats.random_opening_plies = opening_plies;
     while board.outcome().is_none() && !stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
         let mut ply_cfg = cfg;
         ply_cfg.root_noise_seed = seed ^ board.move_count() as u64;
@@ -128,20 +135,18 @@ pub fn generate_one_detailed_controlled(
             board: board.clone(),
             policy,
             value: 0.0,
-            moves_left: 0.0,
             generation: 0,
         });
         board.play(mv);
     }
     let out = board.outcome();
-    stats.plies = samples.len();
+    stats.plies = board.move_count();
     match out {
         Some(Outcome::Win(crate::game::Player::Black)) => stats.black_wins = 1,
         Some(Outcome::Win(crate::game::Player::White)) => stats.white_wins = 1,
         _ => stats.draws = 1,
     }
-    let game_len = samples.len();
-    for (index, s) in samples.iter_mut().enumerate() {
+    for s in &mut samples {
         s.value = match out {
             Some(Outcome::Draw) | None => 0.0,
             Some(Outcome::Win(p)) => {
@@ -152,10 +157,47 @@ pub fn generate_one_detailed_controlled(
                 }
             }
         };
-        s.moves_left = game_len.saturating_sub(index).max(1) as f32;
     }
     GeneratedGame { samples, stats }
 }
+
+fn apply_random_opening(board: &mut Board, probability: f32, seed: &mut u64) -> usize {
+    const REGION_SIZES: [usize; 3] = [3, 4, 5];
+    const OPENING_PLIES: usize = 2;
+
+    if board.move_count() != 0 || probability <= 0.0 || random_unit(seed) >= probability.min(1.0) {
+        return 0;
+    }
+
+    let size = REGION_SIZES[random_index(seed, REGION_SIZES.len())];
+    let row_start = random_index(seed, BOARD_SIZE - size + 1);
+    let col_start = random_index(seed, BOARD_SIZE - size + 1);
+    let mut available = Vec::with_capacity(size * size);
+    for row in row_start..row_start + size {
+        for col in col_start..col_start + size {
+            available.push(Move::new(row, col).expect("随机开局区域必须位于棋盘内"));
+        }
+    }
+
+    let mut played = 0;
+    for _ in 0..OPENING_PLIES {
+        if available.is_empty() {
+            break;
+        }
+        let mv = available.swap_remove(random_index(seed, available.len()));
+        if board.is_legal(mv) {
+            board.play(mv);
+            played += 1;
+        }
+    }
+    played
+}
+
+fn random_unit(seed: &mut u64) -> f32 {
+    const BUCKETS: usize = 1 << 24;
+    random_index(seed, BUCKETS) as f32 / BUCKETS as f32
+}
+
 fn temperature_for_ply(cfg: SearchConfig, ply: usize) -> f32 {
     if ply < cfg.temperature_decay_delay_plies {
         return cfg.temperature_start;
@@ -222,7 +264,6 @@ pub struct TrainStats {
     pub loss: f32,
     pub policy_loss: f32,
     pub value_loss: f32,
-    pub moves_left_loss: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -424,5 +465,37 @@ mod tests {
         };
         let expected = (0.25_f32 / 3.0).sqrt();
         assert!((report.score_rate_standard_error() - expected).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn random_opening_can_be_disabled() {
+        let mut board = Board::new();
+        let mut seed = 7;
+        assert_eq!(apply_random_opening(&mut board, 0.0, &mut seed), 0);
+        assert_eq!(board.move_count(), 0);
+    }
+
+    #[test]
+    fn random_opening_is_deterministic_and_stays_in_one_region() {
+        let mut first = Board::new();
+        let mut first_seed = 7;
+        assert_eq!(apply_random_opening(&mut first, 1.0, &mut first_seed), 2);
+
+        let stones = first
+            .cells()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &stone)| (stone != 0).then_some(Move(index)))
+            .collect::<Vec<_>>();
+        assert_eq!(stones.len(), 2);
+        assert!(stones[0].row().abs_diff(stones[1].row()) <= 4);
+        assert!(stones[0].col().abs_diff(stones[1].col()) <= 4);
+        assert_eq!(first.cells().iter().filter(|&&x| x == 1).count(), 1);
+        assert_eq!(first.cells().iter().filter(|&&x| x == -1).count(), 1);
+
+        let mut second = Board::new();
+        let mut second_seed = 7;
+        assert_eq!(apply_random_opening(&mut second, 1.0, &mut second_seed), 2);
+        assert_eq!(first.cells(), second.cells());
     }
 }

@@ -3,8 +3,6 @@ use std::fmt;
 
 pub const BOARD_SIZE: usize = 15;
 pub const CELL_COUNT: usize = BOARD_SIZE * BOARD_SIZE;
-pub const TACTICAL_FEATURES: usize = 24;
-pub const GLOBAL_TACTICAL_FEATURES: usize = 12;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Player {
@@ -228,88 +226,6 @@ impl Board {
     }
 }
 
-pub(crate) fn tactical_features(board: &Board, mv: Move) -> [f32; TACTICAL_FEATURES] {
-    let mut features = [0.0; TACTICAL_FEATURES];
-    if mv.0 >= CELL_COUNT || board.cells[mv.0] != 0 {
-        return features;
-    }
-    let us = board.to_move().stone();
-    let directions = [(1, 0), (0, 1), (1, 1), (1, -1)];
-    let mut own_four = 0;
-    let mut opponent_four = 0;
-    let mut own_open_three = 0;
-    let mut opponent_open_three = 0;
-    for (direction, (dr, dc)) in directions.into_iter().enumerate() {
-        let (own_run, own_open) = line_shape(board, mv, us, dr, dc);
-        let (opponent_run, opponent_open) = line_shape(board, mv, -us, dr, dc);
-        let base = direction * 4;
-        features[base] = own_run.min(5) as f32 / 5.0;
-        features[base + 1] = own_open as f32 / 2.0;
-        features[base + 2] = opponent_run.min(5) as f32 / 5.0;
-        features[base + 3] = opponent_open as f32 / 2.0;
-        own_four += usize::from(own_run >= 4);
-        opponent_four += usize::from(opponent_run >= 4);
-        own_open_three += usize::from(own_run >= 3 && own_open == 2);
-        opponent_open_three += usize::from(opponent_run >= 3 && opponent_open == 2);
-    }
-    features[16] = f32::from(
-        own_four > 0
-            && directions
-                .into_iter()
-                .any(|(dr, dc)| line_shape(board, mv, us, dr, dc).0 >= 5),
-    );
-    features[17] = f32::from(
-        opponent_four > 0
-            && directions
-                .into_iter()
-                .any(|(dr, dc)| line_shape(board, mv, -us, dr, dc).0 >= 5),
-    );
-    features[18] = own_four as f32 / 4.0;
-    features[19] = opponent_four as f32 / 4.0;
-    features[20] = own_open_three as f32 / 4.0;
-    features[21] = opponent_open_three as f32 / 4.0;
-    for dr in -2i32..=2 {
-        for dc in -2i32..=2 {
-            if dr == 0 && dc == 0 {
-                continue;
-            }
-            let row = mv.row() as i32 + dr;
-            let col = mv.col() as i32 + dc;
-            if row >= 0 && col >= 0 && row < BOARD_SIZE as i32 && col < BOARD_SIZE as i32 {
-                let stone = board.cells[row as usize * BOARD_SIZE + col as usize];
-                features[if stone == us { 22 } else { 23 }] += f32::from(stone != 0) / 24.0;
-            }
-        }
-    }
-    features
-}
-
-pub(crate) fn add_global_tactical_features(
-    global: &mut [f32; GLOBAL_TACTICAL_FEATURES],
-    tactical: &[f32; TACTICAL_FEATURES],
-) {
-    global[0] += tactical[16];
-    global[1] += tactical[17];
-    global[2] += f32::from(tactical[18] > 0.0);
-    global[3] += f32::from(tactical[19] > 0.0);
-    global[4] += f32::from(tactical[20] > 0.0);
-    global[5] += f32::from(tactical[21] > 0.0);
-    global[6] += f32::from(tactical[18] >= 0.5);
-    global[7] += f32::from(tactical[19] >= 0.5);
-    global[8] += f32::from(tactical[20] >= 0.5);
-    global[9] += f32::from(tactical[21] >= 0.5);
-    global[10] = global[10].max(tactical[16] + tactical[18] * 0.5 + tactical[20] * 0.25);
-    global[11] = global[11].max(tactical[17] + tactical[19] * 0.5 + tactical[21] * 0.25);
-}
-
-pub(crate) fn normalize_global_tactical_features(global: &mut [f32; GLOBAL_TACTICAL_FEATURES]) {
-    for value in &mut global[..10] {
-        *value = (*value / 8.0).min(1.0);
-    }
-    global[10] = (global[10] / 1.375).min(1.0);
-    global[11] = (global[11] / 1.375).min(1.0);
-}
-
 fn line_shape(board: &Board, mv: Move, stone: i8, dr: i32, dc: i32) -> (usize, usize) {
     let mut run = 1;
     let mut open = 0;
@@ -409,40 +325,6 @@ mod tests {
         assert_eq!(mapped.len(), 8);
         for symmetry in 0..8 {
             assert!(transform_index(point, symmetry) < CELL_COUNT);
-        }
-    }
-    #[test]
-    fn tactical_features_detect_win_and_survive_symmetry() {
-        let mut board = Board::new();
-        for col in 3..7 {
-            assert!(board.play(Move::new(7, col).unwrap()));
-            assert!(board.play(Move::new(0, col).unwrap()));
-        }
-        let mv = Move::new(7, 7).unwrap();
-        let features = tactical_features(&board, mv);
-        assert_eq!(features[16], 1.0);
-        assert!(features[18] > 0.0);
-        let mut global = [0.0; GLOBAL_TACTICAL_FEATURES];
-        for legal in board.legal_moves() {
-            add_global_tactical_features(&mut global, &tactical_features(&board, legal));
-        }
-        normalize_global_tactical_features(&mut global);
-        assert!(global[0] > 0.0);
-        assert!(global[10] > 0.0);
-        for symmetry in 0..8 {
-            let transformed = board.transformed(symmetry);
-            let transformed_move = Move(transform_index(mv.0, symmetry));
-            let other = tactical_features(&transformed, transformed_move);
-            assert_eq!(&features[16..22], &other[16..22]);
-            let mut other_global = [0.0; GLOBAL_TACTICAL_FEATURES];
-            for legal in transformed.legal_moves() {
-                add_global_tactical_features(
-                    &mut other_global,
-                    &tactical_features(&transformed, legal),
-                );
-            }
-            normalize_global_tactical_features(&mut other_global);
-            assert_eq!(global, other_global);
         }
     }
     #[test]

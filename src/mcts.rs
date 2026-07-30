@@ -18,6 +18,7 @@ pub struct SearchConfig {
     pub temperature_decay_plies: usize,
     pub temperature_value_cutoff: f32,
     pub temperature_visit_offset: f32,
+    pub random_opening_probability: f32,
     pub opening_random_plies: usize,
     pub opening_seed: u64,
 }
@@ -36,6 +37,7 @@ impl Default for SearchConfig {
             temperature_decay_plies: 0,
             temperature_value_cutoff: 0.0,
             temperature_visit_offset: 0.0,
+            random_opening_probability: 0.0,
             opening_random_plies: 0,
             opening_seed: 0,
         }

@@ -1,7 +1,4 @@
-use crate::game::{
-    BOARD_SIZE, Board, CELL_COUNT, GLOBAL_TACTICAL_FEATURES, Move, Player, TACTICAL_FEATURES,
-    add_global_tactical_features, normalize_global_tactical_features, tactical_features,
-};
+use crate::game::{BOARD_SIZE, Board, CELL_COUNT, Move, Player};
 use candle_core::{DType, Device, Shape, Var};
 use candle_nn::VarMap;
 use std::{fs, io, path::Path};
@@ -13,7 +10,7 @@ pub const WDL_SIZE: usize = 3;
 pub const STONE_TYPES: usize = 2;
 pub const AXIS_FEATURES: usize = STONE_TYPES * 15;
 pub const DIAGONAL_FEATURES: usize = STONE_TYPES * (BOARD_SIZE * 2 - 1);
-const FORMAT_VERSION: f32 = 8.0;
+const FORMAT_VERSION: f32 = 9.0;
 
 #[derive(Clone)]
 pub struct PolicyValueModel {
@@ -27,15 +24,11 @@ pub struct PolicyValueModel {
     pub(crate) hidden_bias: Vec<f32>,
     pub(crate) policy_hidden: Vec<f32>,
     pub(crate) policy_bias: Vec<f32>,
-    pub(crate) policy_tactical: Vec<f32>,
     pub(crate) value_head_hidden: Vec<f32>,
-    pub(crate) global_tactical_value: Vec<f32>,
     pub(crate) value_head_bias: Vec<f32>,
     pub(crate) value_head_hidden2: Vec<f32>,
     pub(crate) value_head_bias2: Vec<f32>,
     pub(crate) value_head_output: Vec<f32>,
-    pub(crate) moves_left_output: Vec<f32>,
-    pub(crate) moves_left_bias: Vec<f32>,
 }
 
 #[derive(Clone)]
@@ -81,12 +74,7 @@ impl PolicyValueModel {
         let policy_hidden = (0..CELL_COUNT * hidden_size)
             .map(|_| rng.weight(head_scale))
             .collect();
-        let mut policy_bias = vec![0.0; CELL_COUNT];
-        for (sq, bias) in policy_bias.iter_mut().enumerate() {
-            let r = sq / 15;
-            let c = sq % 15;
-            *bias = 0.15 * (1.0 - ((r as f32 - 7.0).abs() + (c as f32 - 7.0).abs()) / 14.0);
-        }
+        let policy_bias = vec![0.0; CELL_COUNT];
         Self {
             hidden_size,
             input_hidden,
@@ -98,19 +86,15 @@ impl PolicyValueModel {
             hidden_bias: vec![0.0; hidden_size],
             policy_hidden,
             policy_bias,
-            policy_tactical: vec![0.0; TACTICAL_FEATURES],
             value_head_hidden: (0..hidden_size * VALUE_HEAD_SIZE)
                 .map(|_| rng.weight((2.0 / hidden_size as f32).sqrt() * 0.5))
                 .collect(),
-            global_tactical_value: vec![0.0; GLOBAL_TACTICAL_FEATURES * VALUE_HEAD_SIZE],
             value_head_bias: vec![0.0; VALUE_HEAD_SIZE],
             value_head_hidden2: (0..VALUE_HEAD_SIZE * VALUE_HEAD_SIZE)
                 .map(|_| rng.weight((2.0 / VALUE_HEAD_SIZE as f32).sqrt() * 0.5))
                 .collect(),
             value_head_bias2: vec![0.0; VALUE_HEAD_SIZE],
             value_head_output: vec![0.0; VALUE_HEAD_SIZE * WDL_SIZE],
-            moves_left_output: vec![0.0; VALUE_HEAD_SIZE],
-            moves_left_bias: vec![0.0],
         }
     }
 
@@ -160,18 +144,12 @@ impl PolicyValueModel {
         if moves.is_empty() {
             return (Vec::new(), 0.0);
         }
-        let mut global_tactical = [0.0; GLOBAL_TACTICAL_FEATURES];
         {
             crate::scope_profile!("model.policy_logits");
             scratch.logits.clear();
             for &mv in &moves {
-                let tactical = tactical_features(board, mv);
-                add_global_tactical_features(&mut global_tactical, &tactical);
-                scratch
-                    .logits
-                    .push(self.policy_logit(&scratch.hidden, mv, &tactical));
+                scratch.logits.push(self.policy_logit(&scratch.hidden, mv));
             }
-            normalize_global_tactical_features(&mut global_tactical);
         }
         let max = scratch
             .logits
@@ -202,10 +180,6 @@ impl PolicyValueModel {
             *value += dot(
                 &scratch.hidden,
                 &self.value_head_hidden[start..start + self.hidden_size],
-            ) + dot(
-                &global_tactical,
-                &self.global_tactical_value
-                    [output * GLOBAL_TACTICAL_FEATURES..(output + 1) * GLOBAL_TACTICAL_FEATURES],
             );
         }
         for x in &mut scratch.value1 {
@@ -325,12 +299,11 @@ impl PolicyValueModel {
         }
     }
 
-    fn policy_logit(&self, hidden: &[f32], mv: Move, tactical: &[f32; TACTICAL_FEATURES]) -> f32 {
+    fn policy_logit(&self, hidden: &[f32], mv: Move) -> f32 {
         dot(
             hidden,
             &self.policy_hidden[mv.0 * self.hidden_size..(mv.0 + 1) * self.hidden_size],
         ) + self.policy_bias[mv.0]
-            + dot(tactical, &self.policy_tactical)
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
@@ -385,21 +358,9 @@ impl PolicyValueModel {
         insert(&vars, "policy_bias", &self.policy_bias, (CELL_COUNT,))?;
         insert(
             &vars,
-            "policy_tactical",
-            &self.policy_tactical,
-            (TACTICAL_FEATURES,),
-        )?;
-        insert(
-            &vars,
             "value_head_hidden",
             &self.value_head_hidden,
             (VALUE_HEAD_SIZE, self.hidden_size),
-        )?;
-        insert(
-            &vars,
-            "global_tactical_value",
-            &self.global_tactical_value,
-            (VALUE_HEAD_SIZE, GLOBAL_TACTICAL_FEATURES),
         )?;
         insert(
             &vars,
@@ -425,13 +386,6 @@ impl PolicyValueModel {
             &self.value_head_output,
             (WDL_SIZE, VALUE_HEAD_SIZE),
         )?;
-        insert(
-            &vars,
-            "moves_left_output",
-            &self.moves_left_output,
-            (VALUE_HEAD_SIZE, 1),
-        )?;
-        insert(&vars, "moves_left_bias", &self.moves_left_bias, (1,))?;
         vars.save(path).map_err(candle_error)
     }
 
@@ -460,15 +414,11 @@ impl PolicyValueModel {
             hidden_bias,
             policy_hidden: load(&tensors, "policy_hidden")?,
             policy_bias: load(&tensors, "policy_bias")?,
-            policy_tactical: load(&tensors, "policy_tactical")?,
             value_head_hidden: load(&tensors, "value_head_hidden")?,
-            global_tactical_value: load(&tensors, "global_tactical_value")?,
             value_head_bias: load(&tensors, "value_head_bias")?,
             value_head_hidden2: load(&tensors, "value_head_hidden2")?,
             value_head_bias2: load(&tensors, "value_head_bias2")?,
             value_head_output: load(&tensors, "value_head_output")?,
-            moves_left_output: load(&tensors, "moves_left_output")?,
-            moves_left_bias: load(&tensors, "moves_left_bias")?,
         };
         if model.input_hidden.len() != INPUT_SIZE * hidden_size
             || model.stone_hidden.len() != STONE_TYPES * hidden_size
@@ -478,15 +428,11 @@ impl PolicyValueModel {
             || model.anti_diagonal_hidden.len() != DIAGONAL_FEATURES * hidden_size
             || model.policy_hidden.len() != CELL_COUNT * hidden_size
             || model.policy_bias.len() != CELL_COUNT
-            || model.policy_tactical.len() != TACTICAL_FEATURES
             || model.value_head_hidden.len() != hidden_size * VALUE_HEAD_SIZE
-            || model.global_tactical_value.len() != GLOBAL_TACTICAL_FEATURES * VALUE_HEAD_SIZE
             || model.value_head_bias.len() != VALUE_HEAD_SIZE
             || model.value_head_hidden2.len() != VALUE_HEAD_SIZE * VALUE_HEAD_SIZE
             || model.value_head_bias2.len() != VALUE_HEAD_SIZE
             || model.value_head_output.len() != VALUE_HEAD_SIZE * WDL_SIZE
-            || model.moves_left_output.len() != VALUE_HEAD_SIZE
-            || model.moves_left_bias.len() != 1
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -515,15 +461,11 @@ impl PolicyValueModel {
         blend!(hidden_bias);
         blend!(policy_hidden);
         blend!(policy_bias);
-        blend!(policy_tactical);
         blend!(value_head_hidden);
-        blend!(global_tactical_value);
         blend!(value_head_bias);
         blend!(value_head_hidden2);
         blend!(value_head_bias2);
         blend!(value_head_output);
-        blend!(moves_left_output);
-        blend!(moves_left_bias);
     }
 }
 
@@ -745,12 +687,14 @@ mod tests {
 
     #[test]
     fn ema_blends_every_parameter_group() {
-        let online = PolicyValueModel::random(8, 2);
+        let mut online = PolicyValueModel::random(8, 2);
         let mut ema = PolicyValueModel::random(8, 1);
+        assert!(ema.policy_bias.iter().all(|&bias| bias == 0.0));
+        online.policy_bias[0] = 1.0;
         let before = ema.policy_bias[0];
         ema.update_ema(&online, 0.75);
         let expected = before * 0.75 + online.policy_bias[0] * 0.25;
         assert!((ema.policy_bias[0] - expected).abs() < 1e-6);
-        assert_eq!(ema.moves_left_output.len(), VALUE_HEAD_SIZE);
+        assert_eq!(ema.policy_bias.len(), CELL_COUNT);
     }
 }

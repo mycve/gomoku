@@ -124,8 +124,12 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         config.policy_softmax_temp, config.root_dirichlet_alpha, config.root_exploration_fraction
     );
     println!(
-        "aux      : moves_left_weight={:.3} value_target=terminal_wdl ema_decay={:.6} ema_model={}",
-        config.moves_left_loss_weight, config.ema_decay, config.ema_model_path
+        "opening  : probability={:.1}% regions=3x3/4x4/5x5 random_plies=2 samples_after_opening=true",
+        config.selfplay_random_opening_probability * 100.0
+    );
+    println!(
+        "targets  : policy=mcts_visits value=terminal_wdl ema_decay={:.6} ema_model={}",
+        config.ema_decay, config.ema_model_path
     );
     let published = Arc::new(RwLock::new(initial_ema.clone()));
     let version = Arc::new(AtomicU64::new(progress.update as u64));
@@ -147,6 +151,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             temperature_decay_plies: config.temperature_decay_plies,
             temperature_value_cutoff: config.temperature_value_cutoff,
             temperature_visit_offset: config.temperature_visit_offset,
+            random_opening_probability: config.selfplay_random_opening_probability,
             ..Default::default()
         },
         config.seed,
@@ -249,7 +254,6 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 trainer_config.batch_epochs,
                 lr,
                 trainer_config.batch_size,
-                trainer_config.moves_left_loss_weight,
                 trainer_config.ema_decay,
                 Some(&trainer_stop),
             )?;
@@ -357,11 +361,6 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             event.train_stats.value_loss,
             progress.update,
         );
-        tb.add_scalar(
-            "train/moves_left_loss",
-            event.train_stats.moves_left_loss,
-            progress.update,
-        );
         tb.add_scalar("replay/samples", event.pool_samples as f32, progress.update);
         let selfplay_seconds = event.batch.collect_seconds.max(1.0e-6);
         tb.add_scalar(
@@ -423,6 +422,16 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         tb.add_scalar(
             "selfplay/average_plies",
             event.batch.stats.plies as f32 / games,
+            progress.update,
+        );
+        tb.add_scalar(
+            "selfplay/random_opening_rate",
+            event.batch.stats.random_opening_games as f32 / games,
+            progress.update,
+        );
+        tb.add_scalar(
+            "selfplay/random_opening_plies",
+            event.batch.stats.random_opening_plies as f32,
             progress.update,
         );
         tb.add_scalar(
@@ -687,6 +696,13 @@ fn print_event(
         event.batch.stats.plies as f32 / event.batch.games.max(1) as f32
     );
     println!(
+        "opening  : randomized={}/{} rate={:.1}% plies={}",
+        event.batch.stats.random_opening_games,
+        event.batch.games,
+        event.batch.stats.random_opening_games as f32 * 100.0 / event.batch.games.max(1) as f32,
+        event.batch.stats.random_opening_plies
+    );
+    println!(
         "search   : avg_sims={:.1} entropy={:.3} visited={:.1}",
         event.batch.stats.simulations as f32 / searches,
         event.batch.stats.entropy_sum / searches,
@@ -727,7 +743,7 @@ fn print_event(
         event.train_samples as f32 / event.batch.samples.len().max(1) as f32
     );
     println!(
-        "train    : device={} samples={} steps={} lr={:.6} loss={:.4} policy={:.4} value={:.4} moves_left={:.4} time={:.2}s sps={:.1}",
+        "train    : device={} samples={} steps={} lr={:.6} loss={:.4} policy={:.4} value={:.4} time={:.2}s sps={:.1}",
         device,
         event.train_stats.samples,
         event.train_stats.optimizer_steps,
@@ -735,7 +751,6 @@ fn print_event(
         event.train_stats.loss,
         event.train_stats.policy_loss,
         event.train_stats.value_loss,
-        event.train_stats.moves_left_loss,
         event.train_seconds,
         event.train_stats.samples as f32 / event.train_seconds.max(1e-6)
     );

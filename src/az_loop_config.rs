@@ -17,6 +17,7 @@ pub struct AzLoopConfig {
     pub selfplay_samples_per_update: usize,
     pub selfplay_workers: usize,
     pub selfplay_queue_capacity: usize,
+    pub selfplay_random_opening_probability: f32,
     pub learning_rate: f32,
     pub learning_rate_min: f32,
     pub learning_rate_decay: f32,
@@ -33,7 +34,6 @@ pub struct AzLoopConfig {
     pub root_dirichlet_alpha: f32,
     pub root_exploration_fraction: f32,
     pub policy_softmax_temp: f32,
-    pub moves_left_loss_weight: f32,
     pub ema_decay: f32,
     pub replay_capacity: usize,
     pub replay_warmup_samples: usize,
@@ -55,7 +55,7 @@ pub struct AzLoopConfig {
 impl Default for AzLoopConfig {
     fn default() -> Self {
         Self {
-            format_version: 1,
+            format_version: 2,
             model_path: "model.safetensors".into(),
             ema_model_path: "ema.safetensors".into(),
             best_model_path: "best.safetensors".into(),
@@ -66,6 +66,7 @@ impl Default for AzLoopConfig {
             selfplay_samples_per_update: 50_000,
             selfplay_workers: 196,
             selfplay_queue_capacity: 0,
+            selfplay_random_opening_probability: 0.25,
             learning_rate: 0.0008,
             learning_rate_min: 0.0002,
             learning_rate_decay: 0.90,
@@ -82,7 +83,6 @@ impl Default for AzLoopConfig {
             root_dirichlet_alpha: 0.12,
             root_exploration_fraction: 0.25,
             policy_softmax_temp: 1.45,
-            moves_left_loss_weight: 0.1,
             ema_decay: 0.999,
             replay_capacity: 500_000,
             replay_warmup_samples: 100_000,
@@ -121,6 +121,10 @@ impl AzLoopConfig {
     fn validate(&self) -> io::Result<()> {
         let finite = [
             ("learning_rate", self.learning_rate),
+            (
+                "selfplay_random_opening_probability",
+                self.selfplay_random_opening_probability,
+            ),
             ("learning_rate_min", self.learning_rate_min),
             ("learning_rate_decay", self.learning_rate_decay),
             ("cpuct", self.cpuct),
@@ -131,7 +135,6 @@ impl AzLoopConfig {
             ("root_dirichlet_alpha", self.root_dirichlet_alpha),
             ("root_exploration_fraction", self.root_exploration_fraction),
             ("policy_softmax_temp", self.policy_softmax_temp),
-            ("moves_left_loss_weight", self.moves_left_loss_weight),
             ("ema_decay", self.ema_decay),
             ("arena_promotion_rate", self.arena_promotion_rate),
             (
@@ -148,8 +151,8 @@ impl AzLoopConfig {
                 return Err(io::Error::other(format!("配置 `{name}` 必须是有限数值")));
             }
         }
-        if self.format_version != 1 {
-            return Err(io::Error::other("仅支持 format_version = 1"));
+        if self.format_version != 2 {
+            return Err(io::Error::other("仅支持 format_version = 2"));
         }
         if self.simulations == 0
             || self.selfplay_samples_per_update == 0
@@ -171,6 +174,7 @@ impl AzLoopConfig {
             || !(0.0..=1.0).contains(&self.arena_promotion_rate)
             || self.arena_promotion_confidence_z < 0.0
             || !(0.0..=1.0).contains(&self.replay_recent_sample_fraction)
+            || !(0.0..=1.0).contains(&self.selfplay_random_opening_probability)
         {
             return Err(io::Error::other(
                 "配置中的学习率、搜索或比例参数超出合法范围",
@@ -185,7 +189,7 @@ impl AzLoopConfig {
     }
 }
 
-const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 1
+const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 2
 model_path = "model.safetensors"
 ema_model_path = "ema.safetensors"
 best_model_path = "best.safetensors"
@@ -196,6 +200,7 @@ seed = 20260730
 selfplay_samples_per_update = 50000
 selfplay_workers = 196
 selfplay_queue_capacity = 0
+selfplay_random_opening_probability = 0.25
 learning_rate = 0.0008
 learning_rate_min = 0.0002
 learning_rate_decay = 0.90
@@ -212,7 +217,6 @@ temperature_visit_offset = -0.8
 root_dirichlet_alpha = 0.12
 root_exploration_fraction = 0.25
 policy_softmax_temp = 1.45
-moves_left_loss_weight = 0.1
 ema_decay = 0.999
 replay_capacity = 500000
 replay_warmup_samples = 100000
@@ -239,8 +243,10 @@ mod tests {
     fn default_text_is_exact_and_valid() {
         let config: AzLoopConfig = toml::from_str(DEFAULT_CONFIG_TEXT).unwrap();
         config.validate().unwrap();
+        assert_eq!(config.format_version, 2);
         assert_eq!(config.selfplay_samples_per_update, 50_000);
         assert_eq!(config.selfplay_workers, 196);
+        assert_eq!(config.selfplay_random_opening_probability, 0.25);
         assert_eq!(config.replay_capacity, 500_000);
         assert_eq!(config.replay_warmup_samples, 100_000);
         assert_eq!(config.train_samples_per_update, 50_000);

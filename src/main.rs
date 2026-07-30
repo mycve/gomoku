@@ -160,7 +160,7 @@ fn main() -> io::Result<()> {
             PolicyValueModel::random(args.hidden, args.seed).save(&args.output)?;
             println!("model    : initialized {}", args.output);
             println!(
-                "arch     : input=451 hidden={} rmsnorm policy=225 value=96x96xWDL3 moves-left=96x1",
+                "arch     : input=451 hidden={} rmsnorm policy=225 value=96x96xWDL3",
                 args.hidden
             );
             println!("board    : 15x15 freestyle gomoku");
@@ -215,7 +215,6 @@ fn main() -> io::Result<()> {
                 args.learning_rate,
                 args.batch_size,
                 &args.gpu_devices,
-                0.1,
             )?;
             let seconds = started.elapsed().as_secs_f64();
             println!(
@@ -230,8 +229,8 @@ fn main() -> io::Result<()> {
                 (samples.len() * args.epochs) as f64 / seconds.max(1e-9)
             );
             println!(
-                "loss     : total={:.4} policy={:.4} value={:.4} moves_left={:.4}",
-                stats.loss, stats.policy_loss, stats.value_loss, stats.moves_left_loss
+                "loss     : total={:.4} policy={:.4} value={:.4}",
+                stats.loss, stats.policy_loss, stats.value_loss
             );
         }
         Some(Command::AzLoop(args)) => {
