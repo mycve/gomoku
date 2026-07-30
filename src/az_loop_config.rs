@@ -34,8 +34,6 @@ pub struct AzLoopConfig {
     pub root_exploration_fraction: f32,
     pub policy_softmax_temp: f32,
     pub moves_left_loss_weight: f32,
-    pub value_search_target_weight: f32,
-    pub value_search_target_start_update: usize,
     pub ema_decay: f32,
     pub replay_capacity: usize,
     pub train_samples_per_update: usize,
@@ -83,8 +81,6 @@ impl Default for AzLoopConfig {
             root_exploration_fraction: 0.25,
             policy_softmax_temp: 1.45,
             moves_left_loss_weight: 0.1,
-            value_search_target_weight: 0.25,
-            value_search_target_start_update: 5,
             ema_decay: 0.999,
             replay_capacity: 500_000,
             train_samples_per_update: 50_000,
@@ -132,10 +128,6 @@ impl AzLoopConfig {
             ("root_exploration_fraction", self.root_exploration_fraction),
             ("policy_softmax_temp", self.policy_softmax_temp),
             ("moves_left_loss_weight", self.moves_left_loss_weight),
-            (
-                "value_search_target_weight",
-                self.value_search_target_weight,
-            ),
             ("ema_decay", self.ema_decay),
             ("arena_promotion_rate", self.arena_promotion_rate),
             (
@@ -169,7 +161,6 @@ impl AzLoopConfig {
             || !(0.0..=1.0).contains(&self.ema_decay)
             || !(0.0..=1.0).contains(&self.arena_promotion_rate)
             || !(0.0..=1.0).contains(&self.replay_recent_sample_fraction)
-            || !(0.0..=1.0).contains(&self.value_search_target_weight)
         {
             return Err(io::Error::other(
                 "配置中的学习率、搜索或比例参数超出合法范围",
@@ -207,8 +198,6 @@ root_dirichlet_alpha = 0.12
 root_exploration_fraction = 0.25
 policy_softmax_temp = 1.45
 moves_left_loss_weight = 0.1
-value_search_target_weight = 0.25
-value_search_target_start_update = 5
 ema_decay = 0.999
 replay_capacity = 500000
 train_samples_per_update = 50000
@@ -237,8 +226,6 @@ mod tests {
         assert_eq!(config.selfplay_workers, 196);
         assert_eq!(config.replay_capacity, 500_000);
         assert_eq!(config.train_samples_per_update, 50_000);
-        assert_eq!(config.value_search_target_start_update, 5);
-        assert_eq!(config.value_search_target_weight, 0.25);
         assert!(DEFAULT_CONFIG_TEXT.contains("learning_rate = 0.0008\n"));
         assert!(DEFAULT_CONFIG_TEXT.contains("arena_promotion_rate = 0.550000011920929\n"));
     }

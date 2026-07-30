@@ -216,7 +216,6 @@ fn main() -> io::Result<()> {
                 args.batch_size,
                 &args.gpu_devices,
                 0.1,
-                0.25,
             )?;
             let seconds = started.elapsed().as_secs_f64();
             println!(

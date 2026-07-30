@@ -13,8 +13,6 @@ pub struct Sample {
     pub policy: Vec<(Move, f32)>,
     pub value: f32,
     #[serde(default)]
-    pub search_value: f32,
-    #[serde(default)]
     pub moves_left: f32,
     #[serde(default)]
     pub generation: u64,
@@ -30,7 +28,6 @@ impl Sample {
                 .map(|&(mv, probability)| (Move(transform_index(mv.0, symmetry)), probability))
                 .collect(),
             value: self.value,
-            search_value: self.search_value,
             moves_left: self.moves_left,
             generation: self.generation,
         }
@@ -159,7 +156,6 @@ mod tests {
             board: Board::new(),
             policy: Vec::new(),
             value: 0.0,
-            search_value: 0.0,
             moves_left: 1.0,
             generation,
         }

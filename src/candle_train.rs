@@ -35,7 +35,6 @@ pub fn train(
     batch_size: usize,
     requested_devices: &[usize],
     moves_left_loss_weight: f32,
-    value_search_target_weight: f32,
 ) -> io::Result<TrainStats> {
     train_controlled(
         model,
@@ -45,7 +44,6 @@ pub fn train(
         batch_size,
         requested_devices,
         moves_left_loss_weight,
-        value_search_target_weight,
         None,
     )
 }
@@ -59,7 +57,6 @@ pub fn train_controlled(
     batch_size: usize,
     requested_devices: &[usize],
     moves_left_loss_weight: f32,
-    value_search_target_weight: f32,
     stop: Option<&AtomicBool>,
 ) -> io::Result<TrainStats> {
     if samples.is_empty() || epochs == 0 || learning_rate <= 0.0 {
@@ -99,12 +96,8 @@ pub fn train_controlled(
                     .map(|(rank, shard)| {
                         let replica = &replicas[rank];
                         scope.spawn(move || {
-                            let result = replica.backward(
-                                shard,
-                                batch.len(),
-                                moves_left_loss_weight,
-                                value_search_target_weight,
-                            );
+                            let result =
+                                replica.backward(shard, batch.len(), moves_left_loss_weight);
                             crate::profile::flush_thread();
                             result
                         })
@@ -240,11 +233,10 @@ impl Replica {
         samples: &[Sample],
         global_len: usize,
         moves_left_loss_weight: f32,
-        value_search_target_weight: f32,
     ) -> io::Result<ShardOutput> {
         let packed = {
             crate::scope_profile!("train.pack");
-            pack(samples, value_search_target_weight)
+            pack(samples)
         };
         let b = samples.len();
         crate::scope_profile!("train.tensor_h2d");
@@ -543,7 +535,7 @@ struct Packed {
     value_wdl: Vec<f32>,
     moves_left: Vec<f32>,
 }
-fn pack(samples: &[Sample], value_search_target_weight: f32) -> Packed {
+fn pack(samples: &[Sample]) -> Packed {
     let mut inputs = vec![0.0; samples.len() * INPUT_SIZE];
     let mut stone_counts = vec![0.0; samples.len() * STONE_TYPES];
     let mut rank_counts = vec![0.0; samples.len() * AXIS_FEATURES];
@@ -595,14 +587,6 @@ fn pack(samples: &[Sample], value_search_target_weight: f32) -> Packed {
                 targets[row * CELL_COUNT + m.0] = p.max(0.0) / sum
             }
         }
-        let search_value = s.search_value.clamp(-1.0, 1.0);
-        let search_draw = (1.0 - search_value.abs()) * 0.25;
-        let search_decisive = 1.0 - search_draw;
-        let search_wdl = [
-            search_decisive * (1.0 + search_value) * 0.5,
-            search_draw,
-            search_decisive * (1.0 - search_value) * 0.5,
-        ];
         let final_wdl = if s.value > 0.5 {
             [1.0, 0.0, 0.0]
         } else if s.value < -0.5 {
@@ -610,11 +594,7 @@ fn pack(samples: &[Sample], value_search_target_weight: f32) -> Packed {
         } else {
             [0.0, 1.0, 0.0]
         };
-        let search_weight = value_search_target_weight.clamp(0.0, 1.0);
-        value_wdl.extend(
-            (0..WDL_SIZE)
-                .map(|i| final_wdl[i] * (1.0 - search_weight) + search_wdl[i] * search_weight),
-        );
+        value_wdl.extend_from_slice(&final_wdl);
         moves_left.push((s.moves_left / CELL_COUNT as f32).clamp(0.0, 1.0));
     }
     Packed {
@@ -651,11 +631,10 @@ mod tests {
             board: Board::new(),
             policy: vec![(Move::new(7, 7).unwrap(), 1.0)],
             value: 0.0,
-            search_value: 0.0,
             moves_left: 20.0,
             generation: 0,
         };
-        let stats = train(&mut model, &[sample], 1, 1e-3, 1, &[], 0.1, 0.25).unwrap();
+        let stats = train(&mut model, &[sample], 1, 1e-3, 1, &[], 0.1).unwrap();
         assert_eq!(stats.optimizer_steps, 1);
         assert!(stats.moves_left_loss.is_finite());
         assert!(stats.moves_left_loss > 0.0);

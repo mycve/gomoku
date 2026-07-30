@@ -93,7 +93,6 @@ pub fn generate_one_detailed_controlled(
         }
         let sum = c.iter().map(|x| x.visits).sum::<u32>().max(1) as f32;
         let policy: Vec<_> = c.iter().map(|x| (x.mv, x.visits as f32 / sum)).collect();
-        let search_value = c.iter().map(|x| x.q * x.visits as f32).sum::<f32>() / sum;
         let mut top = [0.0_f32; 2];
         for &(_, p) in &policy {
             if p > 0.0 {
@@ -129,7 +128,6 @@ pub fn generate_one_detailed_controlled(
             board: board.clone(),
             policy,
             value: 0.0,
-            search_value,
             moves_left: 0.0,
             generation: 0,
         });
