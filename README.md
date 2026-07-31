@@ -8,7 +8,7 @@
 
 ```bash
 cargo test
-cargo run -- az-init model.safetensors 192
+cargo run -- az-init model.safetensors 32
 cargo run -- az-loop                 # 首次生成 gomoku.azloop.toml
 cargo run -- az-loop --target-update 10
 cargo run -- az-search model.safetensors 3000 1.5 h8 h9 i8
@@ -146,31 +146,28 @@ update 都主动刷新日志，便于实时查看。
 - `gomocup.rs`：Gomocup/Piskvork 协议状态机与限时搜索
 - `bin/gomoku-engine.rs`：不含训练命令入口的独立交付引擎
 
-当前模型采用面向高速增量推理的 AZ-NNUE 结构：默认 192 宽共享隐藏层、ReLU 后
-RMSNorm，以及 `96 → 96 → WDL(3)` 价值头。MCTS 标量价值由
-`P(win) - P(loss)` 得到；初始 WDL 输出层为零，避免随机模型产生虚假胜率。
+当前模型是面向 CPU 搜索设计的纯稀疏 Transformer：宽度 32、2 层、2 个注意力头，
+每个头宽度 16。只为已有棋子创建动态 Token；棋子只与同行、同列或同对角线上的
+棋子建立注意力边，不构造 `225 × 225` 稠密注意力矩阵。每层采用 RMSNorm、稀疏
+自注意力和 `32 → 64 → 32` 前馈残差块。
+
+Policy 将每个合法空点作为 Query，只查询穿过该点四条轴线上的棋子 Token，并直接
+输出该位置的 logit；位置 Query 在模型加载时预投影缓存。Value 汇总上下文化棋子
+Token，经 `32 → 32 → WDL(3)` 输出胜、和、负概率，MCTS 标量价值为
+`P(win) - P(loss)`。
+
 在线模型执行梯度更新，EMA 模型默认按每个优化器 step 折算 `ema_decay = 0.999`，
 并专门提供给自博弈 Actor、检查点和 Arena；Best 仍只由 Arena 晋级替换。
 新训练没有 EMA 检查点时，第一次完整更新会先把在线模型完整复制到 EMA，后续才启用
 指数平滑；恢复已有 `ema.safetensors` 时直接延续历史 EMA，不会重新覆盖。
-输入侧将精确棋子格点嵌入与己/彼棋子类型、15 行、15 列及两个方向各 29 条对角线
-结构嵌入相加；CPU 推理使用一次稀疏棋盘遍历完成全部累加，训练侧使用等价的
-Candle 批量矩阵运算。经验池抽样时会随机应用正方形的 8 种旋转/镜像对称变换，
+输入由执子方嵌入和精确位置嵌入组成。经验池抽样时会随机应用正方形的 8 种旋转/镜像对称变换，
 棋盘与策略标签同步变换，从而提高等价棋形的样本利用率而不增加推理开销。
 Policy 和 Value 均只从可训练的棋盘结构编码中学习，不注入成五、阻五、开放三等
-手工战术标签；Policy 的位置 bias 也从全零开始训练。每个候选点额外读取水平、垂直
-和两条对角线共 4 条轴线，每条轴线同时包含前后两个射线各 4 格。空、己、敌、边界
-四态形成有限的轴棋形类别，由四轴共享的可训练查表产生两个统计量；轴内左右射线按
-无序对编码，因此镜像棋形严格共享表示。候选特征通过均值与最大值残差接入 Policy，
-并再次跨候选池化后直接校准 WDL logits。局部 Policy 和 Value 输出均从零初始化，
-不会在未训练时形成随机战术偏见。Value 只使用完整对局的最终胜、和、负作为 WDL
+手工战术标签。Value 只使用完整对局的最终胜、和、负作为 WDL
 监督，不混入当前网络搜索产生的 Q 值。
-MCTS 节点还缓存黑白双视角的增量累加器，扩展子节点时只加入新落子和手数特征，
-避免每次叶子求值重新扫描整盘。
-模型格式为 v10。`rule_legal_moves()` 返回规则允许的全部空点；搜索和训练调用的
+模型格式为稀疏 Transformer v1。`rule_legal_moves()` 返回规则允许的全部空点；搜索和训练调用的
 `search_candidates()` 不做空间剪枝，同样返回全部合法空点。包括空棋盘在内，所有
-合法落点都由 Policy 和 MCTS 平等参与候选竞争。价值塔采用适合
-NEON/AVX2/FMA 点积的输出优先布局。旧模型不再
+合法落点都由 Policy 和 MCTS 平等参与候选竞争。旧模型不再
 迁移；升级后请清理旧模型、进度和经验池，再用 `az-init` 开始全新训练。
 
 正常训练时经验池只保存在 Trainer 内存中，不再
@@ -178,12 +175,12 @@ NEON/AVX2/FMA 点积的输出优先布局。旧模型不再
 启动会加载该快照并立即删除已消费的快照文件，避免旧快照被重复加载；正常达到目标
 更新退出时不会保留中断快照。
 
-开始全新 v10 训练时，应先停止旧进程，再只删除该实验对应文件和旧配置：
+开始全新稀疏 Transformer 训练时，应先停止旧进程，再只删除该实验对应文件和旧配置：
 
 ```bash
 rm -f model.safetensors ema.safetensors best.safetensors
 rm -f data/azloop-progress.json data/replay.jsonl data/replay.jsonl.tmp
 rm -f gomoku.azloop.toml
 rm -rf checkpoints runs/gomoku
-cargo run --profile fast -- az-init model.safetensors 192
+cargo run --profile fast -- az-init model.safetensors 32
 ```

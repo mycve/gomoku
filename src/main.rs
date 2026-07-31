@@ -2,13 +2,13 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use gomoku::{
     az_loop,
     az_loop_config::{DEFAULT_CONFIG_PATH, load_or_create},
-    candle_train,
     game::{Board, Move, Outcome, Player},
     mcts::{SearchConfig, search},
     model::PolicyValueModel,
     replay,
     selfplay::arena,
     sparse_transformer::{SparseScratch, SparseTransformerModel},
+    train,
 };
 use std::{
     io::{self, Write},
@@ -53,7 +53,7 @@ enum Command {
 struct AzInitArgs {
     #[arg(default_value = "model.safetensors")]
     output: String,
-    #[arg(default_value_t = 192)]
+    #[arg(default_value_t = 32)]
     hidden: usize,
     #[arg(default_value_t = 20260730)]
     seed: u64,
@@ -172,8 +172,7 @@ fn main() -> io::Result<()> {
             PolicyValueModel::random(args.hidden, args.seed).save(&args.output)?;
             println!("model    : initialized {}", args.output);
             println!(
-                "arch     : input=451 hidden={} rmsnorm local=4axesx8cells-pattern2 policy=225 value=96x96xWDL3",
-                args.hidden
+                "arch     : sparse-transformer width=32 layers=2 heads=2 policy=225 value=WDL3"
             );
             println!("board    : 15x15 freestyle gomoku");
         }
@@ -211,12 +210,12 @@ fn main() -> io::Result<()> {
         }
         Some(Command::AzSparseBench(args)) => {
             let board = board_from_moves(&args.moves)?;
-            let model = SparseTransformerModel::random(args.seed);
+            let model = SparseTransformerModel::random(32, args.seed);
             let mut scratch = SparseScratch::default();
-            let _ = model.evaluate(&board, &mut scratch);
+            let _ = model.evaluate_with_scratch(&board, 1.0, &mut scratch);
             let started = Instant::now();
             for _ in 0..args.repeat {
-                let _ = model.evaluate(&board, &mut scratch);
+                let _ = model.evaluate_with_scratch(&board, 1.0, &mut scratch);
             }
             let seconds = started.elapsed().as_secs_f64();
             println!(
@@ -239,8 +238,8 @@ fn main() -> io::Result<()> {
                 )));
             }
             let started = Instant::now();
-            let device = candle_train::training_device_name(args.gpu_device)?;
-            let stats = candle_train::train(
+            let device = train::training_device_name(args.gpu_device)?;
+            let stats = train::train(
                 &mut model,
                 &samples,
                 args.epochs,

@@ -1,6 +1,6 @@
 use crate::{
     game::{Board, Move, Outcome},
-    model::{EvalAccumulator, EvalScratch, PolicyValueModel},
+    model::{EvalScratch, PolicyValueModel},
 };
 use std::time::{Duration, Instant};
 
@@ -53,7 +53,6 @@ pub struct Candidate {
 }
 struct Node {
     board: Board,
-    accumulator: EvalAccumulator,
     children: Vec<Edge>,
     expanded: bool,
 }
@@ -85,10 +84,9 @@ fn search_until(
     deadline: Option<Instant>,
 ) -> Vec<Candidate> {
     crate::scope_profile!("mcts.search");
-    let mut scratch = EvalScratch::new(model.hidden_size);
+    let mut scratch = EvalScratch::new();
     let mut nodes = vec![Node {
         board: board.clone(),
-        accumulator: model.accumulator(board),
         children: vec![],
         expanded: false,
     }];
@@ -137,13 +135,8 @@ fn expand(
         };
     }
     let (mut policy, value) = {
-        crate::scope_profile!("mcts.nn_eval");
-        model.evaluate_accumulator_with_scratch(
-            &nodes[idx].board,
-            &nodes[idx].accumulator,
-            cfg.policy_softmax_temp,
-            scratch,
-        )
+        crate::scope_profile!("mcts.transformer_eval");
+        model.evaluate_with_scratch(&nodes[idx].board, cfg.policy_softmax_temp, scratch)
     };
     if idx == 0 && cfg.root_dirichlet_alpha > 0.0 && cfg.root_exploration_fraction > 0.0 {
         let mut priors = policy.iter().map(|(_, prior)| *prior).collect::<Vec<_>>();
@@ -226,13 +219,10 @@ fn simulate(
         crate::scope_profile!("mcts.create_child");
         let mut b = nodes[idx].board.clone();
         let mv = nodes[idx].children[best].mv;
-        let player = b.to_move();
-        let accumulator = model.accumulator_after_move(&nodes[idx].accumulator, mv, player);
         b.play(mv);
         let c = nodes.len();
         nodes.push(Node {
             board: b,
-            accumulator,
             children: vec![],
             expanded: false,
         });

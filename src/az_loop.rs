@@ -1,11 +1,11 @@
 use crate::{
     async_selfplay::{AsyncSelfplay, SelfplayGame},
     az_loop_config::AzLoopConfig,
-    candle_train,
     mcts::SearchConfig,
     model::PolicyValueModel,
     replay,
     selfplay::{SelfplayStats, arena_controlled},
+    train,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -223,7 +223,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         let mut model = initial_model;
         let mut ema_model = initial_ema;
         let mut ema_initialized = ema_checkpoint_exists;
-        let mut training = candle_train::TrainingSession::new(
+        let mut training = train::TrainingSession::new(
             &model,
             Some(&ema_model),
             trainer_config.gpu_device,
@@ -307,7 +307,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         }
         Ok(())
     });
-    let train_device = candle_train::training_device_name(config.gpu_device)?;
+    let train_device = train::training_device_name(config.gpu_device)?;
     let end = target_update.unwrap_or(usize::MAX);
     println!(
         "loop     : mode=batch-async actors={} actor_queue={}(nonblocking-drop) collector_queue=1(nonblocking-drop) trainer_queue=rendezvous warmup={} samples/update>={} sims={} train_device={} batch={} arena_opening_plies={}",
