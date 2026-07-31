@@ -1,4 +1,4 @@
-use crate::game::{Board, CELL_COUNT, Move};
+use crate::game::{Board, CELL_COUNT, Move, Player};
 use candle_core::{DType, Device, Shape, Var};
 use candle_nn::VarMap;
 use std::{fs, io, path::Path};
@@ -102,6 +102,26 @@ pub struct SparseScratch {
     value_probabilities: [f32; 3],
     line_tokens: Vec<Vec<usize>>,
     active_lines: Vec<usize>,
+}
+
+#[derive(Clone)]
+struct CachedLayer {
+    output: Vec<[f32; TOKEN_WIDTH]>,
+    k: Vec<[f32; TOKEN_WIDTH]>,
+    v: Vec<[f32; TOKEN_WIDTH]>,
+}
+
+#[derive(Clone)]
+struct PerspectiveCache {
+    base: Vec<[f32; TOKEN_WIDTH]>,
+    layers: Vec<CachedLayer>,
+}
+
+#[derive(Clone)]
+pub struct EvalCache {
+    moves: Vec<Move>,
+    black: PerspectiveCache,
+    white: PerspectiveCache,
 }
 
 impl Default for SparseScratch {
@@ -387,6 +407,143 @@ impl SparseTransformerModel {
         self.evaluate_with_scratch(board, 1.0, &mut SparseScratch::new())
     }
 
+    pub fn cache(&self, board: &Board) -> EvalCache {
+        let moves = board
+            .cells()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &stone)| (stone != 0).then_some(Move(index)))
+            .collect::<Vec<_>>();
+        EvalCache {
+            black: self.build_perspective_cache(board, &moves, Player::Black),
+            white: self.build_perspective_cache(board, &moves, Player::White),
+            moves,
+        }
+    }
+
+    pub fn cache_after_move(&self, parent: &EvalCache, mv: Move, player: Player) -> EvalCache {
+        let insertion = parent.moves.partition_point(|move_| move_.0 < mv.0);
+        let mut moves = parent.moves.clone();
+        moves.insert(insertion, mv);
+        EvalCache {
+            black: self.update_perspective_cache(
+                &parent.black,
+                &moves,
+                insertion,
+                mv,
+                player,
+                Player::Black,
+            ),
+            white: self.update_perspective_cache(
+                &parent.white,
+                &moves,
+                insertion,
+                mv,
+                player,
+                Player::White,
+            ),
+            moves,
+        }
+    }
+
+    pub fn evaluate_cache_with_scratch(
+        &self,
+        board: &Board,
+        cache: &EvalCache,
+        policy_temperature: f32,
+        scratch: &mut SparseScratch,
+    ) -> (Vec<(Move, f32)>, f32) {
+        let perspective = match board.to_move() {
+            Player::Black => &cache.black,
+            Player::White => &cache.white,
+        };
+        scratch.moves.clone_from(&cache.moves);
+        scratch.tokens.clone_from(
+            perspective
+                .layers
+                .last()
+                .map(|layer| &layer.output)
+                .unwrap_or(&perspective.base),
+        );
+        rebuild_line_index(scratch);
+        let policy = self.policy(board, policy_temperature, scratch);
+        let value = self.value(scratch);
+        (policy, value)
+    }
+
+    fn build_perspective_cache(
+        &self,
+        board: &Board,
+        moves: &[Move],
+        perspective: Player,
+    ) -> PerspectiveCache {
+        let base = moves
+            .iter()
+            .map(|&mv| self.base_token(mv, board.cells()[mv.0], perspective))
+            .collect::<Vec<_>>();
+        let mut input = base.clone();
+        let mut layers = Vec::with_capacity(LAYERS);
+        for block in &self.blocks {
+            let layer = build_cached_layer(block, moves, &input);
+            input = layer.output.clone();
+            layers.push(layer);
+        }
+        PerspectiveCache { base, layers }
+    }
+
+    fn update_perspective_cache(
+        &self,
+        parent: &PerspectiveCache,
+        moves: &[Move],
+        insertion: usize,
+        mv: Move,
+        player: Player,
+        perspective: Player,
+    ) -> PerspectiveCache {
+        let token = self.base_token(mv, player.stone(), perspective);
+        let base = inserted(&parent.base, insertion, token);
+        let mut input = base.clone();
+        let mut changed = vec![false; moves.len()];
+        changed[insertion] = true;
+        let mut layers = Vec::with_capacity(LAYERS);
+        for (block, old) in self.blocks.iter().zip(&parent.layers) {
+            let mut k = inserted(&old.k, insertion, [0.0; TOKEN_WIDTH]);
+            let mut v = inserted(&old.v, insertion, [0.0; TOKEN_WIDTH]);
+            for index in 0..moves.len() {
+                if changed[index] {
+                    project_kv(block, &input[index], &mut k[index], &mut v[index]);
+                }
+            }
+            let mut affected = vec![false; moves.len()];
+            for index in 0..moves.len() {
+                affected[index] = changed
+                    .iter()
+                    .enumerate()
+                    .any(|(other, &changed)| changed && aligned(moves[index], moves[other]));
+            }
+            let mut output = inserted(&old.output, insertion, [0.0; TOKEN_WIDTH]);
+            for index in 0..moves.len() {
+                if affected[index] {
+                    output[index] = compute_block_output(block, moves, &input, &k, &v, index);
+                }
+            }
+            input = output.clone();
+            changed = affected;
+            layers.push(CachedLayer { output, k, v });
+        }
+        PerspectiveCache { base, layers }
+    }
+
+    fn base_token(&self, mv: Move, stone: i8, perspective: Player) -> [f32; TOKEN_WIDTH] {
+        let side = usize::from(stone != perspective.stone());
+        let mut token = [0.0; TOKEN_WIDTH];
+        for dimension in 0..TOKEN_WIDTH {
+            token[dimension] = self.stone_embedding[side * TOKEN_WIDTH + dimension]
+                + self.position_embedding[mv.0 * TOKEN_WIDTH + dimension];
+        }
+        token
+    }
+
     pub fn evaluate_with_scratch(
         &self,
         board: &Board,
@@ -405,31 +562,16 @@ impl SparseTransformerModel {
     fn encode_stones(&self, board: &Board, scratch: &mut SparseScratch) {
         scratch.moves.clear();
         scratch.tokens.clear();
-        for &line in &scratch.active_lines {
-            scratch.line_tokens[line].clear();
-        }
-        scratch.active_lines.clear();
-        let us = board.to_move().stone();
         for (index, &stone) in board.cells().iter().enumerate() {
             if stone == 0 {
                 continue;
             }
-            let side = usize::from(stone != us);
-            let mut token = [0.0; TOKEN_WIDTH];
-            for dimension in 0..TOKEN_WIDTH {
-                token[dimension] = self.stone_embedding[side * TOKEN_WIDTH + dimension]
-                    + self.position_embedding[index * TOKEN_WIDTH + dimension];
-            }
             scratch.moves.push(Move(index));
-            scratch.tokens.push(token);
-            let token_index = scratch.tokens.len() - 1;
-            for line in line_ids(Move(index)) {
-                if scratch.line_tokens[line].is_empty() {
-                    scratch.active_lines.push(line);
-                }
-                scratch.line_tokens[line].push(token_index);
-            }
+            scratch
+                .tokens
+                .push(self.base_token(Move(index), stone, board.to_move()));
         }
+        rebuild_line_index(scratch);
     }
 
     fn policy(
@@ -553,6 +695,94 @@ impl SparseTransformerModel {
             }
         }
         (policy_loss, value_loss)
+    }
+}
+
+fn inserted<T: Copy>(values: &[T], index: usize, value: T) -> Vec<T> {
+    let mut output = Vec::with_capacity(values.len() + 1);
+    output.extend_from_slice(&values[..index]);
+    output.push(value);
+    output.extend_from_slice(&values[index..]);
+    output
+}
+
+fn build_cached_layer(block: &Block, moves: &[Move], input: &[[f32; TOKEN_WIDTH]]) -> CachedLayer {
+    let mut k = vec![[0.0; TOKEN_WIDTH]; input.len()];
+    let mut v = vec![[0.0; TOKEN_WIDTH]; input.len()];
+    for index in 0..input.len() {
+        project_kv(block, &input[index], &mut k[index], &mut v[index]);
+    }
+    let output = (0..input.len())
+        .map(|index| compute_block_output(block, moves, input, &k, &v, index))
+        .collect();
+    CachedLayer { output, k, v }
+}
+
+fn project_kv(
+    block: &Block,
+    input: &[f32; TOKEN_WIDTH],
+    k: &mut [f32; TOKEN_WIDTH],
+    v: &mut [f32; TOKEN_WIDTH],
+) {
+    let mut normalized = [0.0; TOKEN_WIDTH];
+    rms_norm(input, &mut normalized);
+    project(&normalized, &block.k, k);
+    project(&normalized, &block.v, v);
+}
+
+fn compute_block_output(
+    block: &Block,
+    moves: &[Move],
+    input: &[[f32; TOKEN_WIDTH]],
+    k: &[[f32; TOKEN_WIDTH]],
+    v: &[[f32; TOKEN_WIDTH]],
+    index: usize,
+) -> [f32; TOKEN_WIDTH] {
+    let mut normalized = [0.0; TOKEN_WIDTH];
+    rms_norm(&input[index], &mut normalized);
+    let mut q = [0.0; TOKEN_WIDTH];
+    project(&normalized, &block.q, &mut q);
+    let mut attention = [0.0; TOKEN_WIDTH];
+    attend_all_heads(
+        &q,
+        (HEAD_WIDTH as f32).sqrt().recip(),
+        moves
+            .iter()
+            .enumerate()
+            .filter_map(|(other, &mv)| aligned(moves[index], mv).then_some((&k[other], &v[other]))),
+        &mut attention,
+    );
+    let mut projected = [0.0; TOKEN_WIDTH];
+    project(&attention, &block.output, &mut projected);
+    for dimension in 0..TOKEN_WIDTH {
+        projected[dimension] += input[index][dimension];
+    }
+    rms_norm(&projected, &mut normalized);
+    let mut expanded = [0.0; FF_WIDTH];
+    project_wide(&normalized, &block.ff_up, &mut expanded);
+    for value in &mut expanded {
+        *value = value.max(0.0);
+    }
+    let mut reduced = [0.0; TOKEN_WIDTH];
+    project_wide(&expanded, &block.ff_down, &mut reduced);
+    for dimension in 0..TOKEN_WIDTH {
+        projected[dimension] += reduced[dimension];
+    }
+    projected
+}
+
+fn rebuild_line_index(scratch: &mut SparseScratch) {
+    for &line in &scratch.active_lines {
+        scratch.line_tokens[line].clear();
+    }
+    scratch.active_lines.clear();
+    for (token_index, &mv) in scratch.moves.iter().enumerate() {
+        for line in line_ids(mv) {
+            if scratch.line_tokens[line].is_empty() {
+                scratch.active_lines.push(line);
+            }
+            scratch.line_tokens[line].push(token_index);
+        }
     }
 }
 
@@ -900,6 +1130,30 @@ mod tests {
                 .filter_map(|(index, &stone)| aligned(candidate, stone).then_some(index))
                 .collect::<Vec<_>>();
             assert_eq!(indexed, scanned);
+        }
+    }
+
+    #[test]
+    fn incremental_dual_perspective_cache_matches_full_forward() {
+        let model = SparseTransformerModel::random(TOKEN_WIDTH, 23);
+        let mut board = Board::new();
+        let mut cache = model.cache(&board);
+        let mut scratch = SparseScratch::new();
+        for text in ["h8", "i8", "h9", "g7", "j10", "f10", "k7", "e6"] {
+            let mv = Move::parse(text).unwrap();
+            let player = board.to_move();
+            cache = model.cache_after_move(&cache, mv, player);
+            assert!(board.play(mv));
+            let full = model.evaluate(&board);
+            let incremental = model.evaluate_cache_with_scratch(&board, &cache, 1.0, &mut scratch);
+            assert_eq!(full.0.len(), incremental.0.len());
+            for ((full_move, full_probability), (cached_move, cached_probability)) in
+                full.0.iter().zip(&incremental.0)
+            {
+                assert_eq!(full_move, cached_move);
+                assert!((full_probability - cached_probability).abs() < 1e-6);
+            }
+            assert!((full.1 - incremental.1).abs() < 1e-6);
         }
     }
 }

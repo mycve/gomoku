@@ -3,5 +3,5 @@
 //! 引擎、MCTS、自博弈和训练统一使用 CPU 稀疏 Transformer。
 
 pub use crate::sparse_transformer::{
-    SparseScratch as EvalScratch, SparseTransformerModel as PolicyValueModel,
+    EvalCache, SparseScratch as EvalScratch, SparseTransformerModel as PolicyValueModel,
 };
