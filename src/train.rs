@@ -5,7 +5,9 @@ use crate::{
     selfplay::TrainStats,
     sparse_transformer::{FF_WIDTH, HEAD_WIDTH, HEADS, TOKEN_WIDTH, cells_aligned},
 };
-use candle_core::{DType, Device, Tensor, Var, backprop::GradStore};
+use candle_core::{Device, Tensor, Var, backprop::GradStore};
+#[cfg(test)]
+use candle_core::DType;
 use candle_nn::{
     ops::{log_softmax, softmax},
     optim::{AdamW, Optimizer, ParamsAdamW},
@@ -226,19 +228,7 @@ impl Replica {
     }
 
     fn backward(&self, samples: &[Sample]) -> io::Result<BatchOutput> {
-        let mut policy_losses = Vec::with_capacity(samples.len());
-        let mut value_losses = Vec::with_capacity(samples.len());
-        for sample in samples {
-            let (policy_loss, value_loss) = self.forward_sample(sample)?;
-            policy_losses.push(policy_loss);
-            value_losses.push(value_loss);
-        }
-        let policy_sum = Tensor::stack(&policy_losses, 0)
-            .and_then(|tensor| tensor.sum_all())
-            .map_err(err)?;
-        let value_sum = Tensor::stack(&value_losses, 0)
-            .and_then(|tensor| tensor.sum_all())
-            .map_err(err)?;
+        let (policy_sum, value_sum) = self.forward_batch(samples)?;
         let loss = policy_sum
             .add(&value_sum)
             .and_then(|tensor| tensor.affine(1.0 / samples.len() as f64, 0.0))
@@ -251,6 +241,104 @@ impl Replica {
         })
     }
 
+    fn forward_batch(&self, samples: &[Sample]) -> io::Result<(Tensor, Tensor)> {
+        let packed = PackedBatch::new(samples);
+        let b = samples.len();
+        let n = packed.tokens;
+        let c = packed.candidates;
+        let stone_positions = Tensor::from_vec(packed.stone_positions, b * n, &self.device)
+            .and_then(|tensor| tensor.reshape((b, n)))
+            .map_err(err)?;
+        let stone_sides = Tensor::from_vec(packed.stone_sides, b * n, &self.device)
+            .and_then(|tensor| tensor.reshape((b, n)))
+            .map_err(err)?;
+        let token_valid =
+            Tensor::from_vec(packed.token_valid, (b, n), &self.device).map_err(err)?;
+        let token_gate = token_valid.unsqueeze(2).map_err(err)?;
+        let mut tokens = self
+            .position_embedding
+            .as_tensor()
+            .index_select(&stone_positions.flatten_all().map_err(err)?, 0)
+            .and_then(|tensor| tensor.reshape((b, n, TOKEN_WIDTH)))
+            .and_then(|tensor| {
+                let stones = self
+                    .stone_embedding
+                    .as_tensor()
+                    .index_select(&stone_sides.flatten_all()?, 0)?
+                    .reshape((b, n, TOKEN_WIDTH))?;
+                tensor.add(&stones)
+            })
+            .and_then(|tensor| tensor.broadcast_mul(&token_gate))
+            .map_err(err)?;
+        let self_mask = Tensor::from_vec(packed.self_mask, (b, n, n), &self.device).map_err(err)?;
+        for block in &self.blocks {
+            tokens = transformer_block_batch(&tokens, &self_mask, &token_gate, block)?;
+        }
+
+        let legal_positions =
+            Tensor::from_vec(packed.legal_positions, b * c, &self.device).map_err(err)?;
+        let positions = self
+            .position_embedding
+            .as_tensor()
+            .index_select(&legal_positions, 0)
+            .and_then(|tensor| tensor.reshape((b, c, TOKEN_WIDTH)))
+            .map_err(err)?;
+        let cross_mask =
+            Tensor::from_vec(packed.cross_mask, (b, c, n), &self.device).map_err(err)?;
+        let query_valid =
+            Tensor::from_vec(packed.query_valid, (b, c, 1), &self.device).map_err(err)?;
+        let context = cross_attention_batch(
+            &positions,
+            &tokens,
+            &cross_mask,
+            &query_valid,
+            &self.policy_query,
+            &self.policy_key,
+            &self.policy_value,
+        )?;
+        let bias = self
+            .policy_bias
+            .as_tensor()
+            .index_select(&legal_positions, 0)
+            .and_then(|tensor| tensor.reshape((b, c)))
+            .map_err(err)?;
+        let policy_features = context.add(&positions).map_err(err)?;
+        let logits = linear_batch(&policy_features, self.policy_output.as_tensor())
+            .and_then(|tensor| tensor.reshape((b, c)).map_err(err))
+            .and_then(|tensor| tensor.add(&bias).map_err(err))?;
+        let legal_mask = Tensor::from_vec(packed.legal_mask, (b, c), &self.device).map_err(err)?;
+        let logits = logits.add(&legal_mask).map_err(err)?;
+        let targets = Tensor::from_vec(packed.policy_targets, (b, c), &self.device).map_err(err)?;
+        let policy_sum = log_softmax(&logits, 1)
+            .and_then(|log_probs| targets.mul(&log_probs))
+            .and_then(|tensor| tensor.sum_all())
+            .and_then(|tensor| tensor.affine(-1.0, 0.0))
+            .map_err(err)?;
+
+        let counts = token_valid
+            .sum_keepdim(1)
+            .and_then(|tensor| tensor.affine(1.0, 1e-6))
+            .map_err(err)?;
+        let pooled = tokens
+            .sum(1)
+            .and_then(|tensor| tensor.broadcast_div(&counts))
+            .map_err(err)?;
+        let value_logits = pooled
+            .matmul(self.value_hidden.as_tensor())
+            .and_then(|tensor| tensor.relu())
+            .and_then(|tensor| tensor.matmul(self.value_output.as_tensor()))
+            .map_err(err)?;
+        let value_targets =
+            Tensor::from_vec(packed.value_targets, (b, 3), &self.device).map_err(err)?;
+        let value_sum = log_softmax(&value_logits, 1)
+            .and_then(|log_probs| value_targets.mul(&log_probs))
+            .and_then(|tensor| tensor.sum_all())
+            .and_then(|tensor| tensor.affine(-1.0, 0.0))
+            .map_err(err)?;
+        Ok((policy_sum, value_sum))
+    }
+
+    #[cfg(test)]
     fn forward_sample(&self, sample: &Sample) -> io::Result<(Tensor, Tensor)> {
         let board = &sample.board;
         let us = board.to_move().stone();
@@ -411,6 +499,7 @@ impl Replica {
     }
 }
 
+#[cfg(test)]
 fn transformer_block(tokens: &Tensor, mask: &Tensor, block: &TrainBlock) -> io::Result<Tensor> {
     let normalized = rms_norm(tokens)?;
     let q = heads(&normalized.matmul(block.q.as_tensor()).map_err(err)?)?;
@@ -442,6 +531,50 @@ fn transformer_block(tokens: &Tensor, mask: &Tensor, block: &TrainBlock) -> io::
     residual.add(&ff).map_err(err)
 }
 
+fn transformer_block_batch(
+    tokens: &Tensor,
+    mask: &Tensor,
+    token_gate: &Tensor,
+    block: &TrainBlock,
+) -> io::Result<Tensor> {
+    let b = tokens.dim(0).map_err(err)?;
+    let n = tokens.dim(1).map_err(err)?;
+    let normalized = rms_norm_batch(tokens)?;
+    let q = heads_batch(&linear_batch(&normalized, block.q.as_tensor())?)?;
+    let k = heads_batch(&linear_batch(&normalized, block.k.as_tensor())?)?;
+    let v = heads_batch(&linear_batch(&normalized, block.v.as_tensor())?)?;
+    let k_t = k
+        .transpose(2, 3)
+        .and_then(|tensor| tensor.contiguous())
+        .map_err(err)?;
+    let mask = mask.unsqueeze(1).map_err(err)?;
+    let scores = q
+        .matmul(&k_t)
+        .and_then(|tensor| tensor.affine((HEAD_WIDTH as f64).sqrt().recip(), 0.0))
+        .and_then(|tensor| tensor.broadcast_add(&mask))
+        .map_err(err)?;
+    let context = softmax(&scores, 3)
+        .and_then(|attention| attention.matmul(&v))
+        .and_then(|tensor| tensor.transpose(1, 2))
+        .and_then(|tensor| tensor.contiguous())
+        .and_then(|tensor| tensor.reshape((b, n, TOKEN_WIDTH)))
+        .and_then(|tensor| tensor.broadcast_mul(token_gate))
+        .map_err(err)?;
+    let residual = tokens
+        .add(&linear_batch(&context, block.output.as_tensor())?)
+        .and_then(|tensor| tensor.broadcast_mul(token_gate))
+        .map_err(err)?;
+    let ff = linear_batch(&rms_norm_batch(&residual)?, block.ff_up.as_tensor())?
+        .relu()
+        .map_err(err)?;
+    let ff = linear_batch(&ff, block.ff_down.as_tensor())?;
+    residual
+        .add(&ff)
+        .and_then(|tensor| tensor.broadcast_mul(token_gate))
+        .map_err(err)
+}
+
+#[cfg(test)]
 fn cross_attention(
     positions: &Tensor,
     tokens: &Tensor,
@@ -472,6 +605,41 @@ fn cross_attention(
         .map_err(err)
 }
 
+fn cross_attention_batch(
+    positions: &Tensor,
+    tokens: &Tensor,
+    mask: &Tensor,
+    query_valid: &Tensor,
+    query: &Var,
+    key: &Var,
+    value: &Var,
+) -> io::Result<Tensor> {
+    let b = positions.dim(0).map_err(err)?;
+    let c = positions.dim(1).map_err(err)?;
+    let q = heads_batch(&linear_batch(positions, query.as_tensor())?)?;
+    let k = heads_batch(&linear_batch(tokens, key.as_tensor())?)?;
+    let v = heads_batch(&linear_batch(tokens, value.as_tensor())?)?;
+    let k_t = k
+        .transpose(2, 3)
+        .and_then(|tensor| tensor.contiguous())
+        .map_err(err)?;
+    let mask = mask.unsqueeze(1).map_err(err)?;
+    let query_valid = query_valid.unsqueeze(1).map_err(err)?;
+    let scores = q
+        .matmul(&k_t)
+        .and_then(|tensor| tensor.affine((HEAD_WIDTH as f64).sqrt().recip(), 0.0))
+        .and_then(|tensor| tensor.broadcast_add(&mask))
+        .map_err(err)?;
+    softmax(&scores, 3)
+        .and_then(|attention| attention.broadcast_mul(&query_valid))
+        .and_then(|attention| attention.matmul(&v))
+        .and_then(|tensor| tensor.transpose(1, 2))
+        .and_then(|tensor| tensor.contiguous())
+        .and_then(|tensor| tensor.reshape((b, c, TOKEN_WIDTH)))
+        .map_err(err)
+}
+
+#[cfg(test)]
 fn heads(tensor: &Tensor) -> io::Result<Tensor> {
     tensor
         .reshape((tensor.dim(0).map_err(err)?, HEADS, HEAD_WIDTH))
@@ -480,6 +648,32 @@ fn heads(tensor: &Tensor) -> io::Result<Tensor> {
         .map_err(err)
 }
 
+fn heads_batch(tensor: &Tensor) -> io::Result<Tensor> {
+    tensor
+        .reshape((
+            tensor.dim(0).map_err(err)?,
+            tensor.dim(1).map_err(err)?,
+            HEADS,
+            HEAD_WIDTH,
+        ))
+        .and_then(|tensor| tensor.transpose(1, 2))
+        .and_then(|tensor| tensor.contiguous())
+        .map_err(err)
+}
+
+fn linear_batch(tensor: &Tensor, weight: &Tensor) -> io::Result<Tensor> {
+    let b = tensor.dim(0).map_err(err)?;
+    let n = tensor.dim(1).map_err(err)?;
+    let input = tensor.dim(2).map_err(err)?;
+    let output = weight.dim(1).map_err(err)?;
+    tensor
+        .reshape((b * n, input))
+        .and_then(|tensor| tensor.matmul(weight))
+        .and_then(|tensor| tensor.reshape((b, n, output)))
+        .map_err(err)
+}
+
+#[cfg(test)]
 fn rms_norm(tensor: &Tensor) -> io::Result<Tensor> {
     let rms = tensor
         .sqr()
@@ -490,6 +684,111 @@ fn rms_norm(tensor: &Tensor) -> io::Result<Tensor> {
     tensor.broadcast_div(&rms).map_err(err)
 }
 
+fn rms_norm_batch(tensor: &Tensor) -> io::Result<Tensor> {
+    let rms = tensor
+        .sqr()
+        .and_then(|tensor| tensor.mean_keepdim(2))
+        .and_then(|tensor| tensor.affine(1.0, 1e-6))
+        .and_then(|tensor| tensor.sqrt())
+        .map_err(err)?;
+    tensor.broadcast_div(&rms).map_err(err)
+}
+
+struct PackedBatch {
+    tokens: usize,
+    candidates: usize,
+    stone_positions: Vec<u32>,
+    stone_sides: Vec<u32>,
+    token_valid: Vec<f32>,
+    self_mask: Vec<f32>,
+    legal_positions: Vec<u32>,
+    legal_mask: Vec<f32>,
+    cross_mask: Vec<f32>,
+    query_valid: Vec<f32>,
+    policy_targets: Vec<f32>,
+    value_targets: Vec<f32>,
+}
+
+impl PackedBatch {
+    fn new(samples: &[Sample]) -> Self {
+        let tokens = samples
+            .iter()
+            .map(|sample| sample.board.move_count())
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let legal = samples
+            .iter()
+            .map(|sample| sample.board.search_candidates())
+            .collect::<Vec<_>>();
+        let candidates = legal.iter().map(Vec::len).max().unwrap_or(0).max(1);
+        let b = samples.len();
+        let mut packed = Self {
+            tokens,
+            candidates,
+            stone_positions: vec![0; b * tokens],
+            stone_sides: vec![0; b * tokens],
+            token_valid: vec![0.0; b * tokens],
+            self_mask: vec![-1e9; b * tokens * tokens],
+            legal_positions: vec![0; b * candidates],
+            legal_mask: vec![-1e9; b * candidates],
+            cross_mask: vec![-1e9; b * candidates * tokens],
+            query_valid: vec![0.0; b * candidates],
+            policy_targets: vec![0.0; b * candidates],
+            value_targets: vec![0.0; b * 3],
+        };
+        for (row, sample) in samples.iter().enumerate() {
+            let us = sample.board.to_move().stone();
+            let stones = sample
+                .board
+                .cells()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &stone)| (stone != 0).then_some((Move(index), stone)))
+                .collect::<Vec<_>>();
+            for (index, &(mv, stone)) in stones.iter().enumerate() {
+                let offset = row * tokens + index;
+                packed.stone_positions[offset] = mv.0 as u32;
+                packed.stone_sides[offset] = u32::from(stone != us);
+                packed.token_valid[offset] = 1.0;
+            }
+            for (query, &(left, _)) in stones.iter().enumerate() {
+                for (key, &(right, _)) in stones.iter().enumerate() {
+                    if cells_aligned(left, right) {
+                        packed.self_mask[(row * tokens + query) * tokens + key] = 0.0;
+                    }
+                }
+            }
+            let targets = normalized_policy_target(&legal[row], &sample.policy);
+            for (index, (&mv, target)) in legal[row].iter().zip(targets).enumerate() {
+                let offset = row * candidates + index;
+                packed.legal_positions[offset] = mv.0 as u32;
+                packed.legal_mask[offset] = 0.0;
+                packed.policy_targets[offset] = target;
+                let mut any = false;
+                for (stone_index, &(stone, _)) in stones.iter().enumerate() {
+                    if cells_aligned(mv, stone) {
+                        packed.cross_mask[(row * candidates + index) * tokens + stone_index] = 0.0;
+                        any = true;
+                    }
+                }
+                packed.query_valid[offset] = f32::from(any);
+            }
+            let value = row * 3;
+            packed.value_targets[value
+                + if sample.value > 0.5 {
+                    0
+                } else if sample.value < -0.5 {
+                    2
+                } else {
+                    1
+                }] = 1.0;
+        }
+        packed
+    }
+}
+
+#[cfg(test)]
 fn self_attention_mask(moves: &[Move]) -> Vec<f32> {
     moves
         .iter()
@@ -505,6 +804,7 @@ fn self_attention_mask(moves: &[Move]) -> Vec<f32> {
         .collect()
 }
 
+#[cfg(test)]
 fn cross_attention_mask(legal: &[Move], stones: &[Move]) -> (Vec<f32>, Vec<f32>) {
     let mut mask = Vec::with_capacity(legal.len() * stones.len());
     let mut valid = Vec::with_capacity(legal.len());
@@ -605,7 +905,7 @@ mod tests {
             generation: 0,
         };
         #[cfg(target_os = "macos")]
-        let stats = train(&mut model, &[sample], 1, 1e-3, 1, 0).unwrap();
+        let stats = train(&mut model, &vec![sample.clone(); 32], 1, 1e-3, 32, 0).unwrap();
         #[cfg(not(target_os = "macos"))]
         let stats = TrainingSession::on_device(&model, None, &Device::Cpu, 1e-3)
             .and_then(|mut session| {
@@ -643,5 +943,43 @@ mod tests {
         let (policy_loss, _) = replica.forward_sample(&sample).unwrap();
         let policy_loss = policy_loss.to_scalar::<f32>().unwrap();
         assert!((policy_loss + probability.ln()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn padded_batch_matches_individual_graphs() {
+        let model = PolicyValueModel::random(TOKEN_WIDTH, 23);
+        let mut first = Board::new();
+        assert!(first.play(Move::new(7, 7).unwrap()));
+        let mut second = first.clone();
+        assert!(second.play(Move::new(7, 8).unwrap()));
+        assert!(second.play(Move::new(8, 8).unwrap()));
+        let samples = vec![
+            Sample {
+                board: first,
+                policy: vec![(Move::new(0, 1).unwrap(), 1.0)],
+                value: 0.0,
+                generation: 0,
+            },
+            Sample {
+                board: second,
+                policy: vec![
+                    (Move::new(8, 7).unwrap(), 0.7),
+                    (Move::new(6, 7).unwrap(), 0.3),
+                ],
+                value: 1.0,
+                generation: 0,
+            },
+        ];
+        let replica = Replica::new(&model, &Device::Cpu).unwrap();
+        let (batch_policy, batch_value) = replica.forward_batch(&samples).unwrap();
+        let mut policy = 0.0;
+        let mut value = 0.0;
+        for sample in &samples {
+            let (sample_policy, sample_value) = replica.forward_sample(sample).unwrap();
+            policy += sample_policy.to_scalar::<f32>().unwrap();
+            value += sample_value.to_scalar::<f32>().unwrap();
+        }
+        assert!((batch_policy.to_scalar::<f32>().unwrap() - policy).abs() < 1e-4);
+        assert!((batch_value.to_scalar::<f32>().unwrap() - value).abs() < 1e-4);
     }
 }
