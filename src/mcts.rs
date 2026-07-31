@@ -296,6 +296,7 @@ impl SplitMix64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::CELL_COUNT;
 
     #[test]
     fn root_noise_is_normalized_and_seeded() {
@@ -330,7 +331,7 @@ mod tests {
             one.iter().filter(|candidate| candidate.visits > 0).count(),
             1
         );
-        assert_eq!(one.len(), 24);
+        assert_eq!(one.len(), CELL_COUNT - 1);
 
         let full = search(
             &board,

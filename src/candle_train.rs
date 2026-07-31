@@ -534,7 +534,7 @@ mod tests {
     use crate::game::{Board, Move};
 
     #[test]
-    fn packing_uses_search_candidates_without_changing_rule_legality() {
+    fn packing_uses_all_rule_legal_moves() {
         let mut board = Board::new();
         let occupied = Move::new(7, 7).unwrap();
         assert!(board.play(occupied));
@@ -549,8 +549,8 @@ mod tests {
 
         assert_eq!(packed.policy_masks[occupied.0], -1e9);
         assert_eq!(packed.local_legal_mask[occupied.0], 0.0);
-        assert_eq!(packed.policy_masks[corner.0], -1e9);
-        assert_eq!(packed.local_legal_mask[corner.0], 0.0);
+        assert_eq!(packed.policy_masks[corner.0], 0.0);
+        assert_eq!(packed.local_legal_mask[corner.0], 1.0);
         assert_eq!(packed.policy_masks[nearby.0], 0.0);
         assert_eq!(packed.local_legal_mask[nearby.0], 1.0);
         assert_eq!(packed.policy_targets[nearby.0], 1.0);
@@ -576,7 +576,7 @@ mod tests {
         assert!(model.policy_local.iter().any(|&weight| weight != 0.0));
         assert_ne!(model.local_axis_embedding, before_local);
         let (policy, value) = model.evaluate(&Board::new());
-        assert_eq!(policy.len(), 1);
+        assert_eq!(policy.len(), CELL_COUNT);
         assert!(
             policy
                 .iter()
