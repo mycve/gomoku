@@ -164,6 +164,10 @@ MCTS 默认不启用该缓存。
 
 在线模型执行梯度更新，EMA 模型默认按每个优化器 step 折算 `ema_decay = 0.999`，
 并专门提供给自博弈 Actor、检查点和 Arena；Best 仍只由 Arena 晋级替换。
+训练使用 Candle GPU 计算图：Linux 选择指定编号的 CUDA 设备，macOS 选择对应 Metal
+设备；CUDA 初始化失败会直接报错，不再静默退回 CPU。棋子 Token 按样本保持变长，
+同行、同列和双对角线掩码与 CPU 推理一致；棋子/位置嵌入、两层 Q/K/V、Attention
+输出、FFN、Policy 和 WDL 全部进入 AdamW 与 GPU EMA。
 新训练没有 EMA 检查点时，第一次完整更新会先把在线模型完整复制到 EMA，后续才启用
 指数平滑；恢复已有 `ema.safetensors` 时直接延续历史 EMA，不会重新覆盖。
 输入由执子方嵌入和精确位置嵌入组成。经验池抽样时会随机应用正方形的 8 种旋转/镜像对称变换，

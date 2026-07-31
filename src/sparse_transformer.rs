@@ -97,9 +97,6 @@ pub struct SparseScratch {
     v: Vec<[f32; TOKEN_WIDTH]>,
     next: Vec<[f32; TOKEN_WIDTH]>,
     policy_logits: Vec<f32>,
-    policy_contexts: Vec<[f32; TOKEN_WIDTH]>,
-    value_features: [f32; TOKEN_WIDTH],
-    value_probabilities: [f32; 3],
     line_tokens: Vec<Vec<usize>>,
     active_lines: Vec<usize>,
 }
@@ -135,9 +132,6 @@ impl Default for SparseScratch {
             v: Vec::with_capacity(CELL_COUNT),
             next: Vec::with_capacity(CELL_COUNT),
             policy_logits: Vec::with_capacity(CELL_COUNT),
-            policy_contexts: Vec::with_capacity(CELL_COUNT),
-            value_features: [0.0; TOKEN_WIDTH],
-            value_probabilities: [0.0; 3],
             line_tokens: (0..LINE_COUNT).map(|_| Vec::with_capacity(15)).collect(),
             active_lines: Vec::with_capacity(LINE_COUNT),
         }
@@ -373,6 +367,10 @@ impl SparseTransformerModel {
         }
     }
 
+    pub(crate) fn refresh_runtime_caches(&mut self) {
+        self.rebuild_query_cache();
+    }
+
     fn validate(&self) -> io::Result<()> {
         let square = TOKEN_WIDTH * TOKEN_WIDTH;
         let valid = self.stone_embedding.len() == 2 * TOKEN_WIDTH
@@ -588,9 +586,7 @@ impl SparseTransformerModel {
         }
         let legal = board.search_candidates();
         scratch.policy_logits.clear();
-        scratch.policy_contexts.clear();
         scratch.policy_logits.reserve(legal.len());
-        scratch.policy_contexts.reserve(legal.len());
         let scale = (HEAD_WIDTH as f32).sqrt().recip();
         for &mv in &legal {
             let position = array_at(&self.position_embedding, mv.0);
@@ -612,7 +608,6 @@ impl SparseTransformerModel {
             scratch
                 .policy_logits
                 .push(dot(&context, &self.policy_output) + self.policy_bias[mv.0]);
-            scratch.policy_contexts.push(context);
         }
         softmax_moves(&legal, &scratch.policy_logits, temperature)
     }
@@ -627,74 +622,24 @@ impl SparseTransformerModel {
                 pooled[dimension] += token[dimension] / scratch.tokens.len() as f32;
             }
         }
-        project(&pooled, &self.value_hidden, &mut scratch.value_features);
-        for value in &mut scratch.value_features {
+        let mut value_features = [0.0; TOKEN_WIDTH];
+        project(&pooled, &self.value_hidden, &mut value_features);
+        for value in &mut value_features {
             *value = value.max(0.0);
         }
         let mut logits = [0.0; 3];
         for (output, logit) in logits.iter_mut().enumerate() {
             for dimension in 0..TOKEN_WIDTH {
-                *logit +=
-                    scratch.value_features[dimension] * self.value_output[dimension * 3 + output];
+                *logit += value_features[dimension] * self.value_output[dimension * 3 + output];
             }
         }
         let maximum = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        scratch.value_probabilities = logits.map(|value| (value - maximum).exp());
-        let sum = scratch.value_probabilities.iter().sum::<f32>();
-        for probability in &mut scratch.value_probabilities {
+        let mut probabilities = logits.map(|value| (value - maximum).exp());
+        let sum = probabilities.iter().sum::<f32>();
+        for probability in &mut probabilities {
             *probability /= sum;
         }
-        scratch.value_probabilities[0] - scratch.value_probabilities[2]
-    }
-
-    /// CPU 友好的在线头部更新。Transformer 主体保持稳定，Policy/Value 输出头参与 SGD；
-    /// 后续训练内核会沿同一接口逐步加入稀疏 Attention 的完整反向传播。
-    pub(crate) fn train_heads(
-        &mut self,
-        board: &Board,
-        target_policy: &[(Move, f32)],
-        target_value: f32,
-        learning_rate: f32,
-        scratch: &mut SparseScratch,
-    ) -> (f32, f32) {
-        let (policy, _) = self.evaluate_with_scratch(board, 1.0, scratch);
-        let target_sum = target_policy
-            .iter()
-            .map(|(_, probability)| probability.max(0.0))
-            .sum::<f32>()
-            .max(1e-12);
-        let mut policy_loss = 0.0;
-        for (index, &(mv, probability)) in policy.iter().enumerate() {
-            let target = target_policy
-                .iter()
-                .find_map(|&(target_move, value)| (target_move == mv).then_some(value.max(0.0)))
-                .unwrap_or(0.0)
-                / target_sum;
-            policy_loss -= target * probability.max(1e-12).ln();
-            let gradient = probability - target;
-            for dimension in 0..TOKEN_WIDTH {
-                self.policy_output[dimension] -=
-                    learning_rate * gradient * scratch.policy_contexts[index][dimension];
-            }
-            self.policy_bias[mv.0] -= learning_rate * gradient;
-        }
-        let target_wdl = if target_value > 0.5 {
-            [1.0, 0.0, 0.0]
-        } else if target_value < -0.5 {
-            [0.0, 0.0, 1.0]
-        } else {
-            [0.0, 1.0, 0.0]
-        };
-        let mut value_loss = 0.0;
-        for output in 0..3 {
-            value_loss -= target_wdl[output] * scratch.value_probabilities[output].max(1e-12).ln();
-            let gradient = scratch.value_probabilities[output] - target_wdl[output];
-            for dimension in 0..TOKEN_WIDTH {
-                self.value_output[dimension * 3 + output] -=
-                    learning_rate * gradient * scratch.value_features[dimension];
-            }
-        }
-        (policy_loss, value_loss)
+        probabilities[0] - probabilities[2]
     }
 }
 
@@ -874,6 +819,10 @@ fn attend_all_heads<'a>(
 
 fn aligned(left: Move, right: Move) -> bool {
     ALIGNED_MASKS[left.0][right.0 / 64] & (1_u64 << (right.0 % 64)) != 0
+}
+
+pub(crate) fn cells_aligned(left: Move, right: Move) -> bool {
+    aligned(left, right)
 }
 
 fn line_ids(mv: Move) -> [usize; 4] {
