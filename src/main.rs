@@ -8,6 +8,7 @@ use gomoku::{
     model::PolicyValueModel,
     replay,
     selfplay::arena,
+    sparse_transformer::{SparseScratch, SparseTransformerModel},
 };
 use std::{
     io::{self, Write},
@@ -34,6 +35,8 @@ enum Command {
     AzSearch(AzSearchArgs),
     /// 测试固定局面的搜索速度。
     AzBench(AzBenchArgs),
+    /// 测试纯 CPU 稀疏 Transformer 的固定局面推理速度。
+    AzSparseBench(AzSparseBenchArgs),
     /// 测试回放样本训练速度。
     AzTrainBench(AzTrainBenchArgs),
     /// 按 TOML 配置持续执行自博弈训练。
@@ -78,6 +81,15 @@ struct AzBenchArgs {
     repeat: usize,
     #[arg(default_value_t = 1.5)]
     cpuct: f32,
+    moves: Vec<String>,
+}
+
+#[derive(Args)]
+struct AzSparseBenchArgs {
+    #[arg(default_value_t = 10_000)]
+    repeat: usize,
+    #[arg(default_value_t = 20260730)]
+    seed: u64,
     moves: Vec<String>,
 }
 
@@ -195,6 +207,26 @@ fn main() -> io::Result<()> {
             println!(
                 "speed    : {:.0} simulations/s",
                 total as f64 / seconds.max(1e-9)
+            );
+        }
+        Some(Command::AzSparseBench(args)) => {
+            let board = board_from_moves(&args.moves)?;
+            let model = SparseTransformerModel::random(args.seed);
+            let mut scratch = SparseScratch::default();
+            let _ = model.evaluate(&board, &mut scratch);
+            let started = Instant::now();
+            for _ in 0..args.repeat {
+                let _ = model.evaluate(&board, &mut scratch);
+            }
+            let seconds = started.elapsed().as_secs_f64();
+            println!(
+                "sparse   : tokens={} legal={} layers=2 width=32 heads=2 elapsed={seconds:.3}s",
+                board.move_count(),
+                board.search_candidates().len()
+            );
+            println!(
+                "speed    : {:.0} evaluations/s",
+                args.repeat as f64 / seconds.max(1e-9)
             );
         }
         Some(Command::AzTrainBench(args)) => {

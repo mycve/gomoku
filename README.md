@@ -13,6 +13,7 @@ cargo run -- az-loop                 # 首次生成 gomoku.azloop.toml
 cargo run -- az-loop --target-update 10
 cargo run -- az-search model.safetensors 3000 1.5 h8 h9 i8
 cargo run -- az-bench model.safetensors 3000 20
+cargo run -- az-sparse-bench 10000 20260730 h8 i8 h9
 cargo run -- az-train-bench
 cargo run -- az-eval-best best.safetensors 3000 --human-side black
 cargo run -- az-arena-best model.safetensors best.safetensors 100 3000

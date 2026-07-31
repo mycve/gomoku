@@ -9,3 +9,4 @@ pub mod model;
 pub mod profile;
 pub mod replay;
 pub mod selfplay;
+pub mod sparse_transformer;
