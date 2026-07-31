@@ -3,7 +3,7 @@ use std::fmt;
 
 pub const BOARD_SIZE: usize = 15;
 pub const CELL_COUNT: usize = BOARD_SIZE * BOARD_SIZE;
-pub const SEARCH_CANDIDATE_RADIUS: i32 = 2;
+pub const SEARCH_CANDIDATE_RADIUS: i32 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Player {
@@ -344,12 +344,12 @@ mod tests {
     }
 
     #[test]
-    fn search_candidates_use_explicit_radius_two_without_changing_rules() {
+    fn search_candidates_use_explicit_radius_three_without_changing_rules() {
         let board = Board::new();
         assert_eq!(board.search_candidates(), vec![Move::new(7, 7).unwrap()]);
         let mut board = board;
         assert!(board.play(Move::new(7, 7).unwrap()));
-        assert_eq!(board.search_candidates().len(), 24);
+        assert_eq!(board.search_candidates().len(), 48);
         assert!(
             !board
                 .search_candidates()

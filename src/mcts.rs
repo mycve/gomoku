@@ -330,7 +330,7 @@ mod tests {
             one.iter().filter(|candidate| candidate.visits > 0).count(),
             1
         );
-        assert_eq!(one.len(), 24);
+        assert_eq!(one.len(), 48);
 
         let full = search(
             &board,
