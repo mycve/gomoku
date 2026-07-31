@@ -8,6 +8,59 @@ pub const HEADS: usize = 2;
 pub const HEAD_WIDTH: usize = TOKEN_WIDTH / HEADS;
 pub const LAYERS: usize = 2;
 pub const FF_WIDTH: usize = 64;
+const LINE_COUNT: usize = 15 + 15 + 29 + 29;
+const COLUMN_OFFSET: usize = 15;
+const DIAGONAL_OFFSET: usize = 30;
+const ANTI_DIAGONAL_OFFSET: usize = 59;
+const CELL_LINES: [[u8; 4]; CELL_COUNT] = build_cell_lines();
+const ALIGNED_MASKS: [[u64; 4]; CELL_COUNT] = build_aligned_masks();
+
+const fn build_cell_lines() -> [[u8; 4]; CELL_COUNT] {
+    let mut lines = [[0; 4]; CELL_COUNT];
+    let mut cell = 0;
+    while cell < CELL_COUNT {
+        let row = cell / 15;
+        let col = cell % 15;
+        lines[cell] = [
+            row as u8,
+            (COLUMN_OFFSET + col) as u8,
+            (DIAGONAL_OFFSET + row + 14 - col) as u8,
+            (ANTI_DIAGONAL_OFFSET + row + col) as u8,
+        ];
+        cell += 1;
+    }
+    lines
+}
+
+const fn build_aligned_masks() -> [[u64; 4]; CELL_COUNT] {
+    let mut masks = [[0; 4]; CELL_COUNT];
+    let mut left = 0;
+    while left < CELL_COUNT {
+        let mut right = 0;
+        while right < CELL_COUNT {
+            let mut left_axis = 0;
+            let mut is_aligned = false;
+            while left_axis < 4 {
+                let mut right_axis = 0;
+                while right_axis < 4 {
+                    if CELL_LINES[left][left_axis] == CELL_LINES[right][right_axis]
+                        && left_axis == right_axis
+                    {
+                        is_aligned = true;
+                    }
+                    right_axis += 1;
+                }
+                left_axis += 1;
+            }
+            if is_aligned {
+                masks[left][right / 64] |= 1_u64 << (right % 64);
+            }
+            right += 1;
+        }
+        left += 1;
+    }
+    masks
+}
 
 #[derive(Clone)]
 pub(crate) struct Block {
@@ -35,7 +88,6 @@ pub struct SparseTransformerModel {
     pub(crate) value_output: Vec<f32>,
 }
 
-#[derive(Default)]
 pub struct SparseScratch {
     moves: Vec<Move>,
     tokens: Vec<[f32; TOKEN_WIDTH]>,
@@ -48,6 +100,28 @@ pub struct SparseScratch {
     policy_contexts: Vec<[f32; TOKEN_WIDTH]>,
     value_features: [f32; TOKEN_WIDTH],
     value_probabilities: [f32; 3],
+    line_tokens: Vec<Vec<usize>>,
+    active_lines: Vec<usize>,
+}
+
+impl Default for SparseScratch {
+    fn default() -> Self {
+        Self {
+            moves: Vec::with_capacity(CELL_COUNT),
+            tokens: Vec::with_capacity(CELL_COUNT),
+            normalized: Vec::with_capacity(CELL_COUNT),
+            q: Vec::with_capacity(CELL_COUNT),
+            k: Vec::with_capacity(CELL_COUNT),
+            v: Vec::with_capacity(CELL_COUNT),
+            next: Vec::with_capacity(CELL_COUNT),
+            policy_logits: Vec::with_capacity(CELL_COUNT),
+            policy_contexts: Vec::with_capacity(CELL_COUNT),
+            value_features: [0.0; TOKEN_WIDTH],
+            value_probabilities: [0.0; 3],
+            line_tokens: (0..LINE_COUNT).map(|_| Vec::with_capacity(15)).collect(),
+            active_lines: Vec::with_capacity(LINE_COUNT),
+        }
+    }
 }
 
 impl SparseScratch {
@@ -331,6 +405,10 @@ impl SparseTransformerModel {
     fn encode_stones(&self, board: &Board, scratch: &mut SparseScratch) {
         scratch.moves.clear();
         scratch.tokens.clear();
+        for &line in &scratch.active_lines {
+            scratch.line_tokens[line].clear();
+        }
+        scratch.active_lines.clear();
         let us = board.to_move().stone();
         for (index, &stone) in board.cells().iter().enumerate() {
             if stone == 0 {
@@ -344,6 +422,13 @@ impl SparseTransformerModel {
             }
             scratch.moves.push(Move(index));
             scratch.tokens.push(token);
+            let token_index = scratch.tokens.len() - 1;
+            for line in line_ids(Move(index)) {
+                if scratch.line_tokens[line].is_empty() {
+                    scratch.active_lines.push(line);
+                }
+                scratch.line_tokens[line].push(token_index);
+            }
         }
     }
 
@@ -369,21 +454,16 @@ impl SparseTransformerModel {
             let position = array_at(&self.position_embedding, mv.0);
             let query = array_at(&self.projected_policy_query, mv.0);
             let mut context = [0.0; TOKEN_WIDTH];
-            for head in 0..HEADS {
-                attend(
-                    query,
-                    head,
-                    scale,
-                    scratch
-                        .moves
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, &stone)| {
-                            aligned(mv, stone).then_some((&scratch.k[index], &scratch.v[index]))
-                        }),
-                    &mut context,
-                );
-            }
+            let lines = line_ids(mv);
+            attend_all_heads(
+                query,
+                scale,
+                lines
+                    .iter()
+                    .flat_map(|&line| scratch.line_tokens[line].iter())
+                    .map(|&index| (&scratch.k[index], &scratch.v[index])),
+                &mut context,
+            );
             for dimension in 0..TOKEN_WIDTH {
                 context[dimension] += position[dimension];
             }
@@ -492,18 +572,14 @@ fn apply_block(block: &Block, scratch: &mut SparseScratch) {
     let scale = (HEAD_WIDTH as f32).sqrt().recip();
     for index in 0..count {
         let mut attention = [0.0; TOKEN_WIDTH];
-        for head in 0..HEADS {
-            attend(
-                &scratch.q[index],
-                head,
-                scale,
-                scratch.moves.iter().enumerate().filter_map(|(other, &mv)| {
-                    aligned(scratch.moves[index], mv)
-                        .then_some((&scratch.k[other], &scratch.v[other]))
-                }),
-                &mut attention,
-            );
-        }
+        attend_all_heads(
+            &scratch.q[index],
+            scale,
+            scratch.moves.iter().enumerate().filter_map(|(other, &mv)| {
+                aligned(scratch.moves[index], mv).then_some((&scratch.k[other], &scratch.v[other]))
+            }),
+            &mut attention,
+        );
         let mut projected = [0.0; TOKEN_WIDTH];
         project(&attention, &block.output, &mut projected);
         for dimension in 0..TOKEN_WIDTH {
@@ -526,45 +602,52 @@ fn apply_block(block: &Block, scratch: &mut SparseScratch) {
     std::mem::swap(&mut scratch.tokens, &mut scratch.next);
 }
 
-fn attend<'a>(
+fn attend_all_heads<'a>(
     query: &[f32; TOKEN_WIDTH],
-    head: usize,
     scale: f32,
     keys: impl Iterator<Item = (&'a [f32; TOKEN_WIDTH], &'a [f32; TOKEN_WIDTH])>,
     output: &mut [f32; TOKEN_WIDTH],
 ) {
-    let start = head * HEAD_WIDTH;
-    let end = start + HEAD_WIDTH;
-    let mut maximum = f32::NEG_INFINITY;
-    let mut denominator = 0.0;
+    let mut maximum = [f32::NEG_INFINITY; HEADS];
+    let mut denominator = [0.0; HEADS];
     for (key, value) in keys {
-        let score = dot(&query[start..end], &key[start..end]) * scale;
-        if score <= maximum {
-            let weight = (score - maximum).exp();
-            denominator += weight;
-            for dimension in start..end {
-                output[dimension] += weight * value[dimension];
+        for head in 0..HEADS {
+            let start = head * HEAD_WIDTH;
+            let end = start + HEAD_WIDTH;
+            let score = dot(&query[start..end], &key[start..end]) * scale;
+            if score <= maximum[head] {
+                let weight = (score - maximum[head]).exp();
+                denominator[head] += weight;
+                for dimension in start..end {
+                    output[dimension] += weight * value[dimension];
+                }
+            } else {
+                let rescale = (maximum[head] - score).exp();
+                denominator[head] = denominator[head] * rescale + 1.0;
+                for dimension in start..end {
+                    output[dimension] = output[dimension] * rescale + value[dimension];
+                }
+                maximum[head] = score;
             }
-        } else {
-            let rescale = (maximum - score).exp();
-            denominator = denominator * rescale + 1.0;
-            for dimension in start..end {
-                output[dimension] = output[dimension] * rescale + value[dimension];
-            }
-            maximum = score;
         }
     }
-    if denominator > 0.0 {
-        for value in &mut output[start..end] {
-            *value /= denominator;
+    for head in 0..HEADS {
+        if denominator[head] > 0.0 {
+            let start = head * HEAD_WIDTH;
+            let end = start + HEAD_WIDTH;
+            for value in &mut output[start..end] {
+                *value /= denominator[head];
+            }
         }
     }
 }
 
 fn aligned(left: Move, right: Move) -> bool {
-    left.row() == right.row()
-        || left.col() == right.col()
-        || left.row().abs_diff(right.row()) == left.col().abs_diff(right.col())
+    ALIGNED_MASKS[left.0][right.0 / 64] & (1_u64 << (right.0 % 64)) != 0
+}
+
+fn line_ids(mv: Move) -> [usize; 4] {
+    CELL_LINES[mv.0].map(usize::from)
 }
 
 fn array_at(values: &[f32], index: usize) -> &[f32; TOKEN_WIDTH] {
@@ -578,12 +661,77 @@ fn project(input: &[f32; TOKEN_WIDTH], weights: &[f32], output: &mut [f32; TOKEN
 }
 
 fn project_wide(input: &[f32], weights: &[f32], output: &mut [f32]) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if output.len().is_multiple_of(4) && output.len() <= 64 {
+            // SAFETY: AArch64 guarantees NEON; slice bounds and output width are checked here.
+            unsafe { project_wide_neon(input, weights, output) };
+            return;
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if output.len().is_multiple_of(8)
+            && output.len() <= 64
+            && std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma")
+        {
+            // SAFETY: Runtime feature detection and slice bounds satisfy the kernel contract.
+            unsafe { project_wide_avx2(input, weights, output) };
+            return;
+        }
+    }
+    project_wide_scalar(input, weights, output);
+}
+
+fn project_wide_scalar(input: &[f32], weights: &[f32], output: &mut [f32]) {
     output.fill(0.0);
     for (input_index, &value) in input.iter().enumerate() {
         let row = &weights[input_index * output.len()..(input_index + 1) * output.len()];
         for output_index in 0..output.len() {
             output[output_index] += value * row[output_index];
         }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn project_wide_neon(input: &[f32], weights: &[f32], output: &mut [f32]) {
+    use std::arch::aarch64::{float32x4_t, vdupq_n_f32, vfmaq_f32, vld1q_f32, vst1q_f32};
+    let chunks = output.len() / 4;
+    let mut sums: [float32x4_t; 16] = [vdupq_n_f32(0.0); 16];
+    for (input_index, &value) in input.iter().enumerate() {
+        let scalar = vdupq_n_f32(value);
+        let row = input_index * output.len();
+        for (chunk, sum) in sums[..chunks].iter_mut().enumerate() {
+            let weight = unsafe { vld1q_f32(weights.as_ptr().add(row + chunk * 4)) };
+            *sum = vfmaq_f32(*sum, scalar, weight);
+        }
+    }
+    for (chunk, sum) in sums[..chunks].iter().enumerate() {
+        unsafe { vst1q_f32(output.as_mut_ptr().add(chunk * 4), *sum) };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn project_wide_avx2(input: &[f32], weights: &[f32], output: &mut [f32]) {
+    use std::arch::x86_64::{
+        __m256, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_set1_ps, _mm256_setzero_ps,
+        _mm256_storeu_ps,
+    };
+    let chunks = output.len() / 8;
+    let mut sums: [__m256; 8] = [_mm256_setzero_ps(); 8];
+    for (input_index, &value) in input.iter().enumerate() {
+        let scalar = _mm256_set1_ps(value);
+        let row = input_index * output.len();
+        for (chunk, sum) in sums[..chunks].iter_mut().enumerate() {
+            let weight = unsafe { _mm256_loadu_ps(weights.as_ptr().add(row + chunk * 8)) };
+            *sum = _mm256_fmadd_ps(scalar, weight, *sum);
+        }
+    }
+    for (chunk, sum) in sums[..chunks].iter().enumerate() {
+        unsafe { _mm256_storeu_ps(output.as_mut_ptr().add(chunk * 8), *sum) };
     }
 }
 
@@ -725,5 +873,33 @@ mod tests {
         let restored = SparseTransformerModel::load(&path).unwrap();
         std::fs::remove_file(path).unwrap();
         assert_eq!(restored.evaluate(&board), expected);
+    }
+
+    #[test]
+    fn line_index_matches_alignment_scan_for_empty_candidates() {
+        let stones = [
+            (Move::new(7, 7).unwrap(), Player::Black),
+            (Move::new(2, 7).unwrap(), Player::White),
+            (Move::new(9, 9).unwrap(), Player::Black),
+            (Move::new(4, 10).unwrap(), Player::White),
+        ];
+        let board = Board::from_stones(&stones).unwrap();
+        let model = SparseTransformerModel::random(TOKEN_WIDTH, 17);
+        let mut scratch = SparseScratch::new();
+        model.encode_stones(&board, &mut scratch);
+        for candidate in board.search_candidates() {
+            let mut indexed = line_ids(candidate)
+                .iter()
+                .flat_map(|&line| scratch.line_tokens[line].iter().copied())
+                .collect::<Vec<_>>();
+            indexed.sort_unstable();
+            let scanned = scratch
+                .moves
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &stone)| aligned(candidate, stone).then_some(index))
+                .collect::<Vec<_>>();
+            assert_eq!(indexed, scanned);
+        }
     }
 }
