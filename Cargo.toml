@@ -27,7 +27,7 @@ profile = []
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { version = "0.10.2", features = ["accelerate", "metal"] }
 
-[target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
+[target.'cfg(any(target_os = "windows", all(target_os = "linux", not(target_env = "musl"))))'.dependencies]
 candle-core = { version = "0.10.2", features = ["cuda"] }
 
 [profile.release]

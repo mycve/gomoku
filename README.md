@@ -97,9 +97,33 @@ MCTS。两手开局不写入训练样本；设为 `0.0` 可关闭。Arena 的成
 可用 `tensorboard --logdir runs/gomoku` 查看。训练使用 Candle 自动微分和 AdamW，
 优化器动量在同一次运行的各次 update 之间持续保留，EMA 在每个 optimizer step 后于
 训练设备更新。训练固定使用单个设备，由配置项 `gpu_device = 0` 选择；macOS 使用对应
-Metal 设备，Linux 使用对应 CUDA 设备（0 号 CUDA 不可用时回退 CPU）。在线模型、
+Metal 设备，Linux 和 Windows 使用对应 CUDA 设备（0 号 CUDA 不可用时回退 CPU）。在线模型、
 AdamW 状态与 EMA 均位于同一设备，不再进行跨卡批次分片、梯度回传或参数广播。
 批大小由配置文件控制。
+
+### Windows CUDA 训练
+
+Windows 原生训练需要 64 位 NVIDIA 驱动、CUDA Toolkit（含 `nvcc`）、Visual Studio
+2022 的“使用 C++ 的桌面开发”组件，以及 Rust MSVC 工具链。建议在 **x64 Native
+Tools Command Prompt for VS 2022** 或已加载 MSVC 环境的 PowerShell 中执行：
+
+```powershell
+rustup default stable-x86_64-pc-windows-msvc
+nvcc --version
+nvidia-smi
+cargo build --profile fast
+cargo run --profile fast -- az-init model.safetensors 192
+cargo run --profile fast -- az-loop
+```
+
+首次运行 `az-loop` 会生成 `gomoku.azloop.toml`；确认其中 `gpu_device = 0` 后再次运行。
+多卡机器可将其改为对应的 CUDA 设备编号。启动日志中的 `train_device=cuda:0` 和训练
+行中的 `device=cuda:0` 表示 CUDA 已启用；若显示 `cpu`，请检查前面输出的
+`CUDA unavailable` 原因。可用已有回放数据单独测速：
+
+```powershell
+cargo run --profile fast -- az-train-bench model.safetensors data/replay.jsonl --gpu-device 0
+```
 
 自博弈使用常驻异步 Worker，配置值超过机器可用 CPU 核心数时会自动限制到核心数。
 `selfplay_workers = 0` 表示使用可用 CPU 线程数，

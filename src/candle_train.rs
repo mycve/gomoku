@@ -418,7 +418,10 @@ fn make_device(requested: usize) -> io::Result<(Device, String)> {
             .map(|device| (device, format!("metal:{requested}")))
             .map_err(err);
     }
-    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    #[cfg(any(
+        target_os = "windows",
+        all(target_os = "linux", not(target_env = "musl"))
+    ))]
     {
         match Device::new_cuda(requested) {
             Ok(device) => return Ok((device, format!("cuda:{requested}"))),
