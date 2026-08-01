@@ -2,7 +2,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use gomoku::{
     az_loop,
     az_loop_config::{DEFAULT_CONFIG_PATH, load_or_create},
-    candle_train,
+    candle_train, distill,
     game::{Board, Move, Outcome, Player},
     mcts::{SearchConfig, search},
     model::PolicyValueModel,
@@ -36,6 +36,8 @@ enum Command {
     AzBench(AzBenchArgs),
     /// 测试回放样本训练速度。
     AzTrainBench(AzTrainBenchArgs),
+    /// 使用 KataGo 标注的 NPZ 数据蒸馏模型。
+    AzDistill(AzDistillArgs),
     /// 按 TOML 配置持续执行自博弈训练。
     AzLoop(AzLoopArgs),
     /// 人工在控制台挑战 Best 模型。
@@ -95,6 +97,49 @@ struct AzTrainBenchArgs {
     batch_size: usize,
     #[arg(long, default_value_t = 0)]
     gpu_device: usize,
+}
+
+#[derive(Args)]
+struct AzDistillArgs {
+    /// fs15x_label28b/train 目录。
+    #[arg(default_value = "katago-gomoku-distill-2025.5/fs15x_label28b/train")]
+    data: String,
+    /// 起始模型；文件不存在时随机初始化。
+    #[arg(long, default_value = "model.safetensors")]
+    model: String,
+    #[arg(long, default_value = "distilled.safetensors")]
+    output: String,
+    /// 验证集目录；空字符串表示禁用验证。
+    #[arg(
+        long,
+        default_value = "katago-gomoku-distill-2025.5/fs15x_label28b/val"
+    )]
+    validation: String,
+    /// 验证损失最低时保存到这里。
+    #[arg(long, default_value = "distilled-best.safetensors")]
+    best_output: String,
+    /// 每训练多少个分片验证一次。
+    #[arg(long, default_value_t = 25)]
+    validate_every: usize,
+    #[arg(long, default_value_t = 192)]
+    hidden: usize,
+    #[arg(long, default_value_t = 1)]
+    epochs: usize,
+    #[arg(long, default_value_t = 0.001)]
+    learning_rate: f32,
+    #[arg(long, default_value_t = 256)]
+    batch_size: usize,
+    #[arg(long, default_value_t = 0)]
+    gpu_device: usize,
+    /// 最多处理多少个 NPZ；0 表示全部已下载分片。
+    #[arg(long, default_value_t = 0)]
+    max_files: usize,
+    /// 跳过排序后的前 N 个已下载分片，便于分阶段续训。
+    #[arg(long, default_value_t = 0)]
+    skip_files: usize,
+    /// 每个 NPZ 最多读取多少个样本；0 表示全部。
+    #[arg(long, default_value_t = 0)]
+    max_samples_per_file: usize,
 }
 
 #[derive(Args)]
@@ -231,6 +276,120 @@ fn main() -> io::Result<()> {
             println!(
                 "loss     : total={:.4} policy={:.4} value={:.4}",
                 stats.loss, stats.policy_loss, stats.value_loss
+            );
+        }
+        Some(Command::AzDistill(args)) => {
+            let mut model = if Path::new(&args.model).exists() {
+                PolicyValueModel::load(&args.model)?
+            } else {
+                PolicyValueModel::random(args.hidden, 20260801)
+            };
+            let files = distill::npz_files(&args.data)?;
+            let files = files
+                .into_iter()
+                .filter(|path| !distill::is_lfs_pointer(path).unwrap_or(false))
+                .skip(args.skip_files)
+                .take(if args.max_files == 0 {
+                    usize::MAX
+                } else {
+                    args.max_files
+                })
+                .collect::<Vec<_>>();
+            if files.is_empty() {
+                return Err(io::Error::other(format!(
+                    "{} 中没有已下载的 NPZ 实体（当前文件可能都是 Git LFS 占位符）",
+                    args.data
+                )));
+            }
+            let device = candle_train::training_device_name(args.gpu_device)?;
+            let mut session = candle_train::TrainingSession::new(
+                &model,
+                None,
+                args.gpu_device,
+                args.learning_rate,
+            )?;
+            println!(
+                "distill  : files={} device={} output={}",
+                files.len(),
+                device,
+                args.output
+            );
+            let validation = if args.validation.is_empty() {
+                Vec::new()
+            } else {
+                let mut samples = Vec::new();
+                for path in distill::npz_files(&args.validation)? {
+                    if !distill::is_lfs_pointer(&path)? {
+                        samples.extend(distill::load_npz(path, None)?);
+                    }
+                }
+                samples
+            };
+            let mut best_validation_loss = f32::INFINITY;
+            if !validation.is_empty() {
+                let stats = session.evaluate(&validation, args.batch_size)?;
+                best_validation_loss = stats.loss;
+                model.save(&args.best_output)?;
+                println!(
+                    "validate : samples={} loss={:.4} policy={:.4} value={:.4} best={}",
+                    validation.len(),
+                    stats.loss,
+                    stats.policy_loss,
+                    stats.value_loss,
+                    args.best_output
+                );
+            }
+            let started = Instant::now();
+            let mut total_samples = 0usize;
+            for (index, path) in files.iter().enumerate() {
+                let limit = (args.max_samples_per_file > 0).then_some(args.max_samples_per_file);
+                let samples = distill::load_npz(path, limit)?;
+                let stats = session.train_controlled(
+                    &mut model,
+                    None,
+                    &samples,
+                    args.epochs,
+                    args.learning_rate,
+                    args.batch_size,
+                    1.0,
+                    None,
+                )?;
+                total_samples += samples.len();
+                model.save(&args.output)?;
+                println!(
+                    "file     : {}/{} {} samples={} loss={:.4} policy={:.4} value={:.4}",
+                    index + 1,
+                    files.len(),
+                    path.display(),
+                    samples.len(),
+                    stats.loss,
+                    stats.policy_loss,
+                    stats.value_loss
+                );
+                let should_validate = !validation.is_empty()
+                    && ((index + 1) % args.validate_every.max(1) == 0 || index + 1 == files.len());
+                if should_validate {
+                    let stats = session.evaluate(&validation, args.batch_size)?;
+                    let improved = stats.loss < best_validation_loss;
+                    if improved {
+                        best_validation_loss = stats.loss;
+                        model.save(&args.best_output)?;
+                    }
+                    println!(
+                        "validate : samples={} loss={:.4} policy={:.4} value={:.4}{}",
+                        validation.len(),
+                        stats.loss,
+                        stats.policy_loss,
+                        stats.value_loss,
+                        if improved { " [best]" } else { "" }
+                    );
+                }
+            }
+            println!(
+                "complete : samples={} elapsed={:.1}s model={}",
+                total_samples,
+                started.elapsed().as_secs_f64(),
+                args.output
             );
         }
         Some(Command::AzLoop(args)) => {

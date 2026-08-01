@@ -118,6 +118,21 @@ impl TrainingSession {
         Ok(finalize_stats(stats))
     }
 
+    /// 计算样本损失但不更新参数。当前与训练共用完全相同的前向与标签处理。
+    pub fn evaluate(&self, samples: &[Sample], batch_size: usize) -> io::Result<TrainStats> {
+        if samples.is_empty() {
+            return Ok(TrainStats::default());
+        }
+        let mut stats = TrainStats::default();
+        for batch in samples.chunks(batch_size.max(1)) {
+            let output = self.replica.backward(batch)?;
+            stats.samples += output.samples;
+            stats.policy_loss += output.policy_sum;
+            stats.value_loss += output.value_sum;
+        }
+        Ok(finalize_stats(stats))
+    }
+
     fn copy_models(
         &self,
         model: &mut PolicyValueModel,
@@ -501,13 +516,15 @@ fn pack(samples: &[Sample]) -> Packed {
                 targets[row * CELL_COUNT + m.0] = p.max(0.0) / sum
             }
         }
-        let final_wdl = if s.value > 0.5 {
-            [1.0, 0.0, 0.0]
-        } else if s.value < -0.5 {
-            [0.0, 0.0, 1.0]
-        } else {
-            [0.0, 1.0, 0.0]
-        };
+        let final_wdl = s.value_wdl.unwrap_or_else(|| {
+            if s.value > 0.5 {
+                [1.0, 0.0, 0.0]
+            } else if s.value < -0.5 {
+                [0.0, 0.0, 1.0]
+            } else {
+                [0.0, 1.0, 0.0]
+            }
+        });
         value_wdl.extend_from_slice(&final_wdl);
     }
     Packed {
@@ -547,6 +564,7 @@ mod tests {
             board,
             policy: vec![(nearby, 1.0)],
             value: 0.0,
+            value_wdl: None,
             generation: 0,
         }]);
 
@@ -570,6 +588,7 @@ mod tests {
             board,
             policy: vec![(Move::new(8, 7).unwrap(), 1.0)],
             value: 1.0,
+            value_wdl: None,
             generation: 0,
         };
         let stats = train(&mut model, &[sample], 2, 1e-3, 1, 0).unwrap();

@@ -141,6 +141,7 @@ pub fn generate_one_detailed_controlled(
             board: board.clone(),
             policy,
             value: 0.0,
+            value_wdl: None,
             generation: 0,
         });
         board.play(mv);

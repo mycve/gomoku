@@ -12,6 +12,9 @@ pub struct Sample {
     pub board: Board,
     pub policy: Vec<(Move, f32)>,
     pub value: f32,
+    /// 可选的软胜/和/负标签；蒸馏数据使用它，自博弈旧回放保持兼容。
+    #[serde(default)]
+    pub value_wdl: Option<[f32; 3]>,
     #[serde(default)]
     pub generation: u64,
 }
@@ -26,6 +29,7 @@ impl Sample {
                 .map(|&(mv, probability)| (Move(transform_index(mv.0, symmetry)), probability))
                 .collect(),
             value: self.value,
+            value_wdl: self.value_wdl,
             generation: self.generation,
         }
     }
@@ -163,6 +167,7 @@ mod tests {
             board: Board::new(),
             policy: Vec::new(),
             value: 0.0,
+            value_wdl: None,
             generation,
         }
     }

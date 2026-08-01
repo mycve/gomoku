@@ -2,6 +2,7 @@ pub mod async_selfplay;
 pub mod az_loop;
 pub mod az_loop_config;
 pub mod candle_train;
+pub mod distill;
 pub mod game;
 pub mod gomocup;
 pub mod mcts;
