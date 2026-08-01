@@ -14,10 +14,10 @@ pub const LOCAL_AXES: usize = 4;
 pub const LOCAL_RADIUS: usize = 4;
 pub const LOCAL_RAY_PATTERNS: usize = 4usize.pow(LOCAL_RADIUS as u32);
 pub const LOCAL_AXIS_PATTERNS: usize = LOCAL_RAY_PATTERNS * (LOCAL_RAY_PATTERNS + 1) / 2;
-pub const LOCAL_AXIS_FEATURE_SIZE: usize = 2;
-pub const LOCAL_CANDIDATE_SIZE: usize = LOCAL_AXIS_FEATURE_SIZE * 2;
+pub const LOCAL_AXIS_FEATURE_SIZE: usize = 32;
+pub const LOCAL_CANDIDATE_SIZE: usize = LOCAL_AXIS_FEATURE_SIZE * 3;
 pub const VALUE_LOCAL_SIZE: usize = LOCAL_CANDIDATE_SIZE * 2;
-const FORMAT_VERSION: f32 = 10.0;
+const FORMAT_VERSION: f32 = 16.0;
 const LOCAL_BOUNDARY: u8 = u8::MAX;
 const LOCAL_NEIGHBORS: [u8; CELL_COUNT * LOCAL_AXES * 2 * LOCAL_RADIUS] = build_local_neighbors();
 
@@ -70,6 +70,8 @@ pub struct PolicyValueModel {
     pub(crate) policy_hidden: Vec<f32>,
     pub(crate) policy_bias: Vec<f32>,
     pub(crate) local_axis_embedding: Vec<f32>,
+    pub(crate) local_axis_scale: Vec<f32>,
+    pub(crate) local_axis_bias: Vec<f32>,
     pub(crate) policy_local: Vec<f32>,
     pub(crate) value_head_hidden: Vec<f32>,
     pub(crate) value_local_output: Vec<f32>,
@@ -141,6 +143,8 @@ impl PolicyValueModel {
             local_axis_embedding: (0..LOCAL_AXIS_PATTERNS * LOCAL_AXIS_FEATURE_SIZE)
                 .map(|_| rng.weight((2.0 / LOCAL_AXIS_FEATURE_SIZE as f32).sqrt() * 0.25))
                 .collect(),
+            local_axis_scale: vec![1.0; 2 * LOCAL_AXIS_FEATURE_SIZE],
+            local_axis_bias: vec![0.0; 2 * LOCAL_AXIS_FEATURE_SIZE],
             policy_local: vec![0.0; LOCAL_CANDIDATE_SIZE],
             value_head_hidden: (0..hidden_size * VALUE_HEAD_SIZE)
                 .map(|_| rng.weight((2.0 / hidden_size as f32).sqrt() * 0.5))
@@ -379,17 +383,24 @@ impl PolicyValueModel {
 
     fn local_candidate_into(&self, board: &Board, mv: Move, output: &mut [f32]) {
         output.fill(0.0);
-        let (mean, max) = output.split_at_mut(LOCAL_AXIS_FEATURE_SIZE);
+        let (mean, rest) = output.split_at_mut(LOCAL_AXIS_FEATURE_SIZE);
+        let (max, mean_square) = rest.split_at_mut(LOCAL_AXIS_FEATURE_SIZE);
         max.fill(f32::NEG_INFINITY);
-        for (dr, dc) in [(1, 0), (0, 1), (1, 1), (1, -1)] {
+        for (axis, (dr, dc)) in [(1, 0), (0, 1), (1, 1), (1, -1)].into_iter().enumerate() {
             let (first_code, second_code) = local_ray_codes(board, mv, dr, dc);
             let pattern = second_code * (second_code + 1) / 2 + first_code;
             let axis_feature = &self.local_axis_embedding
                 [pattern * LOCAL_AXIS_FEATURE_SIZE..(pattern + 1) * LOCAL_AXIS_FEATURE_SIZE];
+            let kind_offset = (axis / 2) * LOCAL_AXIS_FEATURE_SIZE;
             for i in 0..LOCAL_AXIS_FEATURE_SIZE {
-                mean[i] += axis_feature[i] / LOCAL_AXES as f32;
-                max[i] = max[i].max(axis_feature[i]);
+                let feature = axis_feature[i] * self.local_axis_scale[kind_offset + i]
+                    + self.local_axis_bias[kind_offset + i];
+                mean[i] += feature / LOCAL_AXES as f32;
+                max[i] = max[i].max(feature);
             }
+        }
+        for i in 0..LOCAL_AXIS_FEATURE_SIZE {
+            mean_square[i] = mean[i] * mean[i];
         }
     }
 
@@ -456,6 +467,18 @@ impl PolicyValueModel {
             "local_axis_embedding",
             &self.local_axis_embedding,
             (LOCAL_AXIS_PATTERNS, LOCAL_AXIS_FEATURE_SIZE),
+        )?;
+        insert(
+            &vars,
+            "local_axis_scale",
+            &self.local_axis_scale,
+            (2, LOCAL_AXIS_FEATURE_SIZE),
+        )?;
+        insert(
+            &vars,
+            "local_axis_bias",
+            &self.local_axis_bias,
+            (2, LOCAL_AXIS_FEATURE_SIZE),
         )?;
         insert(
             &vars,
@@ -534,6 +557,8 @@ impl PolicyValueModel {
             policy_hidden: load(&tensors, "policy_hidden")?,
             policy_bias: load(&tensors, "policy_bias")?,
             local_axis_embedding: load(&tensors, "local_axis_embedding")?,
+            local_axis_scale: load(&tensors, "local_axis_scale")?,
+            local_axis_bias: load(&tensors, "local_axis_bias")?,
             policy_local: load(&tensors, "policy_local")?,
             value_head_hidden: load(&tensors, "value_head_hidden")?,
             value_local_output: load(&tensors, "value_local_output")?,
@@ -551,6 +576,8 @@ impl PolicyValueModel {
             || model.policy_hidden.len() != CELL_COUNT * hidden_size
             || model.policy_bias.len() != CELL_COUNT
             || model.local_axis_embedding.len() != LOCAL_AXIS_PATTERNS * LOCAL_AXIS_FEATURE_SIZE
+            || model.local_axis_scale.len() != 2 * LOCAL_AXIS_FEATURE_SIZE
+            || model.local_axis_bias.len() != 2 * LOCAL_AXIS_FEATURE_SIZE
             || model.policy_local.len() != LOCAL_CANDIDATE_SIZE
             || model.value_head_hidden.len() != hidden_size * VALUE_HEAD_SIZE
             || model.value_local_output.len() != WDL_SIZE * VALUE_LOCAL_SIZE
@@ -587,6 +614,8 @@ impl PolicyValueModel {
         blend!(policy_hidden);
         blend!(policy_bias);
         blend!(local_axis_embedding);
+        blend!(local_axis_scale);
+        blend!(local_axis_bias);
         blend!(policy_local);
         blend!(value_head_hidden);
         blend!(value_local_output);
@@ -882,9 +911,9 @@ mod tests {
     }
 
     #[test]
-    fn v10_model_roundtrip_preserves_local_parameters() {
+    fn model_roundtrip_preserves_local_parameters() {
         let path = std::env::temp_dir().join(format!(
-            "gomoku-v10-roundtrip-{}-{}.safetensors",
+            "gomoku-model-roundtrip-{}-{}.safetensors",
             std::process::id(),
             SplitMix64(11).next()
         ));
@@ -893,6 +922,8 @@ mod tests {
         let restored = PolicyValueModel::load(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
         assert_eq!(restored.local_axis_embedding, model.local_axis_embedding);
+        assert_eq!(restored.local_axis_scale, model.local_axis_scale);
+        assert_eq!(restored.local_axis_bias, model.local_axis_bias);
         assert_eq!(restored.policy_local, model.policy_local);
         assert_eq!(restored.value_local_output, model.value_local_output);
     }

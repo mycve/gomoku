@@ -14,10 +14,42 @@ cargo run -- az-loop --target-update 10
 cargo run -- az-search model.safetensors 3000 1.5 h8 h9 i8
 cargo run -- az-bench model.safetensors 3000 20
 cargo run -- az-train-bench
+cargo run --profile fast -- az-distill
 cargo run -- az-eval-best best.safetensors 3000 --human-side black
 cargo run -- az-arena-best model.safetensors best.safetensors 100 3000
 cargo run --profile fast --bin pbrain-gomoku
 cargo run -- play
+```
+
+### KataGo 数据蒸馏
+
+`az-distill` 读取 `fs15x_label28b` 的 NPZ 分片，使用教师搜索策略和软 WDL 标签训练
+当前策略价值网络。训练会在每个分片内确定性洗牌并应用随机八向对称变换，学习率按全部
+分片进度从 `learning-rate` 余弦衰减到 `min-learning-rate`。默认命令为：
+
+```powershell
+cargo run --profile fast -- az-distill `
+  --output distilled.safetensors `
+  --best-output distilled-best.safetensors
+```
+
+每处理完一个分片，最新模型和 `data/distill-progress.txt` 都会保存；重新执行相同命令
+会自动加载 `distilled.safetensors` 并从下一个分片继续。验证损失最低的模型单独保存在
+`distilled-best.safetensors`，恢复训练时会先重新评估它，避免用退化的最新模型覆盖。
+控制台的 `mass` 表示搜索候选保留的教师策略概率质量，`top1` 表示教师首选着仍在候选
+集合中的比例。新版验证输出还报告策略/价值 KL，它扣除了软标签自身的熵，比原始交叉熵
+更直接地反映拟合差距。
+
+常用控制参数：
+
+```text
+--learning-rate 0.001       初始学习率
+--min-learning-rate 0.00001 最终学习率
+--validation-samples 200000 验证样本上限
+--validate-every 25         验证间隔（分片）
+--max-files N               本次最多处理 N 个分片
+--skip-files N              手工跳过前 N 个分片
+--progress PATH             独立实验的续跑状态文件
 ```
 
 独立的 `pbrain-gomoku` 可执行文件通过纯标准输入/输出实现 Gomocup/Piskvork 协议。Piskvork

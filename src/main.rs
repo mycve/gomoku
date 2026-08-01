@@ -10,8 +10,13 @@ use gomoku::{
     selfplay::arena,
 };
 use std::{
+    fs,
     io::{self, Write},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 
@@ -127,6 +132,9 @@ struct AzDistillArgs {
     epochs: usize,
     #[arg(long, default_value_t = 0.001)]
     learning_rate: f32,
+    /// 余弦衰减的最终学习率。
+    #[arg(long, default_value_t = 0.00001)]
+    min_learning_rate: f32,
     #[arg(long, default_value_t = 256)]
     batch_size: usize,
     #[arg(long, default_value_t = 0)]
@@ -140,6 +148,12 @@ struct AzDistillArgs {
     /// 每个 NPZ 最多读取多少个样本；0 表示全部。
     #[arg(long, default_value_t = 0)]
     max_samples_per_file: usize,
+    /// 最多加载的验证样本数；0 表示全部。按分片顺序均匀截取。
+    #[arg(long, default_value_t = 200000)]
+    validation_samples: usize,
+    /// 已完成分片数的续跑状态文件；空字符串表示禁用。
+    #[arg(long, default_value = "data/distill-progress.txt")]
+    progress: String,
 }
 
 #[derive(Args)]
@@ -205,8 +219,9 @@ fn main() -> io::Result<()> {
             PolicyValueModel::random(args.hidden, args.seed).save(&args.output)?;
             println!("model    : initialized {}", args.output);
             println!(
-                "arch     : input=451 hidden={} rmsnorm local=4axesx8cells-pattern2 policy=225 value=96x96xWDL3",
-                args.hidden
+                "arch     : input=451 hidden={} rmsnorm local=4axesx8cells-pattern{} policy=225 value=96x96xWDL3",
+                args.hidden,
+                gomoku::model::LOCAL_AXIS_FEATURE_SIZE,
             );
             println!("board    : 15x15 freestyle gomoku");
         }
@@ -279,16 +294,46 @@ fn main() -> io::Result<()> {
             );
         }
         Some(Command::AzDistill(args)) => {
-            let mut model = if Path::new(&args.model).exists() {
+            if args.epochs == 0 {
+                return Err(io::Error::other(
+                    "epochs 必须大于 0，避免未训练却推进续跑游标",
+                ));
+            }
+            if !args.learning_rate.is_finite()
+                || !args.min_learning_rate.is_finite()
+                || args.learning_rate <= 0.0
+                || args.min_learning_rate <= 0.0
+                || args.min_learning_rate > args.learning_rate
+            {
+                return Err(io::Error::other(
+                    "学习率必须有限且满足 0 < min-learning-rate <= learning-rate",
+                ));
+            }
+            let saved_progress = if args.progress.is_empty() {
+                0
+            } else {
+                fs::read_to_string(&args.progress)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<usize>().ok())
+                    .unwrap_or(0)
+            };
+            let skip_files = args.skip_files.max(saved_progress);
+            let resume_output = skip_files > 0 && Path::new(&args.output).exists();
+            let mut model = if resume_output {
+                PolicyValueModel::load(&args.output)?
+            } else if Path::new(&args.model).exists() {
                 PolicyValueModel::load(&args.model)?
             } else {
                 PolicyValueModel::random(args.hidden, 20260801)
             };
-            let files = distill::npz_files(&args.data)?;
-            let files = files
+            let all_files = distill::npz_files(&args.data)?
                 .into_iter()
                 .filter(|path| !distill::is_lfs_pointer(path).unwrap_or(false))
-                .skip(args.skip_files)
+                .collect::<Vec<_>>();
+            let total_files = all_files.len();
+            let files = all_files
+                .into_iter()
+                .skip(skip_files)
                 .take(if args.max_files == 0 {
                     usize::MAX
                 } else {
@@ -309,8 +354,10 @@ fn main() -> io::Result<()> {
                 args.learning_rate,
             )?;
             println!(
-                "distill  : files={} device={} output={}",
+                "distill  : files={} skip={} total={} device={} output={}",
                 files.len(),
+                skip_files,
+                total_files,
                 device,
                 args.output
             );
@@ -318,54 +365,119 @@ fn main() -> io::Result<()> {
                 Vec::new()
             } else {
                 let mut samples = Vec::new();
-                for path in distill::npz_files(&args.validation)? {
-                    if !distill::is_lfs_pointer(&path)? {
-                        samples.extend(distill::load_npz(path, None)?);
-                    }
+                let validation_files = distill::npz_files(&args.validation)?
+                    .into_iter()
+                    .filter(|path| !distill::is_lfs_pointer(path).unwrap_or(false))
+                    .collect::<Vec<_>>();
+                let per_file = if args.validation_samples == 0 {
+                    usize::MAX
+                } else {
+                    args.validation_samples
+                        .div_ceil(validation_files.len().max(1))
+                };
+                for path in validation_files {
+                    samples.extend(distill::load_npz(path, Some(per_file))?);
+                }
+                if args.validation_samples > 0 {
+                    samples.truncate(args.validation_samples);
                 }
                 samples
             };
             let mut best_validation_loss = f32::INFINITY;
             if !validation.is_empty() {
+                if skip_files > 0 && Path::new(&args.best_output).exists() {
+                    let best_model = PolicyValueModel::load(&args.best_output)?;
+                    let best_session = candle_train::TrainingSession::new(
+                        &best_model,
+                        None,
+                        args.gpu_device,
+                        args.learning_rate,
+                    )?;
+                    let best_stats = best_session.evaluate(&validation, args.batch_size)?;
+                    best_validation_loss = best_stats.loss;
+                    println!(
+                        "best     : samples={} loss={:.4} policy={:.4} value={:.4} kl={:.4}/{:.4}",
+                        validation.len(),
+                        best_stats.loss,
+                        best_stats.policy_loss,
+                        best_stats.value_loss,
+                        best_stats.policy_kl,
+                        best_stats.value_kl,
+                    );
+                }
                 let stats = session.evaluate(&validation, args.batch_size)?;
-                best_validation_loss = stats.loss;
-                model.save(&args.best_output)?;
+                let improved = stats.loss < best_validation_loss;
+                if improved {
+                    best_validation_loss = stats.loss;
+                    save_model_retry(&model, &args.best_output)?;
+                }
                 println!(
-                    "validate : samples={} loss={:.4} policy={:.4} value={:.4} best={}",
+                    "validate : samples={} loss={:.4} policy={:.4} value={:.4} kl={:.4}/{:.4}{}",
                     validation.len(),
                     stats.loss,
                     stats.policy_loss,
                     stats.value_loss,
-                    args.best_output
+                    stats.policy_kl,
+                    stats.value_kl,
+                    if improved { " [best]" } else { "" },
                 );
             }
             let started = Instant::now();
             let mut total_samples = 0usize;
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_handler = Arc::clone(&stop);
+            ctrlc::set_handler(move || stop_handler.store(true, Ordering::Relaxed))
+                .map_err(|error| io::Error::other(error.to_string()))?;
             for (index, path) in files.iter().enumerate() {
                 let limit = (args.max_samples_per_file > 0).then_some(args.max_samples_per_file);
-                let samples = distill::load_npz(path, limit)?;
+                let (mut samples, load_stats) = distill::load_npz_with_stats(path, limit)?;
+                distill::augment_and_shuffle(
+                    &mut samples,
+                    20260801_u64.wrapping_add((skip_files + index) as u64),
+                );
+                let progress = (skip_files + index) as f32 + 0.5;
+                let progress = progress / total_files.max(1) as f32;
+                let cosine = 0.5 * (1.0 + (std::f32::consts::PI * progress).cos());
+                let learning_rate =
+                    args.min_learning_rate + (args.learning_rate - args.min_learning_rate) * cosine;
                 let stats = session.train_controlled(
                     &mut model,
                     None,
                     &samples,
                     args.epochs,
-                    args.learning_rate,
+                    learning_rate,
                     args.batch_size,
                     1.0,
-                    None,
+                    Some(&stop),
                 )?;
                 total_samples += samples.len();
-                model.save(&args.output)?;
+                save_model_retry(&model, &args.output)?;
+                let complete = stats.samples == samples.len().saturating_mul(args.epochs);
+                if complete && !args.progress.is_empty() {
+                    save_distill_progress(&args.progress, skip_files + index + 1)?;
+                }
                 println!(
-                    "file     : {}/{} {} samples={} loss={:.4} policy={:.4} value={:.4}",
+                    "file     : {}/{} {} samples={}/{} lr={:.2e} loss={:.4} policy={:.4} value={:.4} mass={:.1}% top1={:.1}%",
                     index + 1,
                     files.len(),
                     path.display(),
                     samples.len(),
+                    load_stats.rows,
+                    learning_rate,
                     stats.loss,
                     stats.policy_loss,
-                    stats.value_loss
+                    stats.value_loss,
+                    100.0 * load_stats.policy_mass_retention(),
+                    100.0 * load_stats.top1_retention(),
                 );
+                if !complete || stop.load(Ordering::Relaxed) {
+                    println!(
+                        "stopped  : 当前分片完成 {}/{} 个样本轮次，模型已保存，续跑游标未越过未完成分片",
+                        stats.samples,
+                        samples.len().saturating_mul(args.epochs),
+                    );
+                    break;
+                }
                 let should_validate = !validation.is_empty()
                     && ((index + 1) % args.validate_every.max(1) == 0 || index + 1 == files.len());
                 if should_validate {
@@ -373,14 +485,16 @@ fn main() -> io::Result<()> {
                     let improved = stats.loss < best_validation_loss;
                     if improved {
                         best_validation_loss = stats.loss;
-                        model.save(&args.best_output)?;
+                        save_model_retry(&model, &args.best_output)?;
                     }
                     println!(
-                        "validate : samples={} loss={:.4} policy={:.4} value={:.4}{}",
+                        "validate : samples={} loss={:.4} policy={:.4} value={:.4} kl={:.4}/{:.4}{}",
                         validation.len(),
                         stats.loss,
                         stats.policy_loss,
                         stats.value_loss,
+                        stats.policy_kl,
+                        stats.value_kl,
                         if improved { " [best]" } else { "" }
                     );
                 }
@@ -465,6 +579,45 @@ fn main() -> io::Result<()> {
     }
     gomoku::profile::print_report();
     Ok(())
+}
+
+fn save_distill_progress(path: impl AsRef<Path>, completed: usize) -> io::Result<()> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = PathBuf::from(format!("{}.tmp", path.display()));
+    fs::write(&temporary, completed.to_string())?;
+    let mut last_error = None;
+    for attempt in 0..20 {
+        match fs::rename(&temporary, path) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < 19 {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            }
+        }
+    }
+    Err(last_error.expect("替换进度文件至少尝试一次"))
+}
+
+fn save_model_retry(model: &PolicyValueModel, path: impl AsRef<Path>) -> io::Result<()> {
+    let path = path.as_ref();
+    let mut last_error = None;
+    for attempt in 0..20 {
+        match model.save(path) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < 19 {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            }
+        }
+    }
+    Err(last_error.expect("保存模型至少尝试一次"))
 }
 
 fn load_model(path: &str) -> io::Result<PolicyValueModel> {

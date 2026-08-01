@@ -100,13 +100,17 @@ impl TrainingSession {
                     self.copy_models(model, ema_model)?;
                     return Ok(finalize_stats(stats));
                 }
-                let output = self.replica.backward(batch)?;
+                let output = self.replica.forward(batch, true)?;
                 stats.samples += output.samples;
                 stats.policy_loss += output.policy_sum;
                 stats.value_loss += output.value_sum;
+                stats.policy_entropy += output.policy_entropy_sum;
+                stats.value_entropy += output.value_entropy_sum;
                 {
                     crate::scope_profile!("train.optimizer_step");
-                    self.optimizer.step(&output.grads).map_err(err)?;
+                    self.optimizer
+                        .step(output.grads.as_ref().expect("训练批次必须包含梯度"))
+                        .map_err(err)?;
                 }
                 stats.optimizer_steps += 1;
                 if let Some(ema) = &self.ema {
@@ -125,10 +129,12 @@ impl TrainingSession {
         }
         let mut stats = TrainStats::default();
         for batch in samples.chunks(batch_size.max(1)) {
-            let output = self.replica.backward(batch)?;
+            let output = self.replica.forward(batch, false)?;
             stats.samples += output.samples;
             stats.policy_loss += output.policy_sum;
             stats.value_loss += output.value_sum;
+            stats.policy_entropy += output.policy_entropy_sum;
+            stats.value_entropy += output.value_entropy_sum;
         }
         Ok(finalize_stats(stats))
     }
@@ -150,6 +156,10 @@ fn finalize_stats(mut stats: TrainStats) -> TrainStats {
     let count = stats.samples.max(1) as f32;
     stats.policy_loss /= count;
     stats.value_loss /= count;
+    stats.policy_entropy /= count;
+    stats.value_entropy /= count;
+    stats.policy_kl = (stats.policy_loss - stats.policy_entropy).max(0.0);
+    stats.value_kl = (stats.value_loss - stats.value_entropy).max(0.0);
     stats.loss = stats.policy_loss + stats.value_loss;
     stats
 }
@@ -166,6 +176,8 @@ struct Replica {
     policy_hidden: Var,
     policy_bias: Var,
     local_axis_embedding: Var,
+    local_axis_scale: Var,
+    local_axis_bias: Var,
     policy_local: Var,
     value_head_hidden: Var,
     value_local_output: Var,
@@ -193,6 +205,12 @@ impl Replica {
                 (LOCAL_AXIS_PATTERNS, LOCAL_AXIS_FEATURE_SIZE),
                 device,
             )?,
+            local_axis_scale: var(
+                &model.local_axis_scale,
+                (2, LOCAL_AXIS_FEATURE_SIZE),
+                device,
+            )?,
+            local_axis_bias: var(&model.local_axis_bias, (2, LOCAL_AXIS_FEATURE_SIZE), device)?,
             policy_local: var(&model.policy_local, (LOCAL_CANDIDATE_SIZE,), device)?,
             value_head_hidden: var(&model.value_head_hidden, (VALUE_HEAD_SIZE, h), device)?,
             value_local_output: var(
@@ -226,6 +244,8 @@ impl Replica {
             self.policy_hidden.clone(),
             self.policy_bias.clone(),
             self.local_axis_embedding.clone(),
+            self.local_axis_scale.clone(),
+            self.local_axis_bias.clone(),
             self.policy_local.clone(),
             self.value_head_hidden.clone(),
             self.value_local_output.clone(),
@@ -235,7 +255,7 @@ impl Replica {
             self.value_head_output.clone(),
         ]
     }
-    fn backward(&self, samples: &[Sample]) -> io::Result<BatchOutput> {
+    fn forward(&self, samples: &[Sample], backward: bool) -> io::Result<BatchOutput> {
         let packed = {
             crate::scope_profile!("train.pack");
             pack(samples)
@@ -299,9 +319,69 @@ impl Replica {
             .index_select(&local_axis_indices, 0)
             .and_then(|x| x.reshape((b, CELL_COUNT, LOCAL_AXES, LOCAL_AXIS_FEATURE_SIZE)))
             .map_err(err)?;
+        let axis_scale = Tensor::cat(
+            &[
+                &self
+                    .local_axis_scale
+                    .as_tensor()
+                    .narrow(0, 0, 1)
+                    .map_err(err)?,
+                &self
+                    .local_axis_scale
+                    .as_tensor()
+                    .narrow(0, 0, 1)
+                    .map_err(err)?,
+                &self
+                    .local_axis_scale
+                    .as_tensor()
+                    .narrow(0, 1, 1)
+                    .map_err(err)?,
+                &self
+                    .local_axis_scale
+                    .as_tensor()
+                    .narrow(0, 1, 1)
+                    .map_err(err)?,
+            ],
+            0,
+        )
+        .and_then(|x| x.reshape((1, 1, LOCAL_AXES, LOCAL_AXIS_FEATURE_SIZE)))
+        .map_err(err)?;
+        let axis_bias = Tensor::cat(
+            &[
+                &self
+                    .local_axis_bias
+                    .as_tensor()
+                    .narrow(0, 0, 1)
+                    .map_err(err)?,
+                &self
+                    .local_axis_bias
+                    .as_tensor()
+                    .narrow(0, 0, 1)
+                    .map_err(err)?,
+                &self
+                    .local_axis_bias
+                    .as_tensor()
+                    .narrow(0, 1, 1)
+                    .map_err(err)?,
+                &self
+                    .local_axis_bias
+                    .as_tensor()
+                    .narrow(0, 1, 1)
+                    .map_err(err)?,
+            ],
+            0,
+        )
+        .and_then(|x| x.reshape((1, 1, LOCAL_AXES, LOCAL_AXIS_FEATURE_SIZE)))
+        .map_err(err)?;
+        let local_axes = local_axes
+            .broadcast_mul(&axis_scale)
+            .and_then(|x| x.broadcast_add(&axis_bias))
+            .map_err(err)?;
         let local_mean = local_axes.mean(2).map_err(err)?;
         let local_max = local_axes.max(2).map_err(err)?;
-        let local_candidates = Tensor::cat(&[&local_mean, &local_max], 2).map_err(err)?;
+        let local_mean_square = local_mean.sqr().map_err(err)?;
+        let local_candidates =
+            Tensor::cat(&[&local_mean, &local_max, &local_mean_square], 2).map_err(err)?;
         let local_policy_logits = local_candidates
             .reshape((b * CELL_COUNT, LOCAL_CANDIDATE_SIZE))
             .and_then(|x| {
@@ -363,15 +443,19 @@ impl Replica {
             .map_err(err)?;
         let policy_sum = policy_sum_tensor.to_scalar::<f32>().map_err(err)?;
         let value_sum = value_sum_tensor.to_scalar::<f32>().map_err(err)?;
-        let grads = {
+        let grads = if backward {
             crate::scope_profile!("train.backward");
-            loss.backward().map_err(err)?
+            Some(loss.backward().map_err(err)?)
+        } else {
+            None
         };
         Ok(BatchOutput {
             grads,
             samples: b,
             policy_sum,
             value_sum,
+            policy_entropy_sum: packed.policy_entropy_sum,
+            value_entropy_sum: packed.value_entropy_sum,
         })
     }
     fn cpu_values(&self) -> io::Result<Vec<Vec<f32>>> {
@@ -410,21 +494,25 @@ impl Replica {
         m.policy_hidden = v[7].clone();
         m.policy_bias = v[8].clone();
         m.local_axis_embedding = v[9].clone();
-        m.policy_local = v[10].clone();
-        m.value_head_hidden = v[11].clone();
-        m.value_local_output = v[12].clone();
-        m.value_head_bias = v[13].clone();
-        m.value_head_hidden2 = v[14].clone();
-        m.value_head_bias2 = v[15].clone();
-        m.value_head_output = v[16].clone();
+        m.local_axis_scale = v[10].clone();
+        m.local_axis_bias = v[11].clone();
+        m.policy_local = v[12].clone();
+        m.value_head_hidden = v[13].clone();
+        m.value_local_output = v[14].clone();
+        m.value_head_bias = v[15].clone();
+        m.value_head_hidden2 = v[16].clone();
+        m.value_head_bias2 = v[17].clone();
+        m.value_head_output = v[18].clone();
         Ok(())
     }
 }
 struct BatchOutput {
-    grads: GradStore,
+    grads: Option<GradStore>,
     samples: usize,
     policy_sum: f32,
     value_sum: f32,
+    policy_entropy_sum: f32,
+    value_entropy_sum: f32,
 }
 fn make_device(requested: usize) -> io::Result<(Device, String)> {
     #[cfg(target_os = "macos")]
@@ -468,6 +556,8 @@ struct Packed {
     local_axis_indices: Vec<u32>,
     local_legal_mask: Vec<f32>,
     value_wdl: Vec<f32>,
+    policy_entropy_sum: f32,
+    value_entropy_sum: f32,
 }
 fn pack(samples: &[Sample]) -> Packed {
     let mut inputs = vec![0.0; samples.len() * INPUT_SIZE];
@@ -481,6 +571,8 @@ fn pack(samples: &[Sample]) -> Packed {
     let mut local_axis_indices = vec![0_u32; samples.len() * CELL_COUNT * LOCAL_AXES];
     let mut local_legal_mask = vec![0.0; samples.len() * CELL_COUNT];
     let mut value_wdl = Vec::with_capacity(samples.len() * WDL_SIZE);
+    let mut policy_entropy_sum = 0.0;
+    let mut value_entropy_sum = 0.0;
     for (row, s) in samples.iter().enumerate() {
         let us = s.board.to_move().stone();
         for (sq, &stone) in s.board.cells().iter().enumerate() {
@@ -513,7 +605,11 @@ fn pack(samples: &[Sample]) -> Packed {
         let sum: f32 = s.policy.iter().map(|(_, p)| p.max(0.0)).sum();
         for &(m, p) in &s.policy {
             if m.0 < CELL_COUNT && sum > 1e-12 {
-                targets[row * CELL_COUNT + m.0] = p.max(0.0) / sum
+                let probability = p.max(0.0) / sum;
+                targets[row * CELL_COUNT + m.0] = probability;
+                if probability > 0.0 {
+                    policy_entropy_sum -= probability * probability.ln();
+                }
             }
         }
         let final_wdl = s.value_wdl.unwrap_or_else(|| {
@@ -525,6 +621,11 @@ fn pack(samples: &[Sample]) -> Packed {
                 [0.0, 1.0, 0.0]
             }
         });
+        value_entropy_sum -= final_wdl
+            .iter()
+            .filter(|&&probability| probability > 0.0)
+            .map(|&probability| probability * probability.ln())
+            .sum::<f32>();
         value_wdl.extend_from_slice(&final_wdl);
     }
     Packed {
@@ -539,6 +640,8 @@ fn pack(samples: &[Sample]) -> Packed {
         local_axis_indices,
         local_legal_mask,
         value_wdl,
+        policy_entropy_sum,
+        value_entropy_sum,
     }
 }
 fn var(data: &[f32], shape: impl Into<candle_core::Shape>, device: &Device) -> io::Result<Var> {
@@ -575,6 +678,27 @@ mod tests {
         assert_eq!(packed.policy_masks[nearby.0], 0.0);
         assert_eq!(packed.local_legal_mask[nearby.0], 1.0);
         assert_eq!(packed.policy_targets[nearby.0], 1.0);
+    }
+
+    #[test]
+    fn packing_reports_soft_target_entropy() {
+        let mut board = Board::new();
+        assert!(board.play(Move::new(7, 7).unwrap()));
+        let first = Move::new(7, 8).unwrap();
+        let second = Move::new(8, 7).unwrap();
+        let policy = [0.25_f32, 0.75];
+        let wdl = [0.2_f32, 0.3, 0.5];
+        let packed = pack(&[Sample {
+            board,
+            policy: vec![(first, policy[0]), (second, policy[1])],
+            value: -0.3,
+            value_wdl: Some(wdl),
+            generation: 0,
+        }]);
+        let expected_policy = -policy.iter().map(|p| p * p.ln()).sum::<f32>();
+        let expected_value = -wdl.iter().map(|p| p * p.ln()).sum::<f32>();
+        assert!((packed.policy_entropy_sum - expected_policy).abs() < 1e-6);
+        assert!((packed.value_entropy_sum - expected_value).abs() < 1e-6);
     }
 
     #[test]

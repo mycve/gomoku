@@ -145,6 +145,47 @@ fn expand(
             scratch,
         )
     };
+    let us = nodes[idx].board.to_move();
+    let winning = policy
+        .iter()
+        .filter_map(|&(mv, _)| nodes[idx].board.is_winning_move(mv, us).then_some(mv))
+        .collect::<Vec<_>>();
+    if !winning.is_empty() {
+        let prior = 1.0 / winning.len() as f32;
+        policy = winning.into_iter().map(|mv| (mv, prior)).collect();
+    } else {
+        let forced_blocks = policy
+            .iter()
+            .filter_map(|&(mv, _)| {
+                nodes[idx]
+                    .board
+                    .is_winning_move(mv, us.other())
+                    .then_some(mv)
+            })
+            .collect::<Vec<_>>();
+        if !forced_blocks.is_empty() {
+            let prior = 1.0 / forced_blocks.len() as f32;
+            policy = forced_blocks.into_iter().map(|mv| (mv, prior)).collect();
+        } else if idx == 0 {
+            let forcing_threshold = policy
+                .iter()
+                .map(|(_, prior)| *prior)
+                .fold(0.0_f32, f32::max)
+                * 0.1;
+            let forcing = policy
+                .iter()
+                .filter_map(|&(mv, prior)| {
+                    (prior >= forcing_threshold
+                        && nodes[idx].board.winning_replies_after(mv, us) >= 2)
+                        .then_some(mv)
+                })
+                .collect::<Vec<_>>();
+            if !forcing.is_empty() {
+                let prior = 1.0 / forcing.len() as f32;
+                policy = forcing.into_iter().map(|mv| (mv, prior)).collect();
+            }
+        }
+    }
     if idx == 0 && cfg.root_dirichlet_alpha > 0.0 && cfg.root_exploration_fraction > 0.0 {
         let mut priors = policy.iter().map(|(_, prior)| *prior).collect::<Vec<_>>();
         apply_root_dirichlet_noise(
@@ -296,6 +337,84 @@ impl SplitMix64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::Player;
+
+    #[test]
+    fn immediate_win_replaces_network_policy() {
+        let board = Board::from_stones(&[
+            (Move::parse("d8").unwrap(), Player::Black),
+            (Move::parse("d7").unwrap(), Player::White),
+            (Move::parse("e8").unwrap(), Player::Black),
+            (Move::parse("e7").unwrap(), Player::White),
+            (Move::parse("f8").unwrap(), Player::Black),
+            (Move::parse("f7").unwrap(), Player::White),
+            (Move::parse("g8").unwrap(), Player::Black),
+            (Move::parse("a1").unwrap(), Player::White),
+        ])
+        .unwrap();
+        let result = search(
+            &board,
+            &PolicyValueModel::random(8, 23),
+            SearchConfig {
+                simulations: 2,
+                ..Default::default()
+            },
+        );
+        assert!(result.iter().all(|candidate| {
+            candidate.mv == Move::parse("c8").unwrap() || candidate.mv == Move::parse("h8").unwrap()
+        }));
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn immediate_loss_restricts_search_to_blocks() {
+        let board = Board::from_stones(&[
+            (Move::parse("a1").unwrap(), Player::Black),
+            (Move::parse("d8").unwrap(), Player::White),
+            (Move::parse("a3").unwrap(), Player::Black),
+            (Move::parse("e8").unwrap(), Player::White),
+            (Move::parse("a5").unwrap(), Player::Black),
+            (Move::parse("f8").unwrap(), Player::White),
+            (Move::parse("a7").unwrap(), Player::Black),
+            (Move::parse("g8").unwrap(), Player::White),
+        ])
+        .unwrap();
+        let result = search(
+            &board,
+            &PolicyValueModel::random(8, 29),
+            SearchConfig {
+                simulations: 2,
+                ..Default::default()
+            },
+        );
+        assert!(result.iter().all(|candidate| {
+            candidate.mv == Move::parse("c8").unwrap() || candidate.mv == Move::parse("h8").unwrap()
+        }));
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn open_four_replaces_network_policy() {
+        let board = Board::from_stones(&[
+            (Move::parse("d8").unwrap(), Player::Black),
+            (Move::parse("a1").unwrap(), Player::White),
+            (Move::parse("e8").unwrap(), Player::Black),
+            (Move::parse("a3").unwrap(), Player::White),
+            (Move::parse("g8").unwrap(), Player::Black),
+            (Move::parse("a5").unwrap(), Player::White),
+        ])
+        .unwrap();
+        let result = search(
+            &board,
+            &PolicyValueModel::random(8, 31),
+            SearchConfig {
+                simulations: 2,
+                ..Default::default()
+            },
+        );
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].mv, Move::parse("f8").unwrap());
+    }
 
     #[test]
     fn root_noise_is_normalized_and_seeded() {

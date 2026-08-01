@@ -7,3 +7,6 @@ model.safetensors
 best.safetensors
 .idea
 Cargo.lock
+katago-gomoku-distill-2025.5
+data
+*.safetensors

@@ -288,6 +288,10 @@ pub struct TrainStats {
     pub loss: f32,
     pub policy_loss: f32,
     pub value_loss: f32,
+    pub policy_entropy: f32,
+    pub value_entropy: f32,
+    pub policy_kl: f32,
+    pub value_kl: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]

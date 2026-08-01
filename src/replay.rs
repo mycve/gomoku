@@ -20,7 +20,7 @@ pub struct Sample {
 }
 
 impl Sample {
-    fn transformed(&self, symmetry: usize) -> Self {
+    pub(crate) fn transformed(&self, symmetry: usize) -> Self {
         Self {
             board: self.board.transformed(symmetry),
             policy: self

@@ -12,6 +12,24 @@ use std::{
 
 const PACKED_BYTES: usize = (CELL_COUNT + 7) / 8;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LoadStats {
+    pub rows: usize,
+    pub accepted: usize,
+    pub policy_mass_total: f64,
+    pub policy_mass_kept: f64,
+    pub top1_kept: usize,
+}
+
+impl LoadStats {
+    pub fn policy_mass_retention(self) -> f64 {
+        self.policy_mass_kept / self.policy_mass_total.max(f64::EPSILON)
+    }
+    pub fn top1_retention(self) -> f64 {
+        self.top1_kept as f64 / self.accepted.max(1) as f64
+    }
+}
+
 pub fn npz_files(path: impl AsRef<Path>) -> io::Result<Vec<PathBuf>> {
     let mut files = fs::read_dir(path)?
         .filter_map(Result::ok)
@@ -34,6 +52,13 @@ pub fn is_lfs_pointer(path: impl AsRef<Path>) -> io::Result<bool> {
 }
 
 pub fn load_npz(path: impl AsRef<Path>, limit: Option<usize>) -> io::Result<Vec<Sample>> {
+    load_npz_with_stats(path, limit).map(|x| x.0)
+}
+
+pub fn load_npz_with_stats(
+    path: impl AsRef<Path>,
+    limit: Option<usize>,
+) -> io::Result<(Vec<Sample>, LoadStats)> {
     let path = path.as_ref();
     if is_lfs_pointer(path)? {
         return Err(io::Error::other(format!(
@@ -81,6 +106,10 @@ pub fn load_npz(path: impl AsRef<Path>, limit: Option<usize>) -> io::Result<Vec<
         .to_vec1::<f32>()
         .map_err(err)?;
     let take = limit.unwrap_or(n).min(n);
+    let mut stats = LoadStats {
+        rows: take,
+        ..Default::default()
+    };
     let mut samples = Vec::with_capacity(take);
     for row in 0..take {
         let bit = |channel: usize, sq: usize| {
@@ -111,11 +140,21 @@ pub fn load_npz(path: impl AsRef<Path>, limit: Option<usize>) -> io::Result<Vec<
         let allowed = board.search_candidates();
         let mut target = Vec::with_capacity(allowed.len());
         let policy_base = (row * heads) * moves;
+        let total_mass = (0..CELL_COUNT)
+            .map(|sq| policy[policy_base + sq].max(0) as f64)
+            .sum::<f64>();
+        let top1 = (0..CELL_COUNT)
+            .max_by_key(|&sq| policy[policy_base + sq])
+            .unwrap();
+        let mut kept_mass = 0.0;
+        let mut keeps_top1 = false;
         for mv in allowed {
             let weight = policy[policy_base + mv.0].max(0) as f32;
             if weight > 0.0 {
                 target.push((mv, weight));
+                kept_mass += weight as f64;
             }
+            keeps_top1 |= mv.0 == top1;
         }
         if target.is_empty() {
             continue;
@@ -138,8 +177,37 @@ pub fn load_npz(path: impl AsRef<Path>, limit: Option<usize>) -> io::Result<Vec<
             value_wdl: Some(wdl),
             generation: 0,
         });
+        stats.accepted += 1;
+        stats.policy_mass_total += total_mass;
+        stats.policy_mass_kept += kept_mass;
+        stats.top1_kept += usize::from(keeps_top1);
     }
-    Ok(samples)
+    Ok((samples, stats))
+}
+
+pub fn augment_and_shuffle(samples: &mut [Sample], seed: u64) {
+    let mut rng = SplitMix64(seed);
+    for sample in samples.iter_mut() {
+        *sample = sample.transformed(rng.index(8));
+    }
+    for index in (1..samples.len()).rev() {
+        let other = rng.index(index + 1);
+        samples.swap(index, other);
+    }
+}
+
+struct SplitMix64(u64);
+impl SplitMix64 {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn index(&mut self, len: usize) -> usize {
+        (self.next() as usize) % len.max(1)
+    }
 }
 
 fn required(npz: &NpzTensors, name: &str) -> io::Result<Tensor> {

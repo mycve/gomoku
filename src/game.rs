@@ -198,6 +198,74 @@ impl Board {
         );
         candidates
     }
+    pub(crate) fn is_winning_move(&self, mv: Move, player: Player) -> bool {
+        if mv.0 >= CELL_COUNT || self.cells[mv.0] != 0 {
+            return false;
+        }
+        let stone = player.stone();
+        [(1, 0), (0, 1), (1, 1), (1, -1)]
+            .into_iter()
+            .any(|(dr, dc)| {
+                let mut run = 1;
+                for sign in [-1, 1] {
+                    let mut row = mv.row() as i32 + dr * sign;
+                    let mut col = mv.col() as i32 + dc * sign;
+                    while row >= 0
+                        && col >= 0
+                        && row < BOARD_SIZE as i32
+                        && col < BOARD_SIZE as i32
+                        && self.cells[row as usize * BOARD_SIZE + col as usize] == stone
+                    {
+                        run += 1;
+                        row += dr * sign;
+                        col += dc * sign;
+                    }
+                }
+                run >= 5
+            })
+    }
+    pub(crate) fn winning_replies_after(&self, mv: Move, player: Player) -> usize {
+        if mv.0 >= CELL_COUNT || self.cells[mv.0] != 0 {
+            return 0;
+        }
+        let stone = player.stone();
+        let mut replies = [false; CELL_COUNT];
+        for (dr, dc) in [(1, 0), (0, 1), (1, 1), (1, -1)] {
+            for start in -4..=0 {
+                let mut empty = None;
+                let mut valid = true;
+                for offset in start..start + 5 {
+                    let row = mv.row() as i32 + dr * offset;
+                    let col = mv.col() as i32 + dc * offset;
+                    if row < 0 || col < 0 || row >= BOARD_SIZE as i32 || col >= BOARD_SIZE as i32 {
+                        valid = false;
+                        break;
+                    }
+                    let index = row as usize * BOARD_SIZE + col as usize;
+                    let cell = if index == mv.0 {
+                        stone
+                    } else {
+                        self.cells[index]
+                    };
+                    if cell == 0 {
+                        if empty.replace(index).is_some() {
+                            valid = false;
+                            break;
+                        }
+                    } else if cell != stone {
+                        valid = false;
+                        break;
+                    }
+                }
+                if valid {
+                    if let Some(index) = empty {
+                        replies[index] = true;
+                    }
+                }
+            }
+        }
+        replies.into_iter().filter(|&reply| reply).count()
+    }
     pub fn outcome(&self) -> Option<Outcome> {
         crate::scope_profile!("game.outcome");
         if let Some(mv) = self.last {
@@ -329,6 +397,39 @@ mod tests {
             }
         }
         assert_eq!(b.outcome(), Some(Outcome::Win(Player::Black)));
+    }
+
+    #[test]
+    fn detects_winning_move_for_either_player_without_playing_it() {
+        let board = Board::from_stones(&[
+            (Move::new(7, 3).unwrap(), Player::Black),
+            (Move::new(7, 4).unwrap(), Player::Black),
+            (Move::new(7, 5).unwrap(), Player::Black),
+            (Move::new(7, 6).unwrap(), Player::Black),
+            (Move::new(6, 3).unwrap(), Player::White),
+            (Move::new(6, 4).unwrap(), Player::White),
+            (Move::new(6, 5).unwrap(), Player::White),
+        ])
+        .unwrap();
+        assert!(board.is_winning_move(Move::new(7, 7).unwrap(), Player::Black));
+        assert!(!board.is_winning_move(Move::new(6, 6).unwrap(), Player::White));
+    }
+
+    #[test]
+    fn counts_distinct_winning_replies_created_by_a_move() {
+        let board = Board::from_stones(&[
+            (Move::parse("d8").unwrap(), Player::Black),
+            (Move::parse("a1").unwrap(), Player::White),
+            (Move::parse("e8").unwrap(), Player::Black),
+            (Move::parse("a3").unwrap(), Player::White),
+            (Move::parse("g8").unwrap(), Player::Black),
+            (Move::parse("a5").unwrap(), Player::White),
+        ])
+        .unwrap();
+        assert_eq!(
+            board.winning_replies_after(Move::parse("f8").unwrap(), Player::Black),
+            2
+        );
     }
 
     #[test]
