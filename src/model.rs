@@ -16,8 +16,8 @@ pub const LOCAL_RAY_PATTERNS: usize = 4usize.pow(LOCAL_RADIUS as u32);
 pub const LOCAL_AXIS_PATTERNS: usize = LOCAL_RAY_PATTERNS * (LOCAL_RAY_PATTERNS + 1) / 2;
 pub const LOCAL_AXIS_FEATURE_SIZE: usize = 2;
 pub const LOCAL_CANDIDATE_SIZE: usize = LOCAL_AXIS_FEATURE_SIZE * 2;
-pub const VALUE_LOCAL_SIZE: usize = LOCAL_CANDIDATE_SIZE * 2;
-const FORMAT_VERSION: f32 = 10.0;
+pub const VALUE_PATTERN_SIZE: usize = LOCAL_AXIS_FEATURE_SIZE;
+const FORMAT_VERSION: f32 = 13.0;
 const LOCAL_BOUNDARY: u8 = u8::MAX;
 const LOCAL_NEIGHBORS: [u8; CELL_COUNT * LOCAL_AXES * 2 * LOCAL_RADIUS] = build_local_neighbors();
 
@@ -72,27 +72,38 @@ pub struct PolicyValueModel {
     pub(crate) local_axis_embedding: Vec<f32>,
     pub(crate) policy_local: Vec<f32>,
     pub(crate) value_head_hidden: Vec<f32>,
-    pub(crate) value_local_output: Vec<f32>,
     pub(crate) value_head_bias: Vec<f32>,
     pub(crate) value_head_hidden2: Vec<f32>,
     pub(crate) value_head_bias2: Vec<f32>,
     pub(crate) value_head_output: Vec<f32>,
+    pub(crate) value_pattern_output: Vec<f32>,
 }
 
 #[derive(Clone)]
 pub(crate) struct EvalAccumulator {
     black: Vec<f32>,
     white: Vec<f32>,
+    local_black: Vec<f32>,
+    local_white: Vec<f32>,
     move_count: usize,
+    pub(crate) hash: u64,
 }
 
 pub(crate) struct EvalScratch {
     hidden: Vec<f32>,
     logits: Vec<f32>,
     local_candidate: Vec<f32>,
-    local_value: Vec<f32>,
     value1: Vec<f32>,
     value2: Vec<f32>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ValuePathBenchmark {
+    pub iterations: usize,
+    pub policy_value_seconds: f64,
+    pub value_seconds: f64,
+    pub value: f32,
+    pub update_seconds: f64,
 }
 
 impl EvalScratch {
@@ -101,7 +112,6 @@ impl EvalScratch {
             hidden: Vec::with_capacity(hidden_size),
             logits: Vec::with_capacity(CELL_COUNT),
             local_candidate: vec![0.0; LOCAL_CANDIDATE_SIZE],
-            local_value: vec![0.0; VALUE_LOCAL_SIZE],
             value1: Vec::with_capacity(VALUE_HEAD_SIZE),
             value2: Vec::with_capacity(VALUE_HEAD_SIZE),
         }
@@ -145,19 +155,121 @@ impl PolicyValueModel {
             value_head_hidden: (0..hidden_size * VALUE_HEAD_SIZE)
                 .map(|_| rng.weight((2.0 / hidden_size as f32).sqrt() * 0.5))
                 .collect(),
-            value_local_output: vec![0.0; WDL_SIZE * VALUE_LOCAL_SIZE],
             value_head_bias: vec![0.0; VALUE_HEAD_SIZE],
             value_head_hidden2: (0..VALUE_HEAD_SIZE * VALUE_HEAD_SIZE)
                 .map(|_| rng.weight((2.0 / VALUE_HEAD_SIZE as f32).sqrt() * 0.5))
                 .collect(),
             value_head_bias2: vec![0.0; VALUE_HEAD_SIZE],
             value_head_output: vec![0.0; VALUE_HEAD_SIZE * WDL_SIZE],
+            value_pattern_output: vec![0.0; VALUE_PATTERN_SIZE * WDL_SIZE],
         }
     }
 
     pub fn evaluate(&self, board: &Board) -> (Vec<(Move, f32)>, f32) {
         let accumulator = self.accumulator(board);
         self.evaluate_accumulator(board, &accumulator)
+    }
+
+    /// 唯一的局面价值入口；只读取棋盘增量状态，与候选生成策略无关。
+    pub fn evaluate_value(&self, board: &Board) -> f32 {
+        let accumulator = self.accumulator(board);
+        let mut scratch = EvalScratch::new(self.hidden_size);
+        self.evaluate_value_with_scratch(board, &accumulator, &mut scratch)
+    }
+
+    /// 返回指定合法着法的未归一化排序分；MCTS 可批量调用，PVS 可延迟调用。
+    pub fn evaluate_move_logit(&self, board: &Board, mv: Move) -> Option<f32> {
+        if !board.is_legal(mv) {
+            return None;
+        }
+        let accumulator = self.accumulator(board);
+        let mut scratch = EvalScratch::new(self.hidden_size);
+        self.activate_accumulator(board, &accumulator, &mut scratch.hidden);
+        self.local_candidate_into(board, mv, &mut scratch.local_candidate);
+        Some(self.policy_logit(&scratch.hidden, &scratch.local_candidate, mv))
+    }
+
+    pub(crate) fn evaluate_value_accumulator(
+        &self,
+        board: &Board,
+        accumulator: &EvalAccumulator,
+        scratch: &mut EvalScratch,
+    ) -> f32 {
+        self.evaluate_value_with_scratch(board, accumulator, scratch)
+    }
+
+    pub(crate) fn move_logits_accumulator(
+        &self,
+        board: &Board,
+        accumulator: &EvalAccumulator,
+        moves: &[Move],
+        scratch: &mut EvalScratch,
+    ) -> Vec<(Move, f32)> {
+        self.activate_accumulator(board, accumulator, &mut scratch.hidden);
+        let mut scored = Vec::with_capacity(moves.len());
+        for &mv in moves {
+            self.local_candidate_into(board, mv, &mut scratch.local_candidate);
+            scored.push((
+                mv,
+                self.policy_logit(&scratch.hidden, &scratch.local_candidate, mv),
+            ));
+        }
+        scored
+    }
+
+    /// 比较完整 Policy+Value 与单独 Value 的推理成本。
+    pub fn benchmark_value_paths(&self, board: &Board, iterations: usize) -> ValuePathBenchmark {
+        let iterations = iterations.max(1);
+        let accumulator = self.accumulator(board);
+        let mut full_scratch = EvalScratch::new(self.hidden_size);
+        let mut value_scratch = EvalScratch::new(self.hidden_size);
+
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(
+                self.evaluate_accumulator_with_scratch(board, &accumulator, 1.0, &mut full_scratch)
+                    .1,
+            );
+        }
+        let policy_value_seconds = started.elapsed().as_secs_f64();
+
+        let started = std::time::Instant::now();
+        let mut value = 0.0;
+        for _ in 0..iterations {
+            value = std::hint::black_box(self.evaluate_value_with_scratch(
+                board,
+                &accumulator,
+                &mut value_scratch,
+            ));
+        }
+        let value_seconds = started.elapsed().as_secs_f64();
+
+        let update_seconds = if let Some(&mv) = board.search_candidates().first() {
+            let mut child_board = board.clone();
+            let player = child_board.to_move();
+            let _ = child_board.play(mv);
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                std::hint::black_box(self.accumulator_after_move(
+                    &accumulator,
+                    board,
+                    &child_board,
+                    mv,
+                    player,
+                ));
+            }
+            started.elapsed().as_secs_f64()
+        } else {
+            0.0
+        };
+
+        ValuePathBenchmark {
+            iterations,
+            policy_value_seconds,
+            value_seconds,
+            value,
+            update_seconds,
+        }
     }
 
     pub(crate) fn evaluate_accumulator(
@@ -187,16 +299,7 @@ impl PolicyValueModel {
     ) -> (Vec<(Move, f32)>, f32) {
         crate::scope_profile!("model.evaluate_incremental");
         debug_assert_eq!(accumulator.move_count, board.move_count());
-        {
-            crate::scope_profile!("model.activate_norm");
-            self.activate_hidden_into(
-                match board.to_move() {
-                    Player::Black => &accumulator.black,
-                    Player::White => &accumulator.white,
-                },
-                &mut scratch.hidden,
-            );
-        }
+        self.activate_accumulator(board, accumulator, &mut scratch.hidden);
         let moves = board.search_candidates();
         if moves.is_empty() {
             return (Vec::new(), 0.0);
@@ -204,8 +307,6 @@ impl PolicyValueModel {
         {
             crate::scope_profile!("model.policy_logits");
             scratch.logits.clear();
-            scratch.local_value.fill(0.0);
-            scratch.local_value[LOCAL_CANDIDATE_SIZE..].fill(f32::NEG_INFINITY);
             for &mv in &moves {
                 self.local_candidate_into(board, mv, &mut scratch.local_candidate);
                 scratch.logits.push(self.policy_logit(
@@ -213,11 +314,6 @@ impl PolicyValueModel {
                     &scratch.local_candidate,
                     mv,
                 ));
-                for (i, &value) in scratch.local_candidate.iter().enumerate() {
-                    scratch.local_value[i] += value;
-                    scratch.local_value[LOCAL_CANDIDATE_SIZE + i] =
-                        scratch.local_value[LOCAL_CANDIDATE_SIZE + i].max(value);
-                }
             }
         }
         let max = scratch
@@ -242,11 +338,47 @@ impl PolicyValueModel {
                     .map(|x| ((x - max) * inverse_temperature).exp() / sum),
             )
             .collect();
-        crate::scope_profile!("model.value_head");
-        let inverse_moves = 1.0 / moves.len() as f32;
-        for value in &mut scratch.local_value[..LOCAL_CANDIDATE_SIZE] {
-            *value *= inverse_moves;
+        let value = self.value_from_features(scratch, self.local_for(board, accumulator));
+        (policy, value)
+    }
+
+    fn evaluate_value_with_scratch(
+        &self,
+        board: &Board,
+        accumulator: &EvalAccumulator,
+        scratch: &mut EvalScratch,
+    ) -> f32 {
+        crate::scope_profile!("model.evaluate_value");
+        debug_assert_eq!(accumulator.move_count, board.move_count());
+        self.activate_accumulator(board, accumulator, &mut scratch.hidden);
+        self.value_from_features(scratch, self.local_for(board, accumulator))
+    }
+
+    fn activate_accumulator(
+        &self,
+        board: &Board,
+        accumulator: &EvalAccumulator,
+        hidden: &mut Vec<f32>,
+    ) {
+        crate::scope_profile!("model.activate_norm");
+        self.activate_hidden_into(
+            match board.to_move() {
+                Player::Black => &accumulator.black,
+                Player::White => &accumulator.white,
+            },
+            hidden,
+        );
+    }
+
+    fn local_for<'a>(&self, board: &Board, accumulator: &'a EvalAccumulator) -> &'a [f32] {
+        match board.to_move() {
+            Player::Black => &accumulator.local_black,
+            Player::White => &accumulator.local_white,
         }
+    }
+
+    fn value_from_features(&self, scratch: &mut EvalScratch, local: &[f32]) -> f32 {
+        crate::scope_profile!("model.value_head");
         scratch.value1.clear();
         scratch.value1.extend_from_slice(&self.value_head_bias);
         for (output, value) in scratch.value1.iter_mut().enumerate() {
@@ -277,17 +409,17 @@ impl PolicyValueModel {
             *logit = dot(
                 &scratch.value2,
                 &self.value_head_output[start..start + VALUE_HEAD_SIZE],
-            ) + dot(
-                &scratch.local_value,
-                &self.value_local_output
-                    [output * VALUE_LOCAL_SIZE..(output + 1) * VALUE_LOCAL_SIZE],
+            );
+            *logit += dot(
+                local,
+                &self.value_pattern_output
+                    [output * VALUE_PATTERN_SIZE..(output + 1) * VALUE_PATTERN_SIZE],
             );
         }
         let wdl_max = wdl.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let wdl_sum: f32 = wdl.iter().map(|x| (x - wdl_max).exp()).sum();
         let wdl = wdl.map(|x| (x - wdl_max).exp() / wdl_sum);
-        let value = wdl[0] - wdl[2];
-        (policy, value)
+        wdl[0] - wdl[2]
     }
 
     pub(crate) fn accumulator(&self, board: &Board) -> EvalAccumulator {
@@ -295,7 +427,10 @@ impl PolicyValueModel {
         let mut accumulator = EvalAccumulator {
             black: self.hidden_bias.clone(),
             white: self.hidden_bias.clone(),
+            local_black: self.local_board_summary(board, Player::Black),
+            local_white: self.local_board_summary(board, Player::White),
             move_count: 0,
+            hash: board_hash(board),
         };
         for (sq, &stone) in board.cells().iter().enumerate() {
             if stone == 0 {
@@ -318,14 +453,90 @@ impl PolicyValueModel {
     pub(crate) fn accumulator_after_move(
         &self,
         parent: &EvalAccumulator,
+        board_before: &Board,
+        board_after: &Board,
         mv: Move,
         player: Player,
     ) -> EvalAccumulator {
         crate::scope_profile!("model.accumulator_update");
         let mut child = parent.clone();
         self.add_stone(&mut child, mv, player);
+        self.update_local_after_move(&mut child, board_before, board_after, mv);
         self.set_move_count(&mut child, parent.move_count + 1);
+        child.hash ^= zobrist_piece(mv, player) ^ ZOBRIST_SIDE;
         child
+    }
+
+    fn local_board_summary(&self, board: &Board, perspective: Player) -> Vec<f32> {
+        let mut summary = vec![0.0; VALUE_PATTERN_SIZE];
+        let mut axis_feature = [0.0; VALUE_PATTERN_SIZE];
+        for index in 0..CELL_COUNT {
+            for (dr, dc) in [(1, 0), (0, 1), (1, 1), (1, -1)] {
+                self.local_axis_feature_for_player_into(
+                    board,
+                    Move(index),
+                    dr,
+                    dc,
+                    perspective,
+                    &mut axis_feature,
+                );
+                for (sum, value) in summary.iter_mut().zip(&axis_feature) {
+                    *sum += *value / (CELL_COUNT * LOCAL_AXES) as f32;
+                }
+            }
+        }
+        summary
+    }
+
+    fn update_local_after_move(
+        &self,
+        accumulator: &mut EvalAccumulator,
+        board_before: &Board,
+        board_after: &Board,
+        mv: Move,
+    ) {
+        let mut old = [0.0; VALUE_PATTERN_SIZE];
+        let mut new = [0.0; VALUE_PATTERN_SIZE];
+        for (dr, dc) in [(1_i32, 0_i32), (0, 1), (1, 1), (1, -1)] {
+            for sign in [-1_i32, 1] {
+                for distance in 1..=LOCAL_RADIUS as i32 {
+                    let row = mv.row() as i32 + dr * sign * distance;
+                    let col = mv.col() as i32 + dc * sign * distance;
+                    let Some(center) = (row >= 0
+                        && col >= 0
+                        && row < BOARD_SIZE as i32
+                        && col < BOARD_SIZE as i32)
+                        .then(|| Move(row as usize * BOARD_SIZE + col as usize))
+                    else {
+                        continue;
+                    };
+                    for (perspective, target) in [
+                        (Player::Black, &mut accumulator.local_black),
+                        (Player::White, &mut accumulator.local_white),
+                    ] {
+                        self.local_axis_feature_for_player_into(
+                            board_before,
+                            center,
+                            dr,
+                            dc,
+                            perspective,
+                            &mut old,
+                        );
+                        self.local_axis_feature_for_player_into(
+                            board_after,
+                            center,
+                            dr,
+                            dc,
+                            perspective,
+                            &mut new,
+                        );
+                        for i in 0..VALUE_PATTERN_SIZE {
+                            target[i] += (new[i] - old[i]) / (CELL_COUNT * LOCAL_AXES) as f32;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn add_stone(&self, accumulator: &mut EvalAccumulator, mv: Move, player: Player) {
@@ -378,19 +589,51 @@ impl PolicyValueModel {
     }
 
     fn local_candidate_into(&self, board: &Board, mv: Move, output: &mut [f32]) {
+        self.local_candidate_for_player_into(board, mv, board.to_move(), output);
+    }
+
+    fn local_candidate_for_player_into(
+        &self,
+        board: &Board,
+        mv: Move,
+        perspective: Player,
+        output: &mut [f32],
+    ) {
         output.fill(0.0);
         let (mean, max) = output.split_at_mut(LOCAL_AXIS_FEATURE_SIZE);
         max.fill(f32::NEG_INFINITY);
         for (dr, dc) in [(1, 0), (0, 1), (1, 1), (1, -1)] {
-            let (first_code, second_code) = local_ray_codes(board, mv, dr, dc);
-            let pattern = second_code * (second_code + 1) / 2 + first_code;
-            let axis_feature = &self.local_axis_embedding
-                [pattern * LOCAL_AXIS_FEATURE_SIZE..(pattern + 1) * LOCAL_AXIS_FEATURE_SIZE];
+            let mut axis_feature = [0.0; LOCAL_AXIS_FEATURE_SIZE];
+            self.local_axis_feature_for_player_into(
+                board,
+                mv,
+                dr,
+                dc,
+                perspective,
+                &mut axis_feature,
+            );
             for i in 0..LOCAL_AXIS_FEATURE_SIZE {
                 mean[i] += axis_feature[i] / LOCAL_AXES as f32;
                 max[i] = max[i].max(axis_feature[i]);
             }
         }
+    }
+
+    fn local_axis_feature_for_player_into(
+        &self,
+        board: &Board,
+        mv: Move,
+        dr: i32,
+        dc: i32,
+        perspective: Player,
+        output: &mut [f32],
+    ) {
+        let (first_code, second_code) = local_ray_codes_for_player(board, mv, dr, dc, perspective);
+        let pattern = second_code * (second_code + 1) / 2 + first_code;
+        output.copy_from_slice(
+            &self.local_axis_embedding
+                [pattern * LOCAL_AXIS_FEATURE_SIZE..(pattern + 1) * LOCAL_AXIS_FEATURE_SIZE],
+        );
     }
 
     fn policy_logit(&self, hidden: &[f32], local: &[f32], mv: Move) -> f32 {
@@ -477,12 +720,6 @@ impl PolicyValueModel {
         )?;
         insert(
             &vars,
-            "value_local_output",
-            &self.value_local_output,
-            (WDL_SIZE, VALUE_LOCAL_SIZE),
-        )?;
-        insert(
-            &vars,
             "value_head_hidden2",
             &self.value_head_hidden2,
             (VALUE_HEAD_SIZE, VALUE_HEAD_SIZE),
@@ -498,6 +735,12 @@ impl PolicyValueModel {
             "value_head_output",
             &self.value_head_output,
             (WDL_SIZE, VALUE_HEAD_SIZE),
+        )?;
+        insert(
+            &vars,
+            "value_pattern_output",
+            &self.value_pattern_output,
+            (WDL_SIZE, VALUE_PATTERN_SIZE),
         )?;
         vars.save(path).map_err(candle_error)
     }
@@ -536,11 +779,11 @@ impl PolicyValueModel {
             local_axis_embedding: load(&tensors, "local_axis_embedding")?,
             policy_local: load(&tensors, "policy_local")?,
             value_head_hidden: load(&tensors, "value_head_hidden")?,
-            value_local_output: load(&tensors, "value_local_output")?,
             value_head_bias: load(&tensors, "value_head_bias")?,
             value_head_hidden2: load(&tensors, "value_head_hidden2")?,
             value_head_bias2: load(&tensors, "value_head_bias2")?,
             value_head_output: load(&tensors, "value_head_output")?,
+            value_pattern_output: load(&tensors, "value_pattern_output")?,
         };
         if model.input_hidden.len() != INPUT_SIZE * hidden_size
             || model.stone_hidden.len() != STONE_TYPES * hidden_size
@@ -553,11 +796,11 @@ impl PolicyValueModel {
             || model.local_axis_embedding.len() != LOCAL_AXIS_PATTERNS * LOCAL_AXIS_FEATURE_SIZE
             || model.policy_local.len() != LOCAL_CANDIDATE_SIZE
             || model.value_head_hidden.len() != hidden_size * VALUE_HEAD_SIZE
-            || model.value_local_output.len() != WDL_SIZE * VALUE_LOCAL_SIZE
             || model.value_head_bias.len() != VALUE_HEAD_SIZE
             || model.value_head_hidden2.len() != VALUE_HEAD_SIZE * VALUE_HEAD_SIZE
             || model.value_head_bias2.len() != VALUE_HEAD_SIZE
             || model.value_head_output.len() != VALUE_HEAD_SIZE * WDL_SIZE
+            || model.value_pattern_output.len() != VALUE_PATTERN_SIZE * WDL_SIZE
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -589,16 +832,61 @@ impl PolicyValueModel {
         blend!(local_axis_embedding);
         blend!(policy_local);
         blend!(value_head_hidden);
-        blend!(value_local_output);
         blend!(value_head_bias);
         blend!(value_head_hidden2);
         blend!(value_head_bias2);
         blend!(value_head_output);
+        blend!(value_pattern_output);
     }
 }
 
+const ZOBRIST_SIDE: u64 = 0xA5A5_5A5A_D3C7_B19D;
+
+fn zobrist_piece(mv: Move, player: Player) -> u64 {
+    let mut value = mv.0 as u64
+        ^ if player == Player::Black {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            0xD1B5_4A32_D192_ED03
+        };
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
+fn board_hash(board: &Board) -> u64 {
+    let mut hash = if board.to_move() == Player::White {
+        ZOBRIST_SIDE
+    } else {
+        0
+    };
+    for (index, &stone) in board.cells().iter().enumerate() {
+        let player = if stone == Player::Black.stone() {
+            Some(Player::Black)
+        } else if stone == Player::White.stone() {
+            Some(Player::White)
+        } else {
+            None
+        };
+        if let Some(player) = player {
+            hash ^= zobrist_piece(Move(index), player);
+        }
+    }
+    hash
+}
+
 pub(crate) fn local_ray_codes(board: &Board, mv: Move, dr: i32, dc: i32) -> (usize, usize) {
-    let us = board.to_move().stone();
+    local_ray_codes_for_player(board, mv, dr, dc, board.to_move())
+}
+
+fn local_ray_codes_for_player(
+    board: &Board,
+    mv: Move,
+    dr: i32,
+    dc: i32,
+    perspective: Player,
+) -> (usize, usize) {
+    let us = perspective.stone();
     let axis = match (dr, dc) {
         (1, 0) | (-1, 0) => 0,
         (0, 1) | (0, -1) => 1,
@@ -855,10 +1143,14 @@ mod tests {
         let mut ema = PolicyValueModel::random(8, 1);
         assert!(ema.policy_bias.iter().all(|&bias| bias == 0.0));
         online.policy_bias[0] = 1.0;
+        online.value_head_output[0] = 1.0;
         let before = ema.policy_bias[0];
+        let value_before = ema.value_head_output[0];
         ema.update_ema(&online, 0.75);
         let expected = before * 0.75 + online.policy_bias[0] * 0.25;
+        let value_expected = value_before * 0.75 + online.value_head_output[0] * 0.25;
         assert!((ema.policy_bias[0] - expected).abs() < 1e-6);
+        assert!((ema.value_head_output[0] - value_expected).abs() < 1e-6);
         assert_eq!(ema.policy_bias.len(), CELL_COUNT);
     }
 
@@ -866,7 +1158,7 @@ mod tests {
     fn local_outputs_start_without_manual_bias() {
         let model = PolicyValueModel::random(8, 5);
         assert!(model.policy_local.iter().all(|&weight| weight == 0.0));
-        assert!(model.value_local_output.iter().all(|&weight| weight == 0.0));
+        assert!(model.value_head_output.iter().all(|&weight| weight == 0.0));
     }
 
     #[test]
@@ -882,9 +1174,86 @@ mod tests {
     }
 
     #[test]
-    fn v10_model_roundtrip_preserves_local_parameters() {
+    fn lazy_move_logits_match_batched_policy_softmax() {
+        let model = PolicyValueModel::random(16, 29);
+        let mut board = Board::new();
+        assert!(board.play(Move::parse("h8").unwrap()));
+        let (policy, _) = model.evaluate(&board);
+        let first = policy[0];
+        let second = policy[1];
+        let first_logit = model.evaluate_move_logit(&board, first.0).unwrap();
+        let second_logit = model.evaluate_move_logit(&board, second.0).unwrap();
+
+        let expected_ratio = (first_logit - second_logit).exp();
+        let actual_ratio = first.1 / second.1;
+        assert!((expected_ratio - actual_ratio).abs() < 1e-5);
+        assert!(
+            model
+                .evaluate_move_logit(&board, Move::parse("h8").unwrap())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn value_incremental_state_matches_rebuilt_state() {
+        let mut model = PolicyValueModel::random(16, 19);
+        model.value_head_output[0] = 1.0;
+        model.value_head_output[VALUE_HEAD_SIZE * 2] = -1.0;
+        model.value_pattern_output[0] = 1.0;
+        model.value_pattern_output[VALUE_PATTERN_SIZE * 2] = -1.0;
+
+        let mut board = Board::new();
+        assert!(board.play(Move::parse("h8").unwrap()));
+        let parent = model.accumulator(&board);
+        let player = board.to_move();
+        let mv = Move::parse("h9").unwrap();
+        let board_before = board.clone();
+        assert!(board.play(mv));
+
+        let child = model.accumulator_after_move(&parent, &board_before, &board, mv, player);
+        let rebuilt = model.accumulator(&board);
+        for (incremental, rebuilt) in child.local_black.iter().zip(&rebuilt.local_black) {
+            assert!((incremental - rebuilt).abs() < 1e-6);
+        }
+        for (incremental, rebuilt) in child.local_white.iter().zip(&rebuilt.local_white) {
+            assert!((incremental - rebuilt).abs() < 1e-6);
+        }
+        let mut child_scratch = EvalScratch::new(model.hidden_size);
+        let mut rebuilt_scratch = EvalScratch::new(model.hidden_size);
+        let child_value = model.evaluate_value_with_scratch(&board, &child, &mut child_scratch);
+        let rebuilt_value =
+            model.evaluate_value_with_scratch(&board, &rebuilt, &mut rebuilt_scratch);
+
+        assert!((child_value - rebuilt_value).abs() < 1e-6);
+        assert!((model.evaluate_value(&board) - rebuilt_value).abs() < 1e-6);
+    }
+
+    #[test]
+    fn local_board_summary_is_symmetry_invariant() {
+        let model = PolicyValueModel::random(16, 31);
+        let mut board = Board::new();
+        for text in ["h8", "h9", "i8", "g9", "j7"] {
+            assert!(board.play(Move::parse(text).unwrap()));
+        }
+        let black = model.local_board_summary(&board, Player::Black);
+        let white = model.local_board_summary(&board, Player::White);
+        for symmetry in 0..8 {
+            let transformed = board.transformed(symmetry);
+            let transformed_black = model.local_board_summary(&transformed, Player::Black);
+            let transformed_white = model.local_board_summary(&transformed, Player::White);
+            for (left, right) in black.iter().zip(transformed_black) {
+                assert!((left - right).abs() < 1e-6);
+            }
+            for (left, right) in white.iter().zip(transformed_white) {
+                assert!((left - right).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn v13_model_roundtrip_preserves_policy_and_value_parameters() {
         let path = std::env::temp_dir().join(format!(
-            "gomoku-v10-roundtrip-{}-{}.safetensors",
+            "gomoku-v13-roundtrip-{}-{}.safetensors",
             std::process::id(),
             SplitMix64(11).next()
         ));
@@ -894,6 +1263,7 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert_eq!(restored.local_axis_embedding, model.local_axis_embedding);
         assert_eq!(restored.policy_local, model.policy_local);
-        assert_eq!(restored.value_local_output, model.value_local_output);
+        assert_eq!(restored.value_head_output, model.value_head_output);
+        assert_eq!(restored.value_pattern_output, model.value_pattern_output);
     }
 }

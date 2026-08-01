@@ -1,3 +1,4 @@
+pub mod alphabeta;
 pub mod async_selfplay;
 pub mod az_loop;
 pub mod az_loop_config;

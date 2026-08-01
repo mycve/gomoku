@@ -89,6 +89,9 @@ impl Board {
     pub fn move_count(&self) -> usize {
         self.moves
     }
+    pub fn last_move(&self) -> Option<Move> {
+        self.last
+    }
     pub fn from_stones(stones: &[(Move, Player)]) -> Option<Self> {
         let mut cells = vec![0; CELL_COUNT];
         let mut black = 0usize;

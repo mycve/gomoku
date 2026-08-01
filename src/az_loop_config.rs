@@ -18,6 +18,11 @@ pub struct AzLoopConfig {
     pub selfplay_workers: usize,
     pub selfplay_queue_capacity: usize,
     pub selfplay_random_opening_probability: f32,
+    pub selfplay_pvs_probability: f32,
+    pub selfplay_pvs_nodes: u64,
+    pub selfplay_pvs_depth: u16,
+    pub selfplay_pvs_threat_depth: u16,
+    pub selfplay_pvs_prior_boost: f32,
     pub learning_rate: f32,
     pub learning_rate_min: f32,
     pub learning_rate_decay: f32,
@@ -67,6 +72,11 @@ impl Default for AzLoopConfig {
             selfplay_workers: 196,
             selfplay_queue_capacity: 0,
             selfplay_random_opening_probability: 0.25,
+            selfplay_pvs_probability: 0.05,
+            selfplay_pvs_nodes: 2_000,
+            selfplay_pvs_depth: 3,
+            selfplay_pvs_threat_depth: 8,
+            selfplay_pvs_prior_boost: 2.0,
             learning_rate: 0.0008,
             learning_rate_min: 0.0002,
             learning_rate_decay: 0.90,
@@ -125,6 +135,8 @@ impl AzLoopConfig {
                 "selfplay_random_opening_probability",
                 self.selfplay_random_opening_probability,
             ),
+            ("selfplay_pvs_probability", self.selfplay_pvs_probability),
+            ("selfplay_pvs_prior_boost", self.selfplay_pvs_prior_boost),
             ("learning_rate_min", self.learning_rate_min),
             ("learning_rate_decay", self.learning_rate_decay),
             ("cpuct", self.cpuct),
@@ -180,9 +192,18 @@ impl AzLoopConfig {
             || self.arena_promotion_confidence_z < 0.0
             || !(0.0..=1.0).contains(&self.replay_recent_sample_fraction)
             || !(0.0..=1.0).contains(&self.selfplay_random_opening_probability)
+            || !(0.0..=1.0).contains(&self.selfplay_pvs_probability)
+            || self.selfplay_pvs_prior_boost < 1.0
         {
             return Err(io::Error::other(
                 "配置中的学习率、搜索或比例参数超出合法范围",
+            ));
+        }
+        if self.selfplay_pvs_probability > 0.0
+            && (self.selfplay_pvs_nodes == 0 || self.selfplay_pvs_depth == 0)
+        {
+            return Err(io::Error::other(
+                "启用自博弈 PVS 顾问时，节点预算和主搜索深度必须大于 0",
             ));
         }
         if self.arena_interval > 0 && (self.arena_games == 0 || self.arena_simulations == 0) {
@@ -211,6 +232,11 @@ selfplay_samples_per_update = 50000
 selfplay_workers = 196
 selfplay_queue_capacity = 0
 selfplay_random_opening_probability = 0.25
+selfplay_pvs_probability = 0.05
+selfplay_pvs_nodes = 2000
+selfplay_pvs_depth = 3
+selfplay_pvs_threat_depth = 8
+selfplay_pvs_prior_boost = 2.0
 learning_rate = 0.0008
 learning_rate_min = 0.0002
 learning_rate_decay = 0.90

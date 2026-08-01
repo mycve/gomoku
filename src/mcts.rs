@@ -21,6 +21,11 @@ pub struct SearchConfig {
     pub random_opening_probability: f32,
     pub opening_random_plies: usize,
     pub opening_seed: u64,
+    pub pvs_prior_probability: f32,
+    pub pvs_prior_nodes: u64,
+    pub pvs_prior_depth: u16,
+    pub pvs_prior_threat_depth: u16,
+    pub pvs_prior_boost: f32,
 }
 impl Default for SearchConfig {
     fn default() -> Self {
@@ -40,8 +45,20 @@ impl Default for SearchConfig {
             random_opening_probability: 0.0,
             opening_random_plies: 0,
             opening_seed: 0,
+            pvs_prior_probability: 0.0,
+            pvs_prior_nodes: 2_000,
+            pvs_prior_depth: 3,
+            pvs_prior_threat_depth: 8,
+            pvs_prior_boost: 2.0,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RootPriorHint {
+    pub mv: Move,
+    pub boost: f32,
+    pub force: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -66,7 +83,16 @@ struct Edge {
 }
 
 pub fn search(board: &Board, model: &PolicyValueModel, cfg: SearchConfig) -> Vec<Candidate> {
-    search_until(board, model, cfg, None)
+    search_until(board, model, cfg, None, None)
+}
+
+pub fn search_with_root_hint(
+    board: &Board,
+    model: &PolicyValueModel,
+    cfg: SearchConfig,
+    hint: RootPriorHint,
+) -> Vec<Candidate> {
+    search_until(board, model, cfg, None, Some(hint))
 }
 
 pub fn search_timed(
@@ -75,7 +101,7 @@ pub fn search_timed(
     cfg: SearchConfig,
     time_limit: Duration,
 ) -> Vec<Candidate> {
-    search_until(board, model, cfg, Some(Instant::now() + time_limit))
+    search_until(board, model, cfg, Some(Instant::now() + time_limit), None)
 }
 
 fn search_until(
@@ -83,6 +109,7 @@ fn search_until(
     model: &PolicyValueModel,
     cfg: SearchConfig,
     deadline: Option<Instant>,
+    root_hint: Option<RootPriorHint>,
 ) -> Vec<Candidate> {
     crate::scope_profile!("mcts.search");
     let mut scratch = EvalScratch::new(model.hidden_size);
@@ -92,7 +119,7 @@ fn search_until(
         children: vec![],
         expanded: false,
     }];
-    expand(&mut nodes, 0, model, cfg, &mut scratch);
+    expand(&mut nodes, 0, model, cfg, &mut scratch, root_hint);
     for simulation in 0..cfg.simulations {
         if simulation > 0 && deadline.is_some_and(|limit| Instant::now() >= limit) {
             break;
@@ -122,6 +149,7 @@ fn expand(
     model: &PolicyValueModel,
     cfg: SearchConfig,
     scratch: &mut EvalScratch,
+    root_hint: Option<RootPriorHint>,
 ) -> f32 {
     crate::scope_profile!("mcts.expand");
     if let Some(out) = nodes[idx].board.outcome() {
@@ -155,6 +183,11 @@ fn expand(
         );
         for ((_, prior), noisy) in policy.iter_mut().zip(priors) {
             *prior = noisy;
+        }
+    }
+    if idx == 0 {
+        if let Some(hint) = root_hint {
+            apply_root_prior_hint(&mut policy, hint);
         }
     }
     {
@@ -193,7 +226,7 @@ fn simulate(
         };
     }
     if !nodes[idx].expanded {
-        return expand(nodes, idx, model, cfg, scratch);
+        return expand(nodes, idx, model, cfg, scratch, None);
     }
     let best = {
         crate::scope_profile!("mcts.select_child");
@@ -227,8 +260,14 @@ fn simulate(
         let mut b = nodes[idx].board.clone();
         let mv = nodes[idx].children[best].mv;
         let player = b.to_move();
-        let accumulator = model.accumulator_after_move(&nodes[idx].accumulator, mv, player);
         b.play(mv);
+        let accumulator = model.accumulator_after_move(
+            &nodes[idx].accumulator,
+            &nodes[idx].board,
+            &b,
+            mv,
+            player,
+        );
         let c = nodes.len();
         nodes.push(Node {
             board: b,
@@ -244,6 +283,31 @@ fn simulate(
     e.visits += 1;
     e.value_sum += value;
     value
+}
+
+fn apply_root_prior_hint(policy: &mut [(Move, f32)], hint: RootPriorHint) {
+    if !policy.iter().any(|(mv, _)| *mv == hint.mv) {
+        return;
+    }
+    if hint.force {
+        for (mv, prior) in policy {
+            *prior = f32::from(*mv == hint.mv);
+        }
+        return;
+    }
+    for (mv, prior) in policy.iter_mut() {
+        if *mv == hint.mv {
+            *prior *= hint.boost.max(1.0);
+        }
+    }
+    let sum = policy
+        .iter()
+        .map(|(_, prior)| *prior)
+        .sum::<f32>()
+        .max(1e-12);
+    for (_, prior) in policy {
+        *prior /= sum;
+    }
 }
 
 fn apply_root_dirichlet_noise(priors: &mut [f32], alpha: f32, fraction: f32, seed: u64) {
@@ -344,5 +408,37 @@ mod tests {
             full.iter().map(|candidate| candidate.visits).sum::<u32>(),
             128
         );
+    }
+
+    #[test]
+    fn forced_root_hint_becomes_the_only_prior() {
+        let mut board = Board::new();
+        assert!(board.play(Move::parse("h8").unwrap()));
+        let model = PolicyValueModel::random(8, 19);
+        let hinted = Move::parse("h9").unwrap();
+        let candidates = search_with_root_hint(
+            &board,
+            &model,
+            SearchConfig {
+                simulations: 1,
+                ..Default::default()
+            },
+            RootPriorHint {
+                mv: hinted,
+                boost: 2.0,
+                force: true,
+            },
+        );
+        assert_eq!(
+            candidates.iter().find(|x| x.mv == hinted).unwrap().prior,
+            1.0
+        );
+        assert!(
+            candidates
+                .iter()
+                .filter(|x| x.mv != hinted)
+                .all(|x| x.prior == 0.0)
+        );
+        assert_eq!(candidates[0].mv, hinted);
     }
 }

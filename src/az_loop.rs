@@ -159,6 +159,11 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             temperature_value_cutoff: config.temperature_value_cutoff,
             temperature_visit_offset: config.temperature_visit_offset,
             random_opening_probability: config.selfplay_random_opening_probability,
+            pvs_prior_probability: config.selfplay_pvs_probability,
+            pvs_prior_nodes: config.selfplay_pvs_nodes,
+            pvs_prior_depth: config.selfplay_pvs_depth,
+            pvs_prior_threat_depth: config.selfplay_pvs_threat_depth,
+            pvs_prior_boost: config.selfplay_pvs_prior_boost,
             ..Default::default()
         },
         config.seed,
@@ -408,6 +413,8 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         let games = event.batch.games.max(1) as f32;
         let searches = event.batch.stats.searches.max(1) as f32;
         let sampled_moves = event.batch.stats.sampled_moves.max(1) as f32;
+        let pvs_calls = event.batch.stats.pvs_calls.max(1) as f32;
+        let pvs_hints = event.batch.stats.pvs_hints.max(1) as f32;
         tb.add_scalar("train/learning_rate", event.learning_rate, progress.update);
         tb.add_scalar("train/seconds", event.train_seconds, progress.update);
         tb.add_scalar(
@@ -509,6 +516,31 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         tb.add_scalar(
             "search/temperature_q_gap",
             event.batch.stats.sampled_q_gap_sum / sampled_moves,
+            progress.update,
+        );
+        tb.add_scalar(
+            "hybrid/pvs_call_rate",
+            event.batch.stats.pvs_calls as f32 / searches,
+            progress.update,
+        );
+        tb.add_scalar(
+            "hybrid/pvs_completion_rate",
+            event.batch.stats.pvs_completed as f32 / pvs_calls,
+            progress.update,
+        );
+        tb.add_scalar(
+            "hybrid/pvs_proven_win_rate",
+            event.batch.stats.pvs_proven_wins as f32 / pvs_calls,
+            progress.update,
+        );
+        tb.add_scalar(
+            "hybrid/pvs_mcts_top1_agreement",
+            event.batch.stats.pvs_mcts_agreements as f32 / pvs_hints,
+            progress.update,
+        );
+        tb.add_scalar(
+            "hybrid/pvs_hint_average_rank",
+            event.batch.stats.pvs_hint_rank_sum as f32 / pvs_hints,
             progress.update,
         );
         tb.add_scalar(

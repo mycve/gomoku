@@ -3,7 +3,7 @@ use crate::{
     model::{
         AXIS_FEATURES, DIAGONAL_FEATURES, INPUT_SIZE, LOCAL_AXES, LOCAL_AXIS_FEATURE_SIZE,
         LOCAL_AXIS_PATTERNS, LOCAL_CANDIDATE_SIZE, PolicyValueModel, STONE_TYPES, VALUE_HEAD_SIZE,
-        VALUE_LOCAL_SIZE, WDL_SIZE, local_ray_codes,
+        VALUE_PATTERN_SIZE, WDL_SIZE, local_ray_codes,
     },
     replay::Sample,
     selfplay::TrainStats,
@@ -153,11 +153,11 @@ struct Replica {
     local_axis_embedding: Var,
     policy_local: Var,
     value_head_hidden: Var,
-    value_local_output: Var,
     value_head_bias: Var,
     value_head_hidden2: Var,
     value_head_bias2: Var,
     value_head_output: Var,
+    value_pattern_output: Var,
 }
 impl Replica {
     fn new(model: &PolicyValueModel, device: &Device) -> io::Result<Self> {
@@ -180,11 +180,6 @@ impl Replica {
             )?,
             policy_local: var(&model.policy_local, (LOCAL_CANDIDATE_SIZE,), device)?,
             value_head_hidden: var(&model.value_head_hidden, (VALUE_HEAD_SIZE, h), device)?,
-            value_local_output: var(
-                &model.value_local_output,
-                (WDL_SIZE, VALUE_LOCAL_SIZE),
-                device,
-            )?,
             value_head_bias: var(&model.value_head_bias, (VALUE_HEAD_SIZE,), device)?,
             value_head_hidden2: var(
                 &model.value_head_hidden2,
@@ -195,6 +190,11 @@ impl Replica {
             value_head_output: var(
                 &model.value_head_output,
                 (WDL_SIZE, VALUE_HEAD_SIZE),
+                device,
+            )?,
+            value_pattern_output: var(
+                &model.value_pattern_output,
+                (WDL_SIZE, VALUE_PATTERN_SIZE),
                 device,
             )?,
         })
@@ -213,11 +213,11 @@ impl Replica {
             self.local_axis_embedding.clone(),
             self.policy_local.clone(),
             self.value_head_hidden.clone(),
-            self.value_local_output.clone(),
             self.value_head_bias.clone(),
             self.value_head_hidden2.clone(),
             self.value_head_bias2.clone(),
             self.value_head_output.clone(),
+            self.value_pattern_output.clone(),
         ]
     }
     fn backward(&self, samples: &[Sample]) -> io::Result<BatchOutput> {
@@ -255,9 +255,6 @@ impl Replica {
             &self.device,
         )
         .map_err(err)?;
-        let local_legal_mask =
-            Tensor::from_vec(packed.local_legal_mask, (b, CELL_COUNT, 1), &self.device)
-                .map_err(err)?;
         let hidden = {
             crate::scope_profile!("train.forward");
             inputs
@@ -311,19 +308,6 @@ impl Replica {
             .and_then(|x| x.sum_all())
             .and_then(|x| x.affine(-1.0, 0.0))
             .map_err(err)?;
-        let legal_counts = local_legal_mask.sum(1).map_err(err)?;
-        let masked_local_candidates = local_candidates
-            .broadcast_mul(&local_legal_mask)
-            .map_err(err)?;
-        let local_board_mean = masked_local_candidates
-            .sum(1)
-            .and_then(|x| x.broadcast_div(&legal_counts))
-            .map_err(err)?;
-        let local_board_max = local_candidates
-            .broadcast_add(&masks.unsqueeze(2).map_err(err)?)
-            .and_then(|x| x.max(1))
-            .map_err(err)?;
-        let local_value = Tensor::cat(&[&local_board_mean, &local_board_max], 1).map_err(err)?;
         let value_features = hidden
             .matmul(&self.value_head_hidden.t().map_err(err)?)
             .and_then(|x| x.broadcast_add(&self.value_head_bias))
@@ -332,9 +316,13 @@ impl Replica {
             .and_then(|x| x.broadcast_add(&self.value_head_bias2))
             .and_then(|x| x.relu())
             .map_err(err)?;
+        let value_pattern = local_candidates
+            .narrow(2, 0, VALUE_PATTERN_SIZE)
+            .and_then(|x| x.mean(1))
+            .map_err(err)?;
         let value_logits = value_features
             .matmul(&self.value_head_output.t().map_err(err)?)
-            .and_then(|x| x.add(&local_value.matmul(&self.value_local_output.t()?)?))
+            .and_then(|x| x.add(&value_pattern.matmul(&self.value_pattern_output.t()?)?))
             .map_err(err)?;
         let value_log_probs = log_softmax(&value_logits, 1).map_err(err)?;
         let value_sum_tensor = value_wdl
@@ -397,11 +385,11 @@ impl Replica {
         m.local_axis_embedding = v[9].clone();
         m.policy_local = v[10].clone();
         m.value_head_hidden = v[11].clone();
-        m.value_local_output = v[12].clone();
-        m.value_head_bias = v[13].clone();
-        m.value_head_hidden2 = v[14].clone();
-        m.value_head_bias2 = v[15].clone();
-        m.value_head_output = v[16].clone();
+        m.value_head_bias = v[12].clone();
+        m.value_head_hidden2 = v[13].clone();
+        m.value_head_bias2 = v[14].clone();
+        m.value_head_output = v[15].clone();
+        m.value_pattern_output = v[16].clone();
         Ok(())
     }
 }
@@ -451,7 +439,6 @@ struct Packed {
     policy_targets: Vec<f32>,
     policy_masks: Vec<f32>,
     local_axis_indices: Vec<u32>,
-    local_legal_mask: Vec<f32>,
     value_wdl: Vec<f32>,
 }
 fn pack(samples: &[Sample]) -> Packed {
@@ -464,7 +451,6 @@ fn pack(samples: &[Sample]) -> Packed {
     let mut targets = vec![0.0; samples.len() * CELL_COUNT];
     let mut masks = vec![-1e9; samples.len() * CELL_COUNT];
     let mut local_axis_indices = vec![0_u32; samples.len() * CELL_COUNT * LOCAL_AXES];
-    let mut local_legal_mask = vec![0.0; samples.len() * CELL_COUNT];
     let mut value_wdl = Vec::with_capacity(samples.len() * WDL_SIZE);
     for (row, s) in samples.iter().enumerate() {
         let us = s.board.to_move().stone();
@@ -488,7 +474,6 @@ fn pack(samples: &[Sample]) -> Packed {
         inputs[row * INPUT_SIZE + INPUT_SIZE - 1] = s.board.move_count() as f32 / CELL_COUNT as f32;
         for m in s.board.search_candidates() {
             masks[row * CELL_COUNT + m.0] = 0.0;
-            local_legal_mask[row * CELL_COUNT + m.0] = 1.0;
             for (axis, (dr, dc)) in [(1, 0), (0, 1), (1, 1), (1, -1)].into_iter().enumerate() {
                 let (first, second) = local_ray_codes(&s.board, m, dr, dc);
                 let pattern = second * (second + 1) / 2 + first;
@@ -520,7 +505,6 @@ fn pack(samples: &[Sample]) -> Packed {
         policy_targets: targets,
         policy_masks: masks,
         local_axis_indices,
-        local_legal_mask,
         value_wdl,
     }
 }
@@ -551,11 +535,8 @@ mod tests {
         }]);
 
         assert_eq!(packed.policy_masks[occupied.0], -1e9);
-        assert_eq!(packed.local_legal_mask[occupied.0], 0.0);
         assert_eq!(packed.policy_masks[corner.0], -1e9);
-        assert_eq!(packed.local_legal_mask[corner.0], 0.0);
         assert_eq!(packed.policy_masks[nearby.0], 0.0);
-        assert_eq!(packed.local_legal_mask[nearby.0], 1.0);
         assert_eq!(packed.policy_targets[nearby.0], 1.0);
     }
 
@@ -563,6 +544,7 @@ mod tests {
     fn trains_policy_and_value_on_available_device() {
         let mut model = PolicyValueModel::random(16, 9);
         let before_local = model.local_axis_embedding.clone();
+        let before_pattern_output = model.value_pattern_output.clone();
         let mut board = Board::new();
         assert!(board.play(Move::new(7, 7).unwrap()));
         assert!(board.play(Move::new(7, 8).unwrap()));
@@ -578,6 +560,7 @@ mod tests {
         assert!(stats.value_loss.is_finite());
         assert!(model.policy_local.iter().any(|&weight| weight != 0.0));
         assert_ne!(model.local_axis_embedding, before_local);
+        assert_ne!(model.value_pattern_output, before_pattern_output);
         let (policy, value) = model.evaluate(&Board::new());
         assert_eq!(policy.len(), 1);
         assert!(
@@ -586,5 +569,26 @@ mod tests {
                 .all(|(_, probability)| probability.is_finite())
         );
         assert!(value.is_finite());
+    }
+
+    #[test]
+    fn candidate_independent_value_learns_outcome_supervision() {
+        let mut model = PolicyValueModel::random(16, 23);
+        let mut board = Board::new();
+        assert!(board.play(Move::new(7, 7).unwrap()));
+        assert!(board.play(Move::new(7, 8).unwrap()));
+        let before = model.evaluate_value(&board);
+        let sample = Sample {
+            board: board.clone(),
+            policy: vec![(Move::new(8, 7).unwrap(), 1.0)],
+            value: 1.0,
+            generation: 0,
+        };
+
+        let stats = train(&mut model, &[sample], 20, 1e-2, 1, 0).unwrap();
+        let after = model.evaluate_value(&board);
+
+        assert!(stats.value_loss.is_finite());
+        assert!(after > before + 0.1, "before={before} after={after}");
     }
 }

@@ -12,6 +12,7 @@ cargo run -- az-init model.safetensors 192
 cargo run -- az-loop                 # 首次生成 gomoku.azloop.toml
 cargo run -- az-loop --target-update 10
 cargo run -- az-search model.safetensors 3000 1.5 h8 h9 i8
+cargo run --release -- az-alpha-beta model.safetensors --depth 8 --nodes 100000 h8 h9 i8
 cargo run -- az-bench model.safetensors 3000 20
 cargo run -- az-train-bench
 cargo run -- az-eval-best best.safetensors 3000 --human-side black
@@ -190,7 +191,11 @@ Policy 和 Value 均只从可训练的棋盘结构编码中学习，不注入成
 监督，不混入当前网络搜索产生的 Q 值。
 MCTS 节点还缓存黑白双视角的增量累加器，扩展子节点时只加入新落子和手数特征，
 避免每次叶子求值重新扫描整盘。
-模型格式为 v10。`rule_legal_moves()` 只返回规则允许的全部空点；搜索和训练只调用
+模型格式为 v13。模型只有一个候选无关 WDL：它读取棋盘增量状态以及全棋盘四轴局部
+pattern 的双视角增量均值，不生成候选着；根节点扫描一次，子节点只重算落子影响的
+固定窗口。
+同时供 MCTS 和后续 Alpha-Beta/PVS 使用。Policy 是可逐着计算的未归一化 move logit；
+MCTS 对候选批量计算并 softmax，PVS 可按需延迟计算。`rule_legal_moves()` 只返回规则允许的全部空点；搜索和训练只调用
 `search_candidates()`，使用显式半径 3 候选生成器。空棋盘从中心开始；非终局且棋盘
 未满时若候选为空会立即触发断言暴露错误，不会静默扩大搜索空间。价值塔采用适合
 NEON/AVX2/FMA 点积的输出优先布局。旧模型不再
@@ -201,7 +206,7 @@ NEON/AVX2/FMA 点积的输出优先布局。旧模型不再
 启动会加载该快照并立即删除已消费的快照文件，避免旧快照被重复加载；正常达到目标
 更新退出时不会保留中断快照。
 
-开始全新 v10 训练时，应先停止旧进程，再只删除该实验对应文件和旧配置：
+开始全新 v13 训练时，应先停止旧进程，再只删除该实验对应文件和旧配置：
 
 ```bash
 rm -f model.safetensors ema.safetensors best.safetensors

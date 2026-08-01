@@ -1,5 +1,6 @@
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use gomoku::{
+    alphabeta::{AlphaBetaConfig, search as alpha_beta_search},
     az_loop,
     az_loop_config::{DEFAULT_CONFIG_PATH, load_or_create},
     candle_train,
@@ -36,6 +37,12 @@ enum Command {
     AzBench(AzBenchArgs),
     /// 测试回放样本训练速度。
     AzTrainBench(AzTrainBenchArgs),
+    /// 比较完整 Policy/Value 与候选无关 Value 路径。
+    AzValueBench(AzValueBenchArgs),
+    /// 使用保守 PVS/Alpha-Beta 搜索局面。
+    AzAlphaBeta(AzAlphaBetaArgs),
+    /// 在回放样本上评估候选无关 WDL 的误差与入口一致性。
+    AzValueEval(AzValueEvalArgs),
     /// 按 TOML 配置持续执行自博弈训练。
     AzLoop(AzLoopArgs),
     /// 人工在控制台挑战 Best 模型。
@@ -95,6 +102,40 @@ struct AzTrainBenchArgs {
     batch_size: usize,
     #[arg(long, default_value_t = 0)]
     gpu_device: usize,
+}
+
+#[derive(Args)]
+struct AzValueBenchArgs {
+    #[arg(default_value = "model.safetensors")]
+    model: String,
+    #[arg(long, default_value_t = 100_000)]
+    iterations: usize,
+    /// 已落子坐标序列，例如 h8 h9 i8。
+    moves: Vec<String>,
+}
+
+#[derive(Args)]
+struct AzAlphaBetaArgs {
+    #[arg(default_value = "model.safetensors")]
+    model: String,
+    #[arg(long, default_value_t = 8)]
+    depth: u16,
+    #[arg(long, default_value_t = 100_000)]
+    nodes: u64,
+    #[arg(long, default_value_t = 8)]
+    threat_depth: u16,
+    /// 已落子坐标序列，例如 h8 h9 i8。
+    moves: Vec<String>,
+}
+
+#[derive(Args)]
+struct AzValueEvalArgs {
+    #[arg(default_value = "model.safetensors")]
+    model: String,
+    #[arg(default_value = "data/replay.jsonl")]
+    replay: String,
+    #[arg(long, default_value_t = 10_000)]
+    limit: usize,
 }
 
 #[derive(Args)]
@@ -160,7 +201,7 @@ fn main() -> io::Result<()> {
             PolicyValueModel::random(args.hidden, args.seed).save(&args.output)?;
             println!("model    : initialized {}", args.output);
             println!(
-                "arch     : input=451 hidden={} rmsnorm local=4axesx8cells-pattern2 policy=225 value=96x96xWDL3",
+                "arch     : input=451 hidden={} rmsnorm local=4axesx8cells-pattern2 incremental-axis-mean move-logit=lazy value=96x96xWDL3(candidate-independent)",
                 args.hidden
             );
             println!("board    : 15x15 freestyle gomoku");
@@ -231,6 +272,103 @@ fn main() -> io::Result<()> {
             println!(
                 "loss     : total={:.4} policy={:.4} value={:.4}",
                 stats.loss, stats.policy_loss, stats.value_loss
+            );
+        }
+        Some(Command::AzValueBench(args)) => {
+            let model = load_model(&args.model)?;
+            let board = board_from_moves(&args.moves)?;
+            let result = model.benchmark_value_paths(&board, args.iterations);
+            let full_eps = result.iterations as f64 / result.policy_value_seconds.max(1e-9);
+            let value_eps = result.iterations as f64 / result.value_seconds.max(1e-9);
+            let update_eps = result.iterations as f64 / result.update_seconds.max(1e-9);
+            println!("position : moves={}", board.move_count());
+            println!(
+                "full     : value={:.6} elapsed={:.3}s eval/s={full_eps:.0}",
+                result.value, result.policy_value_seconds
+            );
+            println!(
+                "value    : value={:.6} elapsed={:.3}s eval/s={value_eps:.0}",
+                result.value, result.value_seconds
+            );
+            println!("compare  : speedup={:.2}x", value_eps / full_eps.max(1e-9));
+            println!(
+                "update   : elapsed={:.3}s updates/s={update_eps:.0}",
+                result.update_seconds
+            );
+        }
+        Some(Command::AzAlphaBeta(args)) => {
+            let model = load_model(&args.model)?;
+            let board = board_from_moves(&args.moves)?;
+            let result = alpha_beta_search(
+                &board,
+                &model,
+                AlphaBetaConfig {
+                    max_depth: args.depth,
+                    max_nodes: args.nodes,
+                    threat_extension_depth: args.threat_depth,
+                },
+            );
+            println!("{board}");
+            println!(
+                "pvs      : best={} value={:.4} depth={} nodes={} elapsed={:.3}s nodes/s={:.0}",
+                result
+                    .best_move
+                    .map(|mv| mv.notation())
+                    .unwrap_or_else(|| "none".into()),
+                result.value,
+                result.completed_depth,
+                result.nodes,
+                result.elapsed_seconds,
+                result.nodes as f64 / result.elapsed_seconds.max(1e-9)
+            );
+            println!(
+                "search   : tt_hits={} beta_cutoffs={} threat_nodes={} pv={}",
+                result.tt_hits,
+                result.beta_cutoffs,
+                result.threat_nodes,
+                result
+                    .principal_variation
+                    .iter()
+                    .map(|mv| mv.notation())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+        Some(Command::AzValueEval(args)) => {
+            let model = load_model(&args.model)?;
+            let samples = replay::load(&args.replay)?;
+            let samples = &samples[..samples.len().min(args.limit)];
+            if samples.is_empty() {
+                return Err(io::Error::other("没有可评估的回放样本"));
+            }
+            let mut entrypoint_abs = 0.0_f64;
+            let mut outcome_abs = 0.0_f64;
+            let mut full_outcome_abs = 0.0_f64;
+            let mut strong = 0usize;
+            let mut signs = 0usize;
+            for sample in samples {
+                let (_, full) = model.evaluate(&sample.board);
+                let value = model.evaluate_value(&sample.board);
+                entrypoint_abs += (value - full).abs() as f64;
+                outcome_abs += (value - sample.value).abs() as f64;
+                full_outcome_abs += (full - sample.value).abs() as f64;
+                if full.abs() >= 0.1 {
+                    strong += 1;
+                    signs += usize::from(value.signum() == full.signum());
+                }
+            }
+            let count = samples.len() as f64;
+            println!("samples  : {}", samples.len());
+            println!("entrypoint: mae={:.6}", entrypoint_abs / count);
+            println!(
+                "outcome   : value_mae={:.6} combined_mae={:.6}",
+                outcome_abs / count,
+                full_outcome_abs / count
+            );
+            println!(
+                "sign     : strong={} agreement={:.2}% threshold=0.1",
+                strong,
+                signs as f64 * 100.0 / strong.max(1) as f64
             );
         }
         Some(Command::AzLoop(args)) => {
