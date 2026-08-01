@@ -48,6 +48,9 @@ pub struct SelfplayStats {
     pub pvs_hints: usize,
     pub pvs_mcts_agreements: usize,
     pub pvs_hint_rank_sum: usize,
+    pub pvs_unproven_reviews: usize,
+    pub pvs_unproven_mcts_agreements: usize,
+    pub pvs_unproven_rank_sum: usize,
 }
 
 impl SelfplayStats {
@@ -79,6 +82,9 @@ impl SelfplayStats {
         self.pvs_hints += other.pvs_hints;
         self.pvs_mcts_agreements += other.pvs_mcts_agreements;
         self.pvs_hint_rank_sum += other.pvs_hint_rank_sum;
+        self.pvs_unproven_reviews += other.pvs_unproven_reviews;
+        self.pvs_unproven_mcts_agreements += other.pvs_unproven_mcts_agreements;
+        self.pvs_unproven_rank_sum += other.pvs_unproven_rank_sum;
     }
 }
 
@@ -115,6 +121,7 @@ pub fn generate_one_detailed_controlled(
         let mut ply_cfg = cfg;
         ply_cfg.root_noise_seed = seed ^ board.move_count() as u64;
         let mut tactical = None;
+        let mut unproven_review_move = None;
         let hint = if cfg.pvs_prior_probability > 0.0
             && random_unit(&mut seed) < cfg.pvs_prior_probability
         {
@@ -144,11 +151,14 @@ pub fn generate_one_detailed_controlled(
                     searched_depth: result.completed_depth,
                 });
             }
-            if completed || proven {
+            if completed && !proven && !proven_loss {
+                unproven_review_move = result.best_move;
+            }
+            if proven {
                 result.best_move.map(|mv| RootPriorHint {
                     mv,
                     boost: cfg.pvs_prior_boost,
-                    force: proven,
+                    force: true,
                 })
             } else {
                 None
@@ -171,6 +181,15 @@ pub fn generate_one_detailed_controlled(
             stats.pvs_mcts_agreements += usize::from(c[0].mv == hint.mv);
             stats.pvs_hint_rank_sum +=
                 c.iter().position(|x| x.mv == hint.mv).unwrap_or(c.len()) + 1;
+        }
+        if let Some(review_move) = unproven_review_move {
+            stats.pvs_unproven_reviews += 1;
+            stats.pvs_unproven_mcts_agreements += usize::from(c[0].mv == review_move);
+            stats.pvs_unproven_rank_sum += c
+                .iter()
+                .position(|x| x.mv == review_move)
+                .unwrap_or(c.len())
+                + 1;
         }
         let sum = c.iter().map(|x| x.visits).sum::<u32>().max(1) as f32;
         let policy: Vec<_> = c.iter().map(|x| (x.mv, x.visits as f32 / sum)).collect();

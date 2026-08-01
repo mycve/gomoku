@@ -414,6 +414,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         let sampled_moves = event.batch.stats.sampled_moves.max(1) as f32;
         let pvs_calls = event.batch.stats.pvs_calls.max(1) as f32;
         let pvs_hints = event.batch.stats.pvs_hints.max(1) as f32;
+        let pvs_unproven = event.batch.stats.pvs_unproven_reviews.max(1) as f32;
         tb.add_scalar("train/learning_rate", event.learning_rate, progress.update);
         tb.add_scalar("train/seconds", event.train_seconds, progress.update);
         tb.add_scalar(
@@ -550,6 +551,16 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         tb.add_scalar(
             "hybrid/pvs_hint_average_rank",
             event.batch.stats.pvs_hint_rank_sum as f32 / pvs_hints,
+            progress.update,
+        );
+        tb.add_scalar(
+            "hybrid/unproven_mcts_top1_agreement",
+            event.batch.stats.pvs_unproven_mcts_agreements as f32 / pvs_unproven,
+            progress.update,
+        );
+        tb.add_scalar(
+            "hybrid/unproven_average_rank",
+            event.batch.stats.pvs_unproven_rank_sum as f32 / pvs_unproven,
             progress.update,
         );
         tb.add_scalar(
