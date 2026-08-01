@@ -146,6 +146,14 @@ impl Board {
         self.to_move = self.to_move.other();
         true
     }
+    pub(crate) fn undo(&mut self, mv: Move, player: Player, previous_last: Option<Move>) {
+        debug_assert_eq!(self.cells.get(mv.0).copied(), Some(player.stone()));
+        debug_assert_eq!(self.to_move, player.other());
+        self.cells[mv.0] = 0;
+        self.moves -= 1;
+        self.last = previous_last;
+        self.to_move = player;
+    }
     /// 返回规则允许的全部落点，不包含任何搜索剪枝或启发式。
     pub fn rule_legal_moves(&self) -> Vec<Move> {
         crate::scope_profile!("game.rule_legal_moves");
@@ -359,6 +367,21 @@ mod tests {
                 .contains(&Move::new(0, 0).unwrap())
         );
         assert!(board.rule_legal_moves().contains(&Move::new(0, 0).unwrap()));
+    }
+    #[test]
+    fn undo_restores_board_state() {
+        let mut board = Board::new();
+        assert!(board.play(Move::parse("h8").unwrap()));
+        let before = board.clone();
+        let mv = Move::parse("h9").unwrap();
+        let player = board.to_move();
+        let previous_last = board.last_move();
+        assert!(board.play(mv));
+        board.undo(mv, player, previous_last);
+        assert_eq!(board.cells(), before.cells());
+        assert_eq!(board.to_move(), before.to_move());
+        assert_eq!(board.move_count(), before.move_count());
+        assert_eq!(board.last_move(), before.last_move());
     }
     #[test]
     fn notation_roundtrip() {

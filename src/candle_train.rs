@@ -486,6 +486,24 @@ fn pack(samples: &[Sample]) -> Packed {
                 targets[row * CELL_COUNT + m.0] = p.max(0.0) / sum
             }
         }
+        if let Some(tactical) = &s.tactical {
+            let forcing = tactical
+                .best_moves
+                .iter()
+                .copied()
+                .filter(|mv| mv.0 < CELL_COUNT && masks[row * CELL_COUNT + mv.0] == 0.0)
+                .collect::<Vec<_>>();
+            if tactical.outcome > 0 && !forcing.is_empty() {
+                const TACTICAL_POLICY_BLEND: f32 = 0.5;
+                for target in &mut targets[row * CELL_COUNT..(row + 1) * CELL_COUNT] {
+                    *target *= 1.0 - TACTICAL_POLICY_BLEND;
+                }
+                let forcing_probability = TACTICAL_POLICY_BLEND / forcing.len() as f32;
+                for mv in forcing {
+                    targets[row * CELL_COUNT + mv.0] += forcing_probability;
+                }
+            }
+        }
         let final_wdl = if s.value > 0.5 {
             [1.0, 0.0, 0.0]
         } else if s.value < -0.5 {
@@ -519,6 +537,29 @@ fn err(e: impl std::fmt::Display) -> io::Error {
 mod tests {
     use super::*;
     use crate::game::{Board, Move};
+    use crate::replay::TacticalTarget;
+
+    #[test]
+    fn proven_win_blends_forcing_move_into_policy_target() {
+        let mut board = Board::new();
+        assert!(board.play(Move::new(7, 7).unwrap()));
+        let mcts_move = Move::new(7, 8).unwrap();
+        let forcing_move = Move::new(8, 7).unwrap();
+        let packed = pack(&[Sample {
+            board,
+            policy: vec![(mcts_move, 1.0)],
+            value: 1.0,
+            generation: 0,
+            tactical: Some(TacticalTarget {
+                outcome: 1,
+                distance: 5,
+                best_moves: vec![forcing_move],
+                searched_depth: 4,
+            }),
+        }]);
+        assert_eq!(packed.policy_targets[mcts_move.0], 0.5);
+        assert_eq!(packed.policy_targets[forcing_move.0], 0.5);
+    }
 
     #[test]
     fn packing_uses_search_candidates_without_changing_rule_legality() {
@@ -532,6 +573,7 @@ mod tests {
             policy: vec![(nearby, 1.0)],
             value: 0.0,
             generation: 0,
+            tactical: None,
         }]);
 
         assert_eq!(packed.policy_masks[occupied.0], -1e9);
@@ -553,6 +595,7 @@ mod tests {
             policy: vec![(Move::new(8, 7).unwrap(), 1.0)],
             value: 1.0,
             generation: 0,
+            tactical: None,
         };
         let stats = train(&mut model, &[sample], 2, 1e-3, 1, 0).unwrap();
         assert_eq!(stats.optimizer_steps, 2);
@@ -583,6 +626,7 @@ mod tests {
             policy: vec![(Move::new(8, 7).unwrap(), 1.0)],
             value: 1.0,
             generation: 0,
+            tactical: None,
         };
 
         let stats = train(&mut model, &[sample], 20, 1e-2, 1, 0).unwrap();

@@ -160,7 +160,6 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             temperature_visit_offset: config.temperature_visit_offset,
             random_opening_probability: config.selfplay_random_opening_probability,
             pvs_prior_probability: config.selfplay_pvs_probability,
-            pvs_prior_nodes: config.selfplay_pvs_nodes,
             pvs_prior_depth: config.selfplay_pvs_depth,
             pvs_prior_threat_depth: config.selfplay_pvs_threat_depth,
             pvs_prior_boost: config.selfplay_pvs_prior_boost,
@@ -531,6 +530,16 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         tb.add_scalar(
             "hybrid/pvs_proven_win_rate",
             event.batch.stats.pvs_proven_wins as f32 / pvs_calls,
+            progress.update,
+        );
+        tb.add_scalar(
+            "hybrid/pvs_proven_loss_rate",
+            event.batch.stats.pvs_proven_losses as f32 / pvs_calls,
+            progress.update,
+        );
+        tb.add_scalar(
+            "hybrid/tactical_target_rate",
+            event.batch.stats.tactical_targets as f32 / searches,
             progress.update,
         );
         tb.add_scalar(

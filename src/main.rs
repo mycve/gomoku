@@ -120,6 +120,7 @@ struct AzAlphaBetaArgs {
     model: String,
     #[arg(long, default_value_t = 8)]
     depth: u16,
+    /// 最大节点数；0 表示不限制，完整搜索到指定深度。
     #[arg(long, default_value_t = 100_000)]
     nodes: u64,
     #[arg(long, default_value_t = 8)]

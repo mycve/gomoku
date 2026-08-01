@@ -14,6 +14,17 @@ pub struct Sample {
     pub value: f32,
     #[serde(default)]
     pub generation: u64,
+    #[serde(default)]
+    pub tactical: Option<TacticalTarget>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TacticalTarget {
+    /// 当前行棋方视角：1=严格证明胜，-1=严格证明负。
+    pub outcome: i8,
+    pub distance: u16,
+    pub best_moves: Vec<Move>,
+    pub searched_depth: u16,
 }
 
 impl Sample {
@@ -27,6 +38,16 @@ impl Sample {
                 .collect(),
             value: self.value,
             generation: self.generation,
+            tactical: self.tactical.as_ref().map(|target| TacticalTarget {
+                outcome: target.outcome,
+                distance: target.distance,
+                best_moves: target
+                    .best_moves
+                    .iter()
+                    .map(|mv| Move(transform_index(mv.0, symmetry)))
+                    .collect(),
+                searched_depth: target.searched_depth,
+            }),
         }
     }
 }
@@ -164,6 +185,7 @@ mod tests {
             policy: Vec::new(),
             value: 0.0,
             generation,
+            tactical: None,
         }
     }
 

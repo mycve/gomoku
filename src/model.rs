@@ -495,8 +495,18 @@ impl PolicyValueModel {
         board_after: &Board,
         mv: Move,
     ) {
-        let mut old = [0.0; VALUE_PATTERN_SIZE];
-        let mut new = [0.0; VALUE_PATTERN_SIZE];
+        self.update_local_contribution(accumulator, board_before, mv, -1.0);
+        self.update_local_contribution(accumulator, board_after, mv, 1.0);
+    }
+
+    fn update_local_contribution(
+        &self,
+        accumulator: &mut EvalAccumulator,
+        board: &Board,
+        mv: Move,
+        scale: f32,
+    ) {
+        let mut feature = [0.0; VALUE_PATTERN_SIZE];
         for (dr, dc) in [(1_i32, 0_i32), (0, 1), (1, 1), (1, -1)] {
             for sign in [-1_i32, 1] {
                 for distance in 1..=LOCAL_RADIUS as i32 {
@@ -510,28 +520,25 @@ impl PolicyValueModel {
                     else {
                         continue;
                     };
-                    for (perspective, target) in [
-                        (Player::Black, &mut accumulator.local_black),
-                        (Player::White, &mut accumulator.local_white),
-                    ] {
+                    for perspective in [Player::Black, Player::White] {
                         self.local_axis_feature_for_player_into(
-                            board_before,
+                            board,
                             center,
                             dr,
                             dc,
                             perspective,
-                            &mut old,
-                        );
-                        self.local_axis_feature_for_player_into(
-                            board_after,
-                            center,
-                            dr,
-                            dc,
-                            perspective,
-                            &mut new,
+                            &mut feature,
                         );
                         for i in 0..VALUE_PATTERN_SIZE {
-                            target[i] += (new[i] - old[i]) / (CELL_COUNT * LOCAL_AXES) as f32;
+                            let change = scale * feature[i] / (CELL_COUNT * LOCAL_AXES) as f32;
+                            match perspective {
+                                Player::Black => {
+                                    accumulator.local_black[i] += change;
+                                }
+                                Player::White => {
+                                    accumulator.local_white[i] += change;
+                                }
+                            }
                         }
                     }
                 }
@@ -539,7 +546,39 @@ impl PolicyValueModel {
         }
     }
 
+    pub(crate) fn accumulator_prepare_move(
+        &self,
+        accumulator: &mut EvalAccumulator,
+        board: &Board,
+        mv: Move,
+        player: Player,
+    ) {
+        self.update_local_contribution(accumulator, board, mv, -1.0);
+        self.add_stone_scaled(accumulator, mv, player, 1.0);
+        self.set_move_count(accumulator, accumulator.move_count + 1);
+        accumulator.hash ^= zobrist_piece(mv, player) ^ ZOBRIST_SIDE;
+    }
+
+    pub(crate) fn accumulator_finish_move(
+        &self,
+        accumulator: &mut EvalAccumulator,
+        board: &Board,
+        mv: Move,
+    ) {
+        self.update_local_contribution(accumulator, board, mv, 1.0);
+    }
+
     fn add_stone(&self, accumulator: &mut EvalAccumulator, mv: Move, player: Player) {
+        self.add_stone_scaled(accumulator, mv, player, 1.0);
+    }
+
+    fn add_stone_scaled(
+        &self,
+        accumulator: &mut EvalAccumulator,
+        mv: Move,
+        player: Player,
+        scale: f32,
+    ) {
         for (perspective, hidden) in [
             (Player::Black, &mut accumulator.black),
             (Player::White, &mut accumulator.white),
@@ -554,12 +593,13 @@ impl PolicyValueModel {
                 (side * (BOARD_SIZE * 2 - 1) + mv.row() + mv.col()) * self.hidden_size;
             let stone = side * self.hidden_size;
             for (h, value) in hidden.iter_mut().enumerate() {
-                *value += self.input_hidden[exact + h]
-                    + self.stone_hidden[stone + h]
-                    + self.rank_hidden[rank + h]
-                    + self.file_hidden[file + h]
-                    + self.diagonal_hidden[diagonal + h]
-                    + self.anti_diagonal_hidden[anti_diagonal + h];
+                *value += scale
+                    * (self.input_hidden[exact + h]
+                        + self.stone_hidden[stone + h]
+                        + self.rank_hidden[rank + h]
+                        + self.file_hidden[file + h]
+                        + self.diagonal_hidden[diagonal + h]
+                        + self.anti_diagonal_hidden[anti_diagonal + h]);
             }
         }
     }

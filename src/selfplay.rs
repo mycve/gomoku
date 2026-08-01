@@ -3,7 +3,7 @@ use crate::{
     game::{BOARD_SIZE, Board, Move, Outcome},
     mcts::{RootPriorHint, SearchConfig, search, search_with_root_hint},
     model::PolicyValueModel,
-    replay::Sample,
+    replay::{Sample, TacticalTarget},
 };
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,6 +43,8 @@ pub struct SelfplayStats {
     pub pvs_calls: usize,
     pub pvs_completed: usize,
     pub pvs_proven_wins: usize,
+    pub pvs_proven_losses: usize,
+    pub tactical_targets: usize,
     pub pvs_hints: usize,
     pub pvs_mcts_agreements: usize,
     pub pvs_hint_rank_sum: usize,
@@ -72,6 +74,8 @@ impl SelfplayStats {
         self.pvs_calls += other.pvs_calls;
         self.pvs_completed += other.pvs_completed;
         self.pvs_proven_wins += other.pvs_proven_wins;
+        self.pvs_proven_losses += other.pvs_proven_losses;
+        self.tactical_targets += other.tactical_targets;
         self.pvs_hints += other.pvs_hints;
         self.pvs_mcts_agreements += other.pvs_mcts_agreements;
         self.pvs_hint_rank_sum += other.pvs_hint_rank_sum;
@@ -110,6 +114,7 @@ pub fn generate_one_detailed_controlled(
     while board.outcome().is_none() && !stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
         let mut ply_cfg = cfg;
         ply_cfg.root_noise_seed = seed ^ board.move_count() as u64;
+        let mut tactical = None;
         let hint = if cfg.pvs_prior_probability > 0.0
             && random_unit(&mut seed) < cfg.pvs_prior_probability
         {
@@ -119,14 +124,26 @@ pub fn generate_one_detailed_controlled(
                 model,
                 AlphaBetaConfig {
                     max_depth: cfg.pvs_prior_depth,
-                    max_nodes: cfg.pvs_prior_nodes,
+                    // 自博弈顾问按完整迭代深度工作；0 表示不按节点数截断。
+                    max_nodes: 0,
                     threat_extension_depth: cfg.pvs_prior_threat_depth,
                 },
             );
             let proven = result.proven_win();
+            let proven_loss = result.proven_loss();
             let completed = result.completed_depth >= cfg.pvs_prior_depth;
             stats.pvs_completed += usize::from(completed);
             stats.pvs_proven_wins += usize::from(proven);
+            stats.pvs_proven_losses += usize::from(proven_loss);
+            if proven || proven_loss {
+                stats.tactical_targets += 1;
+                tactical = Some(TacticalTarget {
+                    outcome: if proven { 1 } else { -1 },
+                    distance: result.mate_distance().unwrap_or(0),
+                    best_moves: result.best_move.into_iter().collect(),
+                    searched_depth: result.completed_depth,
+                });
+            }
             if completed || proven {
                 result.best_move.map(|mv| RootPriorHint {
                     mv,
@@ -193,6 +210,7 @@ pub fn generate_one_detailed_controlled(
             policy,
             value: 0.0,
             generation: 0,
+            tactical,
         });
         board.play(mv);
     }

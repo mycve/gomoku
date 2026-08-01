@@ -1,5 +1,5 @@
 use crate::{
-    game::{BOARD_SIZE, Board, Move, Outcome, Player},
+    game::{BOARD_SIZE, Board, CELL_COUNT, Move, Outcome, Player, SEARCH_CANDIDATE_RADIUS},
     model::{EvalAccumulator, EvalScratch, PolicyValueModel},
 };
 use std::{collections::HashMap, time::Instant};
@@ -10,6 +10,7 @@ const PVS_EPSILON: f32 = 1.0e-4;
 #[derive(Clone, Copy, Debug)]
 pub struct AlphaBetaConfig {
     pub max_depth: u16,
+    /// 0 表示不按节点数截断，完整完成迭代深度。
     pub max_nodes: u64,
     pub threat_extension_depth: u16,
 }
@@ -39,7 +40,16 @@ pub struct AlphaBetaResult {
 
 impl AlphaBetaResult {
     pub fn proven_win(&self) -> bool {
-        self.value >= MATE_SCORE - self.completed_depth as f32 - 1.0
+        self.value > MATE_SCORE - 512.0
+    }
+
+    pub fn proven_loss(&self) -> bool {
+        self.value < -MATE_SCORE + 512.0
+    }
+
+    pub fn mate_distance(&self) -> Option<u16> {
+        (self.proven_win() || self.proven_loss())
+            .then(|| (MATE_SCORE - self.value.abs()).round().max(0.0) as u16)
     }
 }
 
@@ -69,9 +79,190 @@ struct Searcher<'a> {
     threat_nodes: u64,
 }
 
+struct SearchPosition {
+    board: Board,
+    accumulators: Vec<EvalAccumulator>,
+    candidate_counts: [u8; CELL_COUNT],
+    winning_black: [[bool; 4]; CELL_COUNT],
+    winning_white: [[bool; 4]; CELL_COUNT],
+    ply: usize,
+    history: Vec<(Move, Player, Option<Move>)>,
+}
+
+impl SearchPosition {
+    fn new(board: &Board, model: &PolicyValueModel, max_ply: usize) -> Self {
+        let root = model.accumulator(board);
+        let mut position = Self {
+            board: board.clone(),
+            accumulators: vec![root; max_ply.max(1) + 1],
+            candidate_counts: [0; CELL_COUNT],
+            winning_black: [[false; 4]; CELL_COUNT],
+            winning_white: [[false; 4]; CELL_COUNT],
+            ply: 0,
+            history: Vec::new(),
+        };
+        for (index, &stone) in board.cells().iter().enumerate() {
+            if stone != 0 {
+                position.adjust_candidate_neighborhood(Move(index), 1);
+            }
+        }
+        position.refresh_all_winning_moves();
+        position
+    }
+
+    fn accumulator(&self) -> &EvalAccumulator {
+        &self.accumulators[self.ply]
+    }
+
+    fn adjust_candidate_neighborhood(&mut self, mv: Move, delta: i8) {
+        for dr in -SEARCH_CANDIDATE_RADIUS..=SEARCH_CANDIDATE_RADIUS {
+            for dc in -SEARCH_CANDIDATE_RADIUS..=SEARCH_CANDIDATE_RADIUS {
+                let row = mv.row() as i32 + dr;
+                let col = mv.col() as i32 + dc;
+                if row >= 0 && col >= 0 && row < BOARD_SIZE as i32 && col < BOARD_SIZE as i32 {
+                    let count =
+                        &mut self.candidate_counts[row as usize * BOARD_SIZE + col as usize];
+                    *count = if delta > 0 { *count + 1 } else { *count - 1 };
+                }
+            }
+        }
+    }
+
+    fn search_candidates(&self) -> Vec<Move> {
+        if self.board.move_count() == 0 {
+            return vec![Move::new(BOARD_SIZE / 2, BOARD_SIZE / 2).unwrap()];
+        }
+        self.candidate_counts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &count)| {
+                (count > 0 && self.board.cells()[index] == 0).then_some(Move(index))
+            })
+            .collect()
+    }
+
+    fn refresh_all_winning_moves(&mut self) {
+        for index in 0..CELL_COUNT {
+            for axis in 0..4 {
+                self.refresh_winning_axis(Move(index), axis);
+            }
+        }
+    }
+
+    fn refresh_winning_axis(&mut self, mv: Move, axis: usize) {
+        if self.board.cells()[mv.0] != 0 {
+            self.winning_black[mv.0][axis] = false;
+            self.winning_white[mv.0][axis] = false;
+        } else {
+            self.winning_black[mv.0][axis] =
+                would_complete_axis(&self.board, mv, Player::Black, axis);
+            self.winning_white[mv.0][axis] =
+                would_complete_axis(&self.board, mv, Player::White, axis);
+        }
+    }
+
+    fn refresh_winning_lines(&mut self, changed: Move) {
+        for (axis, (dr, dc)) in [(1_i32, 0_i32), (0, 1), (1, 1), (1, -1)]
+            .into_iter()
+            .enumerate()
+        {
+            self.refresh_winning_axis(changed, axis);
+            for sign in [-1_i32, 1] {
+                for distance in 1..=4 {
+                    let row = changed.row() as i32 + dr * sign * distance;
+                    let col = changed.col() as i32 + dc * sign * distance;
+                    if row >= 0 && col >= 0 && row < BOARD_SIZE as i32 && col < BOARD_SIZE as i32 {
+                        self.refresh_winning_axis(
+                            Move(row as usize * BOARD_SIZE + col as usize),
+                            axis,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn winning_moves(&self, moves: &[Move], player: Player) -> Vec<Move> {
+        moves
+            .iter()
+            .copied()
+            .filter(|&mv| self.is_winning_move(mv, player))
+            .collect()
+    }
+
+    fn is_winning_move(&self, mv: Move, player: Player) -> bool {
+        match player {
+            Player::Black => self.winning_black[mv.0].iter().any(|&value| value),
+            Player::White => self.winning_white[mv.0].iter().any(|&value| value),
+        }
+    }
+
+    fn forcing_moves(&self, moves: &[Move]) -> Option<ForcingMoves> {
+        let winning = self.winning_moves(moves, self.board.to_move());
+        if !winning.is_empty() {
+            return Some(ForcingMoves::Win(winning));
+        }
+        let blocks = self.winning_moves(moves, self.board.to_move().other());
+        (!blocks.is_empty()).then_some(ForcingMoves::Block(blocks))
+    }
+
+    fn created_immediate_threat(&self, last_move: Move, player: Player) -> bool {
+        for (dr, dc) in [(1_i32, 0_i32), (0, 1), (1, 1), (1, -1)] {
+            for sign in [-1_i32, 1] {
+                for distance in 1..=4 {
+                    let row = last_move.row() as i32 + dr * sign * distance;
+                    let col = last_move.col() as i32 + dc * sign * distance;
+                    if row >= 0
+                        && col >= 0
+                        && row < BOARD_SIZE as i32
+                        && col < BOARD_SIZE as i32
+                        && self
+                            .is_winning_move(Move(row as usize * BOARD_SIZE + col as usize), player)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn make_move(&mut self, model: &PolicyValueModel, mv: Move) -> bool {
+        if !self.board.is_legal(mv) {
+            return false;
+        }
+        let player = self.board.to_move();
+        let previous_last = self.board.last_move();
+        let next_ply = self.ply + 1;
+        let (parents, children) = self.accumulators.split_at_mut(next_ply);
+        children[0].clone_from(&parents[self.ply]);
+        model.accumulator_prepare_move(&mut children[0], &self.board, mv, player);
+        let played = self.board.play(mv);
+        debug_assert!(played);
+        model.accumulator_finish_move(&mut children[0], &self.board, mv);
+        self.adjust_candidate_neighborhood(mv, 1);
+        self.refresh_winning_lines(mv);
+        self.ply = next_ply;
+        self.history.push((mv, player, previous_last));
+        true
+    }
+
+    fn undo_move(&mut self, _model: &PolicyValueModel) {
+        let (mv, player, previous_last) = self.history.pop().expect("撤销栈不能为空");
+        self.adjust_candidate_neighborhood(mv, -1);
+        self.board.undo(mv, player, previous_last);
+        self.refresh_winning_lines(mv);
+        self.ply -= 1;
+    }
+}
+
 pub fn search(board: &Board, model: &PolicyValueModel, cfg: AlphaBetaConfig) -> AlphaBetaResult {
     let started = Instant::now();
-    let accumulator = model.accumulator(board);
+    let mut position = SearchPosition::new(
+        board,
+        model,
+        cfg.max_depth as usize + cfg.threat_extension_depth as usize + 2,
+    );
     let mut searcher = Searcher {
         model,
         cfg,
@@ -88,7 +279,7 @@ pub fn search(board: &Board, model: &PolicyValueModel, cfg: AlphaBetaConfig) -> 
     let mut completed_depth = 0;
 
     for depth in 1..=cfg.max_depth {
-        match searcher.negamax(board, &accumulator, depth, 0, -MATE_SCORE, MATE_SCORE) {
+        match searcher.negamax(&mut position, depth, 0, -MATE_SCORE, MATE_SCORE) {
             Ok((value, mv)) => {
                 best_value = value;
                 best_move = mv.or(best_move);
@@ -101,7 +292,8 @@ pub fn search(board: &Board, model: &PolicyValueModel, cfg: AlphaBetaConfig) -> 
         }
     }
 
-    let principal_variation = searcher.principal_variation(board, &accumulator, completed_depth);
+    let principal_variation =
+        searcher.principal_variation(board, position.accumulator(), completed_depth);
     AlphaBetaResult {
         best_move,
         value: best_value,
@@ -116,27 +308,29 @@ pub fn search(board: &Board, model: &PolicyValueModel, cfg: AlphaBetaConfig) -> 
 }
 
 impl Searcher<'_> {
+    fn node_budget_exhausted(&self) -> bool {
+        self.cfg.max_nodes != 0 && self.nodes >= self.cfg.max_nodes
+    }
+
     fn negamax(
         &mut self,
-        board: &Board,
-        accumulator: &EvalAccumulator,
+        position: &mut SearchPosition,
         depth: u16,
         ply: u16,
         mut alpha: f32,
         beta: f32,
     ) -> Result<(f32, Option<Move>), ()> {
-        if self.nodes >= self.cfg.max_nodes {
+        if self.node_budget_exhausted() {
             return Err(());
         }
         self.nodes += 1;
 
-        if let Some(outcome) = board.outcome() {
-            return Ok((terminal_value(outcome, board.to_move(), ply), None));
+        if let Some(outcome) = position.board.outcome() {
+            return Ok((terminal_value(outcome, position.board.to_move(), ply), None));
         }
         if depth == 0 {
             return self.threat_quiescence(
-                board,
-                accumulator,
+                position,
                 ply,
                 self.cfg.threat_extension_depth,
                 alpha,
@@ -146,7 +340,7 @@ impl Searcher<'_> {
         }
 
         let original_alpha = alpha;
-        let hash = accumulator.hash;
+        let hash = position.accumulator().hash;
         let tt_move = if let Some(entry) = self.table.get(&hash).copied() {
             if entry.depth >= depth {
                 self.tt_hits += 1;
@@ -166,60 +360,34 @@ impl Searcher<'_> {
             None
         };
 
-        let moves = match forcing_moves(board) {
+        let candidates = position.search_candidates();
+        let moves = match position.forcing_moves(&candidates) {
             Some(ForcingMoves::Win(moves) | ForcingMoves::Block(moves)) => moves,
-            None => board.search_candidates(),
+            None => candidates,
         };
         if moves.is_empty() {
             return Ok((0.0, None));
         }
-        let ordered = self.order_moves(board, accumulator, &moves, tt_move);
+        let ordered = self.order_moves(position, &moves, tt_move);
         let mut best_value = -MATE_SCORE;
         let mut best_move = None;
 
         for (index, mv) in ordered.into_iter().enumerate() {
-            let player = board.to_move();
-            let mut child_board = board.clone();
-            if !child_board.play(mv) {
+            if !position.make_move(self.model, mv) {
                 continue;
             }
-            let child_accumulator =
-                self.model
-                    .accumulator_after_move(accumulator, board, &child_board, mv, player);
-            let mut value = if index == 0 {
-                -self
-                    .negamax(
-                        &child_board,
-                        &child_accumulator,
-                        depth - 1,
-                        ply + 1,
-                        -beta,
-                        -alpha,
-                    )?
-                    .0
+            let first_result = if index == 0 {
+                self.negamax(position, depth - 1, ply + 1, -beta, -alpha)
             } else {
-                -self
-                    .negamax(
-                        &child_board,
-                        &child_accumulator,
-                        depth - 1,
-                        ply + 1,
-                        -alpha - PVS_EPSILON,
-                        -alpha,
-                    )?
-                    .0
+                self.negamax(position, depth - 1, ply + 1, -alpha - PVS_EPSILON, -alpha)
             };
+            position.undo_move(self.model);
+            let mut value = -first_result?.0;
             if index > 0 && value > alpha && value < beta {
-                value = -self
-                    .negamax(
-                        &child_board,
-                        &child_accumulator,
-                        depth - 1,
-                        ply + 1,
-                        -beta,
-                        -alpha,
-                    )?
-                    .0;
+                position.make_move(self.model, mv);
+                let research = self.negamax(position, depth - 1, ply + 1, -beta, -alpha);
+                position.undo_move(self.model);
+                value = -research?.0;
             }
             if value > best_value {
                 best_value = value;
@@ -253,11 +421,12 @@ impl Searcher<'_> {
 
     fn order_moves(
         &mut self,
-        board: &Board,
-        accumulator: &EvalAccumulator,
+        position: &SearchPosition,
         moves: &[Move],
         tt_move: Option<Move>,
     ) -> Vec<Move> {
+        let board = &position.board;
+        let accumulator = position.accumulator();
         let player = board.to_move();
         let opponent = player.other();
         let logits =
@@ -268,9 +437,9 @@ impl Searcher<'_> {
             .map(|(mv, logit)| {
                 let tactical = if Some(mv) == tt_move {
                     4.0e9
-                } else if would_win(board, mv, player) {
+                } else if position.is_winning_move(mv, player) {
                     3.0e9
-                } else if would_win(board, mv, opponent) {
+                } else if position.is_winning_move(mv, opponent) {
                     2.0e9
                 } else {
                     0.0
@@ -284,44 +453,56 @@ impl Searcher<'_> {
 
     fn threat_quiescence(
         &mut self,
-        board: &Board,
-        accumulator: &EvalAccumulator,
+        position: &mut SearchPosition,
         ply: u16,
         remaining: u16,
         mut alpha: f32,
         beta: f32,
         check_trigger: bool,
     ) -> Result<(f32, Option<Move>), ()> {
-        if let Some(outcome) = board.outcome() {
-            return Ok((terminal_value(outcome, board.to_move(), ply), None));
+        if let Some(outcome) = position.board.outcome() {
+            return Ok((terminal_value(outcome, position.board.to_move(), ply), None));
         }
         if remaining == 0 {
             return Ok((
-                self.model
-                    .evaluate_value_accumulator(board, accumulator, &mut self.scratch),
+                self.model.evaluate_value_accumulator(
+                    &position.board,
+                    position.accumulator(),
+                    &mut self.scratch,
+                ),
                 None,
             ));
         }
         if check_trigger {
-            let Some(last_move) = board.last_move() else {
+            let Some(last_move) = position.board.last_move() else {
                 return Ok((
-                    self.model
-                        .evaluate_value_accumulator(board, accumulator, &mut self.scratch),
+                    self.model.evaluate_value_accumulator(
+                        &position.board,
+                        position.accumulator(),
+                        &mut self.scratch,
+                    ),
                     None,
                 ));
             };
-            if !created_immediate_threat(board, last_move, board.to_move().other()) {
+            if !position.created_immediate_threat(last_move, position.board.to_move().other()) {
                 return Ok((
-                    self.model
-                        .evaluate_value_accumulator(board, accumulator, &mut self.scratch),
+                    self.model.evaluate_value_accumulator(
+                        &position.board,
+                        position.accumulator(),
+                        &mut self.scratch,
+                    ),
                     None,
                 ));
             }
         }
-        let Some(forcing) = forcing_moves(board) else {
+        let candidates = position.search_candidates();
+        let Some(forcing) = position.forcing_moves(&candidates) else {
             return Ok((
-                self.model
-                    .evaluate_value_accumulator(board, accumulator, &mut self.scratch),
+                self.model.evaluate_value_accumulator(
+                    &position.board,
+                    position.accumulator(),
+                    &mut self.scratch,
+                ),
                 None,
             ));
         };
@@ -332,34 +513,22 @@ impl Searcher<'_> {
         let ForcingMoves::Block(moves) = forcing else {
             unreachable!();
         };
-        let ordered = self.order_moves(board, accumulator, &moves, None);
+        let ordered = self.order_moves(position, &moves, None);
         let mut best_value = -MATE_SCORE;
         let mut best_move = None;
         for mv in ordered {
-            if self.nodes >= self.cfg.max_nodes {
+            if self.node_budget_exhausted() {
                 return Err(());
             }
             self.nodes += 1;
             self.threat_nodes += 1;
-            let player = board.to_move();
-            let mut child_board = board.clone();
-            if !child_board.play(mv) {
+            if !position.make_move(self.model, mv) {
                 continue;
             }
-            let child_accumulator =
-                self.model
-                    .accumulator_after_move(accumulator, board, &child_board, mv, player);
-            let value = -self
-                .threat_quiescence(
-                    &child_board,
-                    &child_accumulator,
-                    ply + 1,
-                    remaining - 1,
-                    -beta,
-                    -alpha,
-                    false,
-                )?
-                .0;
+            let result =
+                self.threat_quiescence(position, ply + 1, remaining - 1, -beta, -alpha, false);
+            position.undo_move(self.model);
+            let value = -result?.0;
             if value > best_value {
                 best_value = value;
                 best_move = Some(mv);
@@ -412,77 +581,45 @@ fn terminal_value(outcome: Outcome, to_move: Player, ply: u16) -> f32 {
     }
 }
 
+#[cfg(test)]
 fn would_win(board: &Board, mv: Move, player: Player) -> bool {
     if !board.is_legal(mv) {
         return false;
     }
-    for (dr, dc) in [(1_i32, 0_i32), (0, 1), (1, 1), (1, -1)] {
-        let mut stones = 1;
-        for sign in [-1_i32, 1] {
-            let mut row = mv.row() as i32 + dr * sign;
-            let mut col = mv.col() as i32 + dc * sign;
-            while row >= 0
-                && col >= 0
-                && row < BOARD_SIZE as i32
-                && col < BOARD_SIZE as i32
-                && board.cells()[row as usize * BOARD_SIZE + col as usize] == player.stone()
-            {
-                stones += 1;
-                row += dr * sign;
-                col += dc * sign;
-            }
-        }
-        if stones >= 5 {
-            return true;
-        }
-    }
-    false
+    would_complete_five(board, mv, player)
 }
 
-fn created_immediate_threat(board: &Board, last_move: Move, player: Player) -> bool {
-    for (dr, dc) in [(1_i32, 0_i32), (0, 1), (1, 1), (1, -1)] {
-        for sign in [-1_i32, 1] {
-            for distance in 1..=4 {
-                let row = last_move.row() as i32 + dr * sign * distance;
-                let col = last_move.col() as i32 + dc * sign * distance;
-                if row < 0 || col < 0 || row >= BOARD_SIZE as i32 || col >= BOARD_SIZE as i32 {
-                    continue;
-                }
-                let mv = Move::new(row as usize, col as usize).unwrap();
-                if would_win(board, mv, player) {
-                    return true;
-                }
-            }
+#[cfg(test)]
+fn would_complete_five(board: &Board, mv: Move, player: Player) -> bool {
+    if mv.0 >= CELL_COUNT || board.cells()[mv.0] != 0 {
+        return false;
+    }
+    (0..4).any(|axis| would_complete_axis(board, mv, player, axis))
+}
+
+fn would_complete_axis(board: &Board, mv: Move, player: Player, axis: usize) -> bool {
+    let (dr, dc) = [(1_i32, 0_i32), (0, 1), (1, 1), (1, -1)][axis];
+    let mut stones = 1;
+    for sign in [-1_i32, 1] {
+        let mut row = mv.row() as i32 + dr * sign;
+        let mut col = mv.col() as i32 + dc * sign;
+        while row >= 0
+            && col >= 0
+            && row < BOARD_SIZE as i32
+            && col < BOARD_SIZE as i32
+            && board.cells()[row as usize * BOARD_SIZE + col as usize] == player.stone()
+        {
+            stones += 1;
+            row += dr * sign;
+            col += dc * sign;
         }
     }
-    false
+    stones >= 5
 }
 
 enum ForcingMoves {
     Win(Vec<Move>),
     Block(Vec<Move>),
-}
-
-fn forcing_moves(board: &Board) -> Option<ForcingMoves> {
-    let moves = board.search_candidates();
-    let player = board.to_move();
-    let winning = moves
-        .iter()
-        .copied()
-        .filter(|&mv| would_win(board, mv, player))
-        .collect::<Vec<_>>();
-    if !winning.is_empty() {
-        return Some(ForcingMoves::Win(winning));
-    }
-    let blocks = moves
-        .iter()
-        .copied()
-        .filter(|&mv| would_win(board, mv, player.other()))
-        .collect::<Vec<_>>();
-    if !blocks.is_empty() {
-        return Some(ForcingMoves::Block(blocks));
-    }
-    None
 }
 
 #[cfg(test)]
@@ -533,6 +670,65 @@ mod tests {
         );
         assert!(result.nodes <= 128);
         assert!(result.best_move.is_some());
+    }
+
+    #[test]
+    fn zero_node_budget_means_unlimited_depth_search() {
+        let mut board = Board::new();
+        assert!(board.play(Move::new(7, 7).unwrap()));
+        let model = PolicyValueModel::random(8, 31);
+        let result = search(
+            &board,
+            &model,
+            AlphaBetaConfig {
+                max_depth: 2,
+                max_nodes: 0,
+                threat_extension_depth: 0,
+            },
+        );
+        assert_eq!(result.completed_depth, 2);
+        assert!(result.nodes > 0);
+    }
+
+    #[test]
+    fn search_position_restores_after_multiple_moves() {
+        let model = PolicyValueModel::random(16, 47);
+        let board = Board::new();
+        let mut position = SearchPosition::new(&board, &model, 16);
+        let original_hash = position.accumulator().hash;
+        for text in ["h8", "h9", "i8", "g8", "i9", "g9"] {
+            assert!(position.make_move(&model, Move::parse(text).unwrap()));
+            assert_eq!(
+                position.search_candidates(),
+                position.board.search_candidates()
+            );
+            for mv in position.search_candidates() {
+                assert_eq!(
+                    position.is_winning_move(mv, Player::Black),
+                    would_win(&position.board, mv, Player::Black)
+                );
+                assert_eq!(
+                    position.is_winning_move(mv, Player::White),
+                    would_win(&position.board, mv, Player::White)
+                );
+            }
+        }
+        for _ in 0..6 {
+            position.undo_move(&model);
+            assert_eq!(
+                position.search_candidates(),
+                position.board.search_candidates()
+            );
+        }
+        assert_eq!(position.board.cells(), board.cells());
+        assert_eq!(position.board.to_move(), board.to_move());
+        assert_eq!(position.board.move_count(), 0);
+        assert_eq!(position.board.last_move(), None);
+        assert_eq!(position.accumulator().hash, original_hash);
+        let mut scratch = EvalScratch::new(model.hidden_size);
+        let restored =
+            model.evaluate_value_accumulator(&position.board, position.accumulator(), &mut scratch);
+        assert!((restored - model.evaluate_value(&board)).abs() < 1e-6);
     }
 
     #[test]

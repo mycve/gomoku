@@ -22,7 +22,6 @@ pub struct SearchConfig {
     pub opening_random_plies: usize,
     pub opening_seed: u64,
     pub pvs_prior_probability: f32,
-    pub pvs_prior_nodes: u64,
     pub pvs_prior_depth: u16,
     pub pvs_prior_threat_depth: u16,
     pub pvs_prior_boost: f32,
@@ -46,9 +45,8 @@ impl Default for SearchConfig {
             opening_random_plies: 0,
             opening_seed: 0,
             pvs_prior_probability: 0.0,
-            pvs_prior_nodes: 2_000,
-            pvs_prior_depth: 3,
-            pvs_prior_threat_depth: 8,
+            pvs_prior_depth: 4,
+            pvs_prior_threat_depth: 10,
             pvs_prior_boost: 2.0,
         }
     }
