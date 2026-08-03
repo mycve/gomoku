@@ -444,8 +444,7 @@ struct Replica {
     hidden_bias: Var,
     policy_global: Var,
     policy_global_bias: Var,
-    policy_gate: Var,
-    policy_gate_bias: Var,
+    policy_local_gate: Var,
     policy_output: Var,
     policy_bias: Var,
     local_axis_embedding: Var,
@@ -473,8 +472,7 @@ impl Replica {
             hidden_bias: var(&model.hidden_bias, (h,), device)?,
             policy_global: var(&model.policy_global, (POLICY_HEAD_SIZE, h), device)?,
             policy_global_bias: var(&model.policy_global_bias, (POLICY_HEAD_SIZE,), device)?,
-            policy_gate: var(&model.policy_gate, (POLICY_HEAD_SIZE,), device)?,
-            policy_gate_bias: var(&model.policy_gate_bias, (1,), device)?,
+            policy_local_gate: var(&model.policy_local_gate, (POLICY_HEAD_SIZE,), device)?,
             policy_output: var(&model.policy_output, (CELL_COUNT, POLICY_HEAD_SIZE), device)?,
             policy_bias: var(&model.policy_bias, (CELL_COUNT,), device)?,
             local_axis_embedding: var(
@@ -520,8 +518,7 @@ impl Replica {
             self.hidden_bias.clone(),
             self.policy_global.clone(),
             self.policy_global_bias.clone(),
-            self.policy_gate.clone(),
-            self.policy_gate_bias.clone(),
+            self.policy_local_gate.clone(),
             self.policy_output.clone(),
             self.policy_bias.clone(),
             self.local_axis_embedding.clone(),
@@ -687,20 +684,18 @@ impl Replica {
         let policy_global = hidden
             .matmul(&self.policy_global.t().map_err(err)?)
             .and_then(|x| x.broadcast_add(&self.policy_global_bias))
+            .map_err(err)?;
+        let policy_features = local_policy_logits
+            .unsqueeze(2)
+            .and_then(|x| {
+                x.broadcast_mul(&self.policy_local_gate.reshape((1, 1, POLICY_HEAD_SIZE))?)
+            })
+            .and_then(|x| x.broadcast_add(&policy_global.unsqueeze(1)?))
             .and_then(|x| x.relu())
             .map_err(err)?;
-        let policy_gate = policy_global
-            .matmul(
-                &self
-                    .policy_gate
-                    .reshape((POLICY_HEAD_SIZE, 1))
-                    .map_err(err)?,
-            )
-            .and_then(|x| x.broadcast_add(&self.policy_gate_bias))
-            .map_err(err)?;
-        let logits = policy_global
-            .matmul(&self.policy_output.t().map_err(err)?)
-            .and_then(|x| x.add(&local_policy_logits.broadcast_mul(&policy_gate)?))
+        let logits = policy_features
+            .broadcast_mul(&self.policy_output.unsqueeze(0).map_err(err)?)
+            .and_then(|x| x.sum(2))
             .and_then(|x| x.broadcast_add(&self.policy_bias))
             .and_then(|x| x.add(&masks))
             .map_err(err)?;
@@ -801,20 +796,19 @@ impl Replica {
         m.hidden_bias = v[6].clone();
         m.policy_global = v[7].clone();
         m.policy_global_bias = v[8].clone();
-        m.policy_gate = v[9].clone();
-        m.policy_gate_bias = v[10].clone();
-        m.policy_output = v[11].clone();
-        m.policy_bias = v[12].clone();
-        m.local_axis_embedding = v[13].clone();
-        m.local_axis_scale = v[14].clone();
-        m.local_axis_bias = v[15].clone();
-        m.policy_local = v[16].clone();
-        m.value_head_hidden = v[17].clone();
-        m.value_local_output = v[18].clone();
-        m.value_head_bias = v[19].clone();
-        m.value_head_hidden2 = v[20].clone();
-        m.value_head_bias2 = v[21].clone();
-        m.value_head_output = v[22].clone();
+        m.policy_local_gate = v[9].clone();
+        m.policy_output = v[10].clone();
+        m.policy_bias = v[11].clone();
+        m.local_axis_embedding = v[12].clone();
+        m.local_axis_scale = v[13].clone();
+        m.local_axis_bias = v[14].clone();
+        m.policy_local = v[15].clone();
+        m.value_head_hidden = v[16].clone();
+        m.value_local_output = v[17].clone();
+        m.value_head_bias = v[18].clone();
+        m.value_head_hidden2 = v[19].clone();
+        m.value_head_bias2 = v[20].clone();
+        m.value_head_output = v[21].clone();
         Ok(())
     }
 }

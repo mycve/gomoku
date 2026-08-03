@@ -46,6 +46,7 @@ struct TrainerEvent {
     online_model: PolicyValueModel,
     batch: PendingBatch,
     train_stats: crate::selfplay::TrainStats,
+    sampling_seconds: f32,
     train_seconds: f32,
     pool_samples: usize,
     learning_rate: f32,
@@ -290,7 +291,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 }
                 let update = start_update + index + 1;
                 let lr = current_lr(&trainer_config, optimizer_steps);
-                let started = Instant::now();
+                let sampling_started = Instant::now();
                 let sampled = replay::sample_mixed_recent(
                     &pool,
                     trainer_config.train_samples_per_update,
@@ -300,11 +301,13 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                     trainer_config.replay_value_surprise_fraction,
                     trainer_config.seed ^ update as u64,
                 );
+                let sampling_seconds = sampling_started.elapsed().as_secs_f32();
                 let train_samples = sampled.samples.len();
                 let recent_quota_rate = sampled.recent_quota as f32 / train_samples.max(1) as f32;
                 let actual_recent_rate = sampled.actual_recent as f32 / train_samples.max(1) as f32;
                 let effective_ema_decay =
                     ema_decay_for_update(trainer_config.ema_decay, ema_initialized);
+                let train_started = Instant::now();
                 let train_stats = training.train_controlled(
                     &mut model,
                     Some(&mut ema_model),
@@ -322,13 +325,14 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                     ema_initialized = true;
                 }
                 optimizer_steps += train_stats.optimizer_steps;
-                let train_seconds = started.elapsed().as_secs_f32();
+                let train_seconds = train_started.elapsed().as_secs_f32();
                 if event_tx
                     .send(TrainerEvent {
                         model: ema_model.clone(),
                         online_model: model.clone(),
                         batch,
                         train_stats,
+                        sampling_seconds,
                         train_seconds,
                         pool_samples: pool.len(),
                         learning_rate: lr,
@@ -469,6 +473,11 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         let searches = event.batch.stats.searches.max(1) as f32;
         let sampled_moves = event.batch.stats.sampled_moves.max(1) as f32;
         tb.add_scalar("train/learning_rate", event.learning_rate, progress.update);
+        tb.add_scalar(
+            "train/sampling_seconds",
+            event.sampling_seconds,
+            progress.update,
+        );
         tb.add_scalar("train/seconds", event.train_seconds, progress.update);
         tb.add_scalar(
             "train/samples_per_second",
@@ -876,7 +885,7 @@ fn print_event(
         event.train_samples as f32 / event.batch.samples.len().max(1) as f32
     );
     println!(
-        "train    : device={} samples={} steps={} total_steps={} lr={:.6} loss={:.4} policy={:.4} value={:.4} time={:.2}s sps={:.1}",
+        "train    : device={} samples={} steps={} total_steps={} lr={:.6} loss={:.4} policy={:.4} value={:.4} sample={:.3}s time={:.2}s sps={:.1}",
         device,
         event.train_stats.samples,
         event.train_stats.optimizer_steps,
@@ -885,6 +894,7 @@ fn print_event(
         event.train_stats.loss,
         event.train_stats.policy_loss,
         event.train_stats.value_loss,
+        event.sampling_seconds,
         event.train_seconds,
         event.train_stats.samples as f32 / event.train_seconds.max(1e-6)
     );

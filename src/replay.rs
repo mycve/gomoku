@@ -88,6 +88,8 @@ pub fn sample_mixed_recent(
     .min(count);
     let mut rng = SplitMix64(seed);
     let mut samples = Vec::with_capacity(count);
+    let recent_weights = WeightedSource::new(pool, &recent);
+    let historical_weights = WeightedSource::new(pool, &historical);
     let policy_quota = ((count as f32) * policy_surprise_fraction.clamp(0.0, 1.0)).round() as usize;
     let value_quota = ((count as f32) * value_surprise_fraction.clamp(0.0, 1.0)).round() as usize;
     let mut kinds = vec![0u8; count];
@@ -112,7 +114,12 @@ pub fn sample_mixed_recent(
             &historical
         };
         let kind = kinds[slot] as usize;
-        let selected = weighted_index(pool, source, kind, &mut rng);
+        let weights = if std::ptr::eq(source, &recent) {
+            &recent_weights
+        } else {
+            &historical_weights
+        };
+        let selected = weights.sample(kind, &mut rng);
         let sample = &pool[selected];
         samples.push(sample.transformed(rng.index(8)));
     }
@@ -131,34 +138,48 @@ pub fn sample_mixed_recent(
     }
 }
 
-fn weighted_index(pool: &[Sample], source: &[usize], kind: usize, rng: &mut SplitMix64) -> usize {
-    if kind == 0 {
-        return source[rng.index(source.len())];
+struct WeightedSource<'a> {
+    indices: &'a [usize],
+    policy_cdf: Vec<f32>,
+    policy_total: f32,
+    value_cdf: Vec<f32>,
+    value_total: f32,
+}
+
+impl<'a> WeightedSource<'a> {
+    fn new(pool: &[Sample], indices: &'a [usize]) -> Self {
+        let mut policy_cdf = Vec::with_capacity(indices.len());
+        let mut value_cdf = Vec::with_capacity(indices.len());
+        let mut policy_total = 0.0;
+        let mut value_total = 0.0;
+        for &index in indices {
+            policy_total += pool[index].policy_surprise.max(1e-4);
+            value_total += pool[index].value_surprise.max(1e-4);
+            policy_cdf.push(policy_total);
+            value_cdf.push(value_total);
+        }
+        Self {
+            indices,
+            policy_cdf,
+            policy_total,
+            value_cdf,
+            value_total,
+        }
     }
-    let total = source
-        .iter()
-        .map(|&index| {
-            if kind == 1 {
-                pool[index].policy_surprise
-            } else {
-                pool[index].value_surprise
-            }
-            .max(1e-4)
-        })
-        .sum::<f32>();
-    let mut draw = rng.unit() * total;
-    for &index in source {
-        draw -= if kind == 1 {
-            pool[index].policy_surprise
+
+    fn sample(&self, kind: usize, rng: &mut SplitMix64) -> usize {
+        if kind == 0 {
+            return self.indices[rng.index(self.indices.len())];
+        }
+        let (cdf, total) = if kind == 1 {
+            (&self.policy_cdf, self.policy_total)
         } else {
-            pool[index].value_surprise
-        }
-        .max(1e-4);
-        if draw <= 0.0 {
-            return index;
-        }
+            (&self.value_cdf, self.value_total)
+        };
+        let draw = rng.unit() * total;
+        let position = cdf.partition_point(|&cumulative| cumulative <= draw);
+        self.indices[position.min(self.indices.len() - 1)]
     }
-    *source.last().expect("抽样来源不能为空")
 }
 
 struct SplitMix64(u64);
