@@ -128,10 +128,12 @@ MCTS。两手开局不写入训练样本；设为 `0.0` 可关闭。Arena 的成
 训练损失、学习率、自博弈速度、回放池大小和竞技场得分会写入 `runs/gomoku`，
 可用 `tensorboard --logdir runs/gomoku` 查看。训练使用 Candle 自动微分和 AdamW，
 优化器动量在同一次运行的各次 update 之间持续保留，EMA 在每个 optimizer step 后于
-训练设备更新。训练固定使用单个设备，由配置项 `gpu_device = 0` 选择；macOS 使用对应
-Metal 设备，Linux 和 Windows 使用对应 CUDA 设备（0 号 CUDA 不可用时回退 CPU）。在线模型、
-AdamW 状态与 EMA 均位于同一设备，不再进行跨卡批次分片、梯度回传或参数广播。
-批大小由配置文件控制。
+训练默认探测并使用所有可见 CUDA GPU；多卡时每个全局 batch 会按卡数分片，各卡
+并行前向/反向，经 NCCL AllReduce 汇总梯度，由主卡执行 AdamW，再通过 NCCL 广播
+参数。Linux 默认使用全部可见 CUDA GPU，可用 `CUDA_VISIBLE_DEVICES` 限制可见范围；
+macOS 使用 Metal，Windows 使用单 CUDA 设备（无 CUDA 时回退 CPU）。在线模型在每张
+训练卡上各有副本；AdamW 状态和 EMA 只保留在主卡。配置中的 `batch_size` 是多卡共同
+处理的全局 batch。旧配置中的 `gpu_device` 字段应删除。
 
 ### Windows CUDA 训练
 
@@ -148,13 +150,11 @@ cargo run --profile fast -- az-init model.safetensors 192
 cargo run --profile fast -- az-loop
 ```
 
-首次运行 `az-loop` 会生成 `gomoku.azloop.toml`；确认其中 `gpu_device = 0` 后再次运行。
-多卡机器可将其改为对应的 CUDA 设备编号。启动日志中的 `train_device=cuda:0` 和训练
-行中的 `device=cuda:0` 表示 CUDA 已启用；若显示 `cpu`，请检查前面输出的
+首次运行 `az-loop` 会生成 `gomoku.azloop.toml`。若显示 `cpu`，请检查前面输出的
 `CUDA unavailable` 原因。可用已有回放数据单独测速：
 
 ```powershell
-cargo run --profile fast -- az-train-bench model.safetensors data/replay.jsonl --gpu-device 0
+cargo run --profile fast -- az-train-bench model.safetensors data/replay.jsonl
 ```
 
 自博弈使用常驻异步 Worker，配置值超过机器可用 CPU 核心数时会自动限制到核心数。

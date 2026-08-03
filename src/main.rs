@@ -100,8 +100,6 @@ struct AzTrainBenchArgs {
     learning_rate: f32,
     #[arg(default_value_t = 256)]
     batch_size: usize,
-    #[arg(long, default_value_t = 0)]
-    gpu_device: usize,
 }
 
 #[derive(Args)]
@@ -137,8 +135,6 @@ struct AzDistillArgs {
     min_learning_rate: f32,
     #[arg(long, default_value_t = 256)]
     batch_size: usize,
-    #[arg(long, default_value_t = 0)]
-    gpu_device: usize,
     /// 最多处理多少个 NPZ；0 表示全部已下载分片。
     #[arg(long, default_value_t = 0)]
     max_files: usize,
@@ -267,14 +263,13 @@ fn main() -> io::Result<()> {
                 )));
             }
             let started = Instant::now();
-            let device = candle_train::training_device_name(args.gpu_device)?;
+            let device = candle_train::training_device_name()?;
             let stats = candle_train::train(
                 &mut model,
                 &samples,
                 args.epochs,
                 args.learning_rate,
                 args.batch_size,
-                args.gpu_device,
             )?;
             let seconds = started.elapsed().as_secs_f64();
             println!(
@@ -346,13 +341,8 @@ fn main() -> io::Result<()> {
                     args.data
                 )));
             }
-            let device = candle_train::training_device_name(args.gpu_device)?;
-            let mut session = candle_train::TrainingSession::new(
-                &model,
-                None,
-                args.gpu_device,
-                args.learning_rate,
-            )?;
+            let device = candle_train::training_device_name()?;
+            let mut session = candle_train::TrainingSession::new(&model, None, args.learning_rate)?;
             println!(
                 "distill  : files={} skip={} total={} device={} output={}",
                 files.len(),
@@ -387,12 +377,8 @@ fn main() -> io::Result<()> {
             if !validation.is_empty() {
                 if skip_files > 0 && Path::new(&args.best_output).exists() {
                     let best_model = PolicyValueModel::load(&args.best_output)?;
-                    let best_session = candle_train::TrainingSession::new(
-                        &best_model,
-                        None,
-                        args.gpu_device,
-                        args.learning_rate,
-                    )?;
+                    let best_session =
+                        candle_train::TrainingSession::new(&best_model, None, args.learning_rate)?;
                     let best_stats = best_session.evaluate(&validation, args.batch_size)?;
                     best_validation_loss = best_stats.loss;
                     println!(

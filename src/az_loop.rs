@@ -226,7 +226,6 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         let mut training = candle_train::TrainingSession::new(
             &model,
             Some(&ema_model),
-            trainer_config.gpu_device,
             current_lr(&trainer_config, start_update),
         )?;
         let mut pool = initial_pool;
@@ -307,7 +306,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         }
         Ok(())
     });
-    let train_device = candle_train::training_device_name(config.gpu_device)?;
+    let train_device = candle_train::training_device_name()?;
     let end = target_update.unwrap_or(usize::MAX);
     println!(
         "loop     : mode=batch-async actors={} actor_queue={}(nonblocking-drop) collector_queue=1(nonblocking-drop) trainer_queue=rendezvous warmup={} samples/update>={} sims={} train_device={} batch={} arena_opening_plies={}",

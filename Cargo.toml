@@ -24,13 +24,18 @@ zip = { version = "7.2", default-features = false, features = ["deflate-flate2-z
 
 [features]
 default = []
+gpu-train = []
+nccl-train = ["gpu-train", "candle-core/nccl"]
 profile = []
 
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { version = "0.10.2", features = ["accelerate", "metal"] }
 
-[target.'cfg(any(target_os = "windows", all(target_os = "linux", not(target_env = "musl"))))'.dependencies]
+[target.'cfg(target_os = "windows")'.dependencies]
 candle-core = { version = "0.10.2", features = ["cuda"] }
+
+[target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
+candle-core = { version = "0.10.2", features = ["cuda", "nccl"] }
 
 [profile.release]
 lto = "fat"

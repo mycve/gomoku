@@ -8,16 +8,34 @@ use crate::{
     replay::Sample,
     selfplay::TrainStats,
 };
+#[cfg(any(
+    feature = "nccl-train",
+    all(target_os = "linux", not(target_env = "musl"))
+))]
+use candle_core::{
+    CudaStorage, Storage,
+    cuda_backend::cudarc::nccl::{result as nccl_result, safe as nccl},
+    op::BackpropOp,
+};
 use candle_core::{Device, Tensor, Var, backprop::GradStore};
 use candle_nn::{
     ops::log_softmax,
     optim::{AdamW, Optimizer, ParamsAdamW},
 };
-use std::io;
+#[cfg(any(
+    feature = "nccl-train",
+    all(target_os = "linux", not(target_env = "musl"))
+))]
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::{io, thread};
 
-pub fn training_device_name(requested: usize) -> io::Result<String> {
-    Ok(make_device(requested)?.1)
+pub fn training_device_name() -> io::Result<String> {
+    let names = training_device_indices()
+        .iter()
+        .map(|&index| make_device(index).map(|(_, name)| name))
+        .collect::<io::Result<Vec<_>>>()?;
+    Ok(names.join(","))
 }
 
 pub fn train(
@@ -26,9 +44,8 @@ pub fn train(
     epochs: usize,
     learning_rate: f32,
     batch_size: usize,
-    requested_device: usize,
 ) -> io::Result<TrainStats> {
-    let mut session = TrainingSession::new(model, None, requested_device, learning_rate)?;
+    let mut session = TrainingSession::new(model, None, learning_rate)?;
     session.train_controlled(
         model,
         None,
@@ -42,25 +59,70 @@ pub fn train(
 }
 
 pub struct TrainingSession {
-    replica: Replica,
+    replicas: Vec<Replica>,
     ema: Option<Replica>,
     optimizer: AdamW,
+    #[cfg(any(
+        feature = "nccl-train",
+        all(target_os = "linux", not(target_env = "musl"))
+    ))]
+    nccl: Option<NcclAllReduce>,
 }
+
+#[cfg(any(
+    feature = "nccl-train",
+    all(target_os = "linux", not(target_env = "musl"))
+))]
+struct NcclAllReduce {
+    comms: Vec<nccl::Comm>,
+}
+
+#[cfg(any(
+    feature = "nccl-train",
+    all(target_os = "linux", not(target_env = "musl"))
+))]
+unsafe impl Send for NcclAllReduce {}
+#[cfg(any(
+    feature = "nccl-train",
+    all(target_os = "linux", not(target_env = "musl"))
+))]
+unsafe impl Sync for NcclAllReduce {}
 
 impl TrainingSession {
     pub fn new(
         model: &PolicyValueModel,
         ema_model: Option<&PolicyValueModel>,
-        requested_device: usize,
         learning_rate: f32,
     ) -> io::Result<Self> {
-        let (device, _) = make_device(requested_device)?;
-        let replica = Replica::new(model, &device)?;
+        let unique = training_device_indices();
+        #[cfg(not(any(
+            feature = "nccl-train",
+            all(target_os = "linux", not(target_env = "musl"))
+        )))]
+        if unique.len() > 1 {
+            return Err(io::Error::other(
+                "多卡训练需要使用 --features nccl-train 编译",
+            ));
+        }
+        let devices = unique
+            .iter()
+            .map(|&index| make_device(index).map(|(device, _)| device))
+            .collect::<io::Result<Vec<_>>>()?;
+        let replicas = devices
+            .iter()
+            .map(|device| Replica::new(model, device))
+            .collect::<io::Result<Vec<_>>>()?;
+        if replicas.len() > 1 {
+            eprintln!(
+                "train    : NCCL data parallel devices={:?} global_batch_sharded_each_step",
+                unique
+            );
+        }
         let ema = ema_model
-            .map(|model| Replica::new(model, &device))
+            .map(|model| Replica::new(model, &devices[0]))
             .transpose()?;
         let optimizer = AdamW::new(
-            replica.vars(),
+            replicas[0].vars(),
             ParamsAdamW {
                 lr: learning_rate as f64,
                 beta1: 0.9,
@@ -70,10 +132,20 @@ impl TrainingSession {
             },
         )
         .map_err(err)?;
+        #[cfg(any(
+            feature = "nccl-train",
+            all(target_os = "linux", not(target_env = "musl"))
+        ))]
+        let nccl = init_nccl_all_reduce(&replicas)?;
         Ok(Self {
-            replica,
+            replicas,
             ema,
             optimizer,
+            #[cfg(any(
+                feature = "nccl-train",
+                all(target_os = "linux", not(target_env = "musl"))
+            ))]
+            nccl,
         })
     }
 
@@ -100,21 +172,15 @@ impl TrainingSession {
                     self.copy_models(model, ema_model)?;
                     return Ok(finalize_stats(stats));
                 }
-                let output = self.replica.forward(batch, true)?;
+                let output = self.train_batch(batch)?;
                 stats.samples += output.samples;
                 stats.policy_loss += output.policy_sum;
                 stats.value_loss += output.value_sum;
                 stats.policy_entropy += output.policy_entropy_sum;
                 stats.value_entropy += output.value_entropy_sum;
-                {
-                    crate::scope_profile!("train.optimizer_step");
-                    self.optimizer
-                        .step(output.grads.as_ref().expect("训练批次必须包含梯度"))
-                        .map_err(err)?;
-                }
                 stats.optimizer_steps += 1;
                 if let Some(ema) = &self.ema {
-                    ema.update_ema_from(&self.replica, ema_decay)?;
+                    ema.update_ema_from(&self.replicas[0], ema_decay)?;
                 }
             }
         }
@@ -129,7 +195,7 @@ impl TrainingSession {
         }
         let mut stats = TrainStats::default();
         for batch in samples.chunks(batch_size.max(1)) {
-            let output = self.replica.forward(batch, false)?;
+            let output = self.replicas[0].forward(batch, false, batch.len())?;
             stats.samples += output.samples;
             stats.policy_loss += output.policy_sum;
             stats.value_loss += output.value_sum;
@@ -144,9 +210,212 @@ impl TrainingSession {
         model: &mut PolicyValueModel,
         ema_model: Option<&mut PolicyValueModel>,
     ) -> io::Result<()> {
-        self.replica.copy_to(model)?;
+        self.replicas[0].copy_to(model)?;
         if let (Some(ema), Some(ema_model)) = (&self.ema, ema_model) {
             ema.copy_to(ema_model)?;
+        }
+        Ok(())
+    }
+
+    fn train_batch(&mut self, batch: &[Sample]) -> io::Result<BatchOutput> {
+        let active = self.replicas.len().min(batch.len());
+        if active <= 1 {
+            let output = self.replicas[0].forward(batch, true, batch.len())?;
+            crate::scope_profile!("train.optimizer_step");
+            self.optimizer
+                .step(output.grads.as_ref().expect("训练批次必须包含梯度"))
+                .map_err(err)?;
+            #[cfg(any(
+                feature = "nccl-train",
+                all(target_os = "linux", not(target_env = "musl"))
+            ))]
+            if self.replicas.len() > 1 {
+                self.nccl_broadcast_vars()?;
+            }
+            return Ok(output);
+        }
+        let shard_size = batch.len().div_ceil(active);
+        #[allow(unused_mut)]
+        let mut outputs = thread::scope(|scope| {
+            let handles = batch
+                .chunks(shard_size)
+                .zip(&self.replicas)
+                .map(|(shard, replica)| {
+                    scope.spawn(move || replica.forward(shard, true, batch.len()))
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| io::Error::other("多卡训练线程异常退出"))?
+                })
+                .collect::<io::Result<Vec<_>>>()
+        })?;
+        #[cfg(any(
+            feature = "nccl-train",
+            all(target_os = "linux", not(target_env = "musl"))
+        ))]
+        {
+            self.nccl_all_reduce_grads(&mut outputs)?;
+            crate::scope_profile!("train.optimizer_step");
+            self.optimizer
+                .step(outputs[0].grads.as_ref().expect("NCCL 后主卡梯度缺失"))
+                .map_err(err)?;
+            self.nccl_broadcast_vars()?;
+        }
+        let mut total = BatchOutput::default();
+        for output in outputs {
+            total.add_stats(output);
+        }
+        Ok(total)
+    }
+
+    #[cfg(any(
+        feature = "nccl-train",
+        all(target_os = "linux", not(target_env = "musl"))
+    ))]
+    fn nccl_all_reduce_grads(&self, outputs: &mut [BatchOutput]) -> io::Result<()> {
+        let vars_by_rank = self.replicas.iter().map(Replica::vars).collect::<Vec<_>>();
+        for var_index in 0..vars_by_rank[0].len() {
+            let grads = outputs
+                .iter()
+                .zip(&vars_by_rank)
+                .map(|(output, vars)| {
+                    output
+                        .grads
+                        .as_ref()
+                        .and_then(|store| store.get(&vars[var_index]))
+                })
+                .collect::<Vec<_>>();
+            if grads.iter().all(|grad| grad.is_none()) {
+                continue;
+            }
+            if grads.iter().any(|grad| grad.is_none()) {
+                return Err(io::Error::other(format!(
+                    "NCCL 参数 {var_index} 的梯度在部分 GPU 上缺失"
+                )));
+            }
+            let tensors = grads
+                .into_iter()
+                .map(|grad| grad.expect("已检查梯度").contiguous().map_err(err))
+                .collect::<io::Result<Vec<_>>>()?;
+            let storages = tensors
+                .iter()
+                .map(|tensor| {
+                    let (storage, layout) = tensor.storage_and_layout();
+                    if !layout.is_contiguous() || layout.start_offset() != 0 {
+                        return Err(io::Error::other("NCCL 梯度必须连续且偏移为零"));
+                    }
+                    Ok(storage)
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            let mut receives = tensors
+                .iter()
+                .map(|tensor| {
+                    tensor
+                        .device()
+                        .as_cuda_device()
+                        .map_err(err)?
+                        .cuda_stream()
+                        .alloc_zeros::<f32>(tensor.elem_count())
+                        .map_err(nccl_cuda_error)
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            let nccl = self.nccl.as_ref().expect("多卡必须初始化 NCCL");
+            nccl::group_start().map_err(nccl_error)?;
+            let reduce = (|| -> io::Result<()> {
+                for rank in 0..outputs.len() {
+                    let send = match &*storages[rank] {
+                        Storage::Cuda(storage) => storage.as_cuda_slice::<f32>().map_err(err)?,
+                        _ => return Err(io::Error::other("NCCL 梯度不在 CUDA 设备上")),
+                    };
+                    nccl.comms[rank]
+                        .all_reduce(send, &mut receives[rank], &nccl::ReduceOp::Sum)
+                        .map_err(nccl_error)?;
+                }
+                Ok(())
+            })();
+            let group_end = nccl::group_end().map_err(nccl_error);
+            reduce?;
+            group_end?;
+            for (rank, recv) in receives.into_iter().enumerate() {
+                let var = &vars_by_rank[rank][var_index];
+                let device = self.replicas[rank]
+                    .device
+                    .as_cuda_device()
+                    .map_err(err)?
+                    .clone();
+                let storage = Storage::Cuda(CudaStorage::wrap_cuda_slice(recv, device));
+                let reduced =
+                    Tensor::from_storage(storage, var.shape().clone(), BackpropOp::none(), false);
+                outputs[rank]
+                    .grads
+                    .as_mut()
+                    .expect("训练输出必须有梯度")
+                    .insert(var, reduced);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(
+        feature = "nccl-train",
+        all(target_os = "linux", not(target_env = "musl"))
+    ))]
+    fn nccl_broadcast_vars(&self) -> io::Result<()> {
+        let vars_by_rank = self.replicas.iter().map(Replica::vars).collect::<Vec<_>>();
+        let nccl = self.nccl.as_ref().expect("多卡必须初始化 NCCL");
+        for var_index in 0..vars_by_rank[0].len() {
+            let root = vars_by_rank[0][var_index]
+                .as_detached_tensor()
+                .contiguous()
+                .map_err(err)?;
+            let (root_storage, root_layout) = root.storage_and_layout();
+            if !root_layout.is_contiguous() || root_layout.start_offset() != 0 {
+                return Err(io::Error::other("NCCL 广播参数必须连续且偏移为零"));
+            }
+            let mut receives = vars_by_rank
+                .iter()
+                .map(|vars| {
+                    vars[var_index]
+                        .device()
+                        .as_cuda_device()
+                        .map_err(err)?
+                        .cuda_stream()
+                        .alloc_zeros::<f32>(root.elem_count())
+                        .map_err(nccl_cuda_error)
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            nccl::group_start().map_err(nccl_error)?;
+            let broadcast = (|| -> io::Result<()> {
+                let send = match &*root_storage {
+                    Storage::Cuda(storage) => storage.as_cuda_slice::<f32>().map_err(err)?,
+                    _ => return Err(io::Error::other("NCCL 广播源不在 CUDA 设备上")),
+                };
+                for rank in 0..vars_by_rank.len() {
+                    nccl.comms[rank]
+                        .broadcast((rank == 0).then_some(send), &mut receives[rank], 0)
+                        .map_err(nccl_error)?;
+                }
+                Ok(())
+            })();
+            let group_end = nccl::group_end().map_err(nccl_error);
+            broadcast?;
+            group_end?;
+            for (rank, recv) in receives.into_iter().enumerate().skip(1) {
+                let var = &vars_by_rank[rank][var_index];
+                let device = self.replicas[rank]
+                    .device
+                    .as_cuda_device()
+                    .map_err(err)?
+                    .clone();
+                let storage = Storage::Cuda(CudaStorage::wrap_cuda_slice(recv, device));
+                let tensor =
+                    Tensor::from_storage(storage, var.shape().clone(), BackpropOp::none(), false);
+                var.set(&tensor).map_err(err)?;
+            }
         }
         Ok(())
     }
@@ -255,7 +524,12 @@ impl Replica {
             self.value_head_output.clone(),
         ]
     }
-    fn forward(&self, samples: &[Sample], backward: bool) -> io::Result<BatchOutput> {
+    fn forward(
+        &self,
+        samples: &[Sample],
+        backward: bool,
+        global_batch_size: usize,
+    ) -> io::Result<BatchOutput> {
         let packed = {
             crate::scope_profile!("train.pack");
             pack(samples)
@@ -439,7 +713,7 @@ impl Replica {
             .map_err(err)?;
         let loss = policy_sum_tensor
             .add(&value_sum_tensor)
-            .and_then(|x| x.affine(1.0 / b as f64, 0.0))
+            .and_then(|x| x.affine(1.0 / global_batch_size.max(1) as f64, 0.0))
             .map_err(err)?;
         let policy_sum = policy_sum_tensor.to_scalar::<f32>().map_err(err)?;
         let value_sum = value_sum_tensor.to_scalar::<f32>().map_err(err)?;
@@ -506,6 +780,7 @@ impl Replica {
         Ok(())
     }
 }
+#[derive(Default)]
 struct BatchOutput {
     grads: Option<GradStore>,
     samples: usize,
@@ -513,6 +788,123 @@ struct BatchOutput {
     value_sum: f32,
     policy_entropy_sum: f32,
     value_entropy_sum: f32,
+}
+impl BatchOutput {
+    fn add_stats(&mut self, other: Self) {
+        self.samples += other.samples;
+        self.policy_sum += other.policy_sum;
+        self.value_sum += other.value_sum;
+        self.policy_entropy_sum += other.policy_entropy_sum;
+        self.value_entropy_sum += other.value_entropy_sum;
+    }
+}
+
+fn training_device_indices() -> Vec<usize> {
+    #[cfg(any(
+        feature = "nccl-train",
+        all(target_os = "linux", not(target_env = "musl"))
+    ))]
+    {
+        let candidates = visible_cuda_device_count()
+            .or_else(nvidia_smi_device_count)
+            .map(|count| (0..count).collect::<Vec<_>>())
+            .unwrap_or_else(|| probe_cuda_devices(64));
+        let available = candidates
+            .into_iter()
+            .filter(|&index| Device::new_cuda(index).is_ok())
+            .collect::<Vec<_>>();
+        if !available.is_empty() {
+            return available;
+        }
+    }
+    vec![0]
+}
+
+#[cfg(any(
+    feature = "nccl-train",
+    all(target_os = "linux", not(target_env = "musl"))
+))]
+fn visible_cuda_device_count() -> Option<usize> {
+    let value = std::env::var("CUDA_VISIBLE_DEVICES").ok()?;
+    let value = value.trim();
+    if value.is_empty() || value == "-1" || value.eq_ignore_ascii_case("NoDevFiles") {
+        return None;
+    }
+    let count = value
+        .split(',')
+        .filter(|item| !item.trim().is_empty())
+        .count();
+    (count > 0).then_some(count)
+}
+
+#[cfg(any(
+    feature = "nccl-train",
+    all(target_os = "linux", not(target_env = "musl"))
+))]
+fn nvidia_smi_device_count() -> Option<usize> {
+    let output = Command::new("nvidia-smi").arg("-L").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let count = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.trim_start().starts_with("GPU "))
+        .count();
+    (count > 0).then_some(count)
+}
+
+#[cfg(any(
+    feature = "nccl-train",
+    all(target_os = "linux", not(target_env = "musl"))
+))]
+fn probe_cuda_devices(limit: usize) -> Vec<usize> {
+    let mut devices = Vec::new();
+    for index in 0..limit {
+        if Device::new_cuda(index).is_ok() {
+            devices.push(index);
+        } else if !devices.is_empty() {
+            break;
+        }
+    }
+    devices
+}
+
+#[cfg(any(
+    feature = "nccl-train",
+    all(target_os = "linux", not(target_env = "musl"))
+))]
+fn init_nccl_all_reduce(replicas: &[Replica]) -> io::Result<Option<NcclAllReduce>> {
+    if replicas.len() <= 1 {
+        return Ok(None);
+    }
+    let streams = replicas
+        .iter()
+        .map(|replica| {
+            replica
+                .device
+                .as_cuda_device()
+                .map(|device| device.cuda_stream())
+                .map_err(err)
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let comms = nccl::Comm::from_devices(streams).map_err(nccl_error)?;
+    Ok(Some(NcclAllReduce { comms }))
+}
+
+#[cfg(any(
+    feature = "nccl-train",
+    all(target_os = "linux", not(target_env = "musl"))
+))]
+fn nccl_error(error: nccl_result::NcclError) -> io::Error {
+    io::Error::other(format!("NCCL failed: {error:?}"))
+}
+
+#[cfg(any(
+    feature = "nccl-train",
+    all(target_os = "linux", not(target_env = "musl"))
+))]
+fn nccl_cuda_error(error: candle_core::cuda_backend::cudarc::driver::DriverError) -> io::Error {
+    io::Error::other(format!("NCCL CUDA allocation failed: {error:?}"))
 }
 fn make_device(requested: usize) -> io::Result<(Device, String)> {
     #[cfg(target_os = "macos")]
@@ -538,7 +930,7 @@ fn make_device(requested: usize) -> io::Result<(Device, String)> {
     #[allow(unreachable_code)]
     {
         if requested != 0 {
-            return Err(io::Error::other("当前平台仅支持 gpu_device = 0（CPU）"));
+            return Err(io::Error::other("当前平台仅支持设备 0（CPU）"));
         }
         Ok((Device::Cpu, "cpu".into()))
     }
@@ -715,7 +1107,7 @@ mod tests {
             value_wdl: None,
             generation: 0,
         };
-        let stats = train(&mut model, &[sample], 2, 1e-3, 1, 0).unwrap();
+        let stats = train(&mut model, &[sample], 2, 1e-3, 1).unwrap();
         assert_eq!(stats.optimizer_steps, 2);
         assert!(stats.policy_loss.is_finite());
         assert!(stats.value_loss.is_finite());
