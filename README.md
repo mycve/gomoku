@@ -240,7 +240,9 @@ Policy 和 Value 损失具有独立样本权重。价值塔采用适合 NEON/AVX
 启动会加载该快照并立即删除已消费的快照文件，避免旧快照被重复加载；正常达到目标
 更新退出时不会保留中断快照。
 
-开始全新训练配置及 Replay v6 时，应先停止旧进程，再只删除该实验对应文件和旧配置：
+开始全新训练配置 v7 及当前 Replay 格式时，应先停止旧进程，再只删除该实验对应文件和旧配置。
+训练学习率按累计 optimizer step 调度：前 200 steps 从 `1e-4` 线性升至 `8e-4`，
+随后用 10000 steps 余弦下降至 `1e-4`，累计 step 会随 progress 持久化：
 
 ```bash
 rm -f model.safetensors ema.safetensors best.safetensors

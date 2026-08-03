@@ -22,7 +22,8 @@ pub struct AzLoopConfig {
     pub selfplay_policy_opening_temperature: f32,
     pub learning_rate: f32,
     pub learning_rate_min: f32,
-    pub learning_rate_decay: f32,
+    pub learning_rate_warmup_steps: usize,
+    pub learning_rate_cosine_steps: usize,
     pub batch_epochs: usize,
     pub batch_size: usize,
     pub cpuct: f32,
@@ -75,7 +76,7 @@ pub struct AzLoopConfig {
 impl Default for AzLoopConfig {
     fn default() -> Self {
         Self {
-            format_version: 6,
+            format_version: 7,
             model_path: "model.safetensors".into(),
             ema_model_path: "ema.safetensors".into(),
             best_model_path: "best.safetensors".into(),
@@ -90,8 +91,9 @@ impl Default for AzLoopConfig {
             selfplay_policy_opening_avg_plies: 6,
             selfplay_policy_opening_temperature: 1.6,
             learning_rate: 0.0008,
-            learning_rate_min: 0.0002,
-            learning_rate_decay: 0.90,
+            learning_rate_min: 0.0001,
+            learning_rate_warmup_steps: 200,
+            learning_rate_cosine_steps: 10_000,
             batch_epochs: 1,
             batch_size: 256,
             cpuct: 1.5,
@@ -170,7 +172,6 @@ impl AzLoopConfig {
                 self.selfplay_policy_opening_temperature,
             ),
             ("learning_rate_min", self.learning_rate_min),
-            ("learning_rate_decay", self.learning_rate_decay),
             ("cpuct", self.cpuct),
             ("cpuct_log", self.cpuct_log),
             ("cpuct_base", self.cpuct_base),
@@ -226,8 +227,8 @@ impl AzLoopConfig {
                 return Err(io::Error::other(format!("配置 `{name}` 必须是有限数值")));
             }
         }
-        if self.format_version != 6 {
-            return Err(io::Error::other("仅支持 format_version = 6"));
+        if self.format_version != 7 {
+            return Err(io::Error::other("仅支持 format_version = 7"));
         }
         if self.simulations == 0
             || self.selfplay_samples_per_update == 0
@@ -235,6 +236,8 @@ impl AzLoopConfig {
             || self.batch_epochs == 0
             || self.batch_size == 0
             || self.train_samples_per_update == 0
+            || self.learning_rate_warmup_steps == 0
+            || self.learning_rate_cosine_steps == 0
         {
             return Err(io::Error::other(
                 "simulations、selfplay_samples_per_update、replay_warmup_samples、batch_size 和 train_samples_per_update 必须大于 0",
@@ -242,7 +245,7 @@ impl AzLoopConfig {
         }
         if self.learning_rate <= 0.0
             || self.learning_rate_min < 0.0
-            || !(0.0..=1.0).contains(&self.learning_rate_decay)
+            || self.learning_rate_min > self.learning_rate
             || self.cpuct <= 0.0
             || self.cpuct_log < 0.0
             || self.cpuct_base <= 0.0
@@ -310,7 +313,7 @@ impl AzLoopConfig {
     }
 }
 
-const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 6
+const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 7
 model_path = "model.safetensors"
 ema_model_path = "ema.safetensors"
 best_model_path = "best.safetensors"
@@ -325,8 +328,9 @@ selfplay_policy_opening_probability = 0.8
 selfplay_policy_opening_avg_plies = 6
 selfplay_policy_opening_temperature = 1.6
 learning_rate = 0.0008
-learning_rate_min = 0.0002
-learning_rate_decay = 0.90
+learning_rate_min = 0.0001
+learning_rate_warmup_steps = 200
+learning_rate_cosine_steps = 10000
 batch_epochs = 1
 batch_size = 256
 cpuct = 1.5
@@ -384,7 +388,7 @@ mod tests {
     fn default_text_is_exact_and_valid() {
         let config: AzLoopConfig = toml::from_str(DEFAULT_CONFIG_TEXT).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.format_version, 6);
+        assert_eq!(config.format_version, 7);
         assert_eq!(config.selfplay_samples_per_update, 50_000);
         assert_eq!(config.selfplay_workers, 196);
         assert_eq!(config.selfplay_policy_opening_probability, 0.8);

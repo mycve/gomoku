@@ -26,6 +26,7 @@ struct Progress {
     update: usize,
     total_games: usize,
     total_samples: usize,
+    optimizer_steps: usize,
     learning_rate: f32,
 }
 
@@ -153,6 +154,14 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             "copy_first_update"
         }
     );
+    println!(
+        "lr       : warmup={} cosine={} min={:.6} peak={:.6} resumed_steps={}",
+        config.learning_rate_warmup_steps,
+        config.learning_rate_cosine_steps,
+        config.learning_rate_min,
+        config.learning_rate,
+        progress.optimizer_steps
+    );
     let published = Arc::new(RwLock::new(initial_ema.clone()));
     let version = Arc::new(AtomicU64::new(progress.update as u64));
     let mut actors = AsyncSelfplay::start(
@@ -254,6 +263,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     let trainer_version = Arc::clone(&version);
     let trainer_config = config.clone();
     let start_update = progress.update;
+    let start_optimizer_steps = progress.optimizer_steps;
     let trainer = thread::spawn(move || -> io::Result<()> {
         let result = (|| -> io::Result<()> {
             let mut model = initial_model;
@@ -262,10 +272,11 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             let mut training = candle_train::TrainingSession::new(
                 &model,
                 Some(&ema_model),
-                current_lr(&trainer_config, start_update),
+                current_lr(&trainer_config, start_optimizer_steps),
             )?;
             let mut pool = initial_pool;
             let mut index = 0usize;
+            let mut optimizer_steps = start_optimizer_steps;
             while let Ok(batch) = ready_rx.recv() {
                 if trainer_stop.load(Ordering::SeqCst) {
                     break;
@@ -278,7 +289,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                     pool.drain(..pool.len() - trainer_config.replay_capacity);
                 }
                 let update = start_update + index + 1;
-                let lr = current_lr(&trainer_config, update - 1);
+                let lr = current_lr(&trainer_config, optimizer_steps);
                 let started = Instant::now();
                 let sampled = replay::sample_mixed_recent(
                     &pool,
@@ -310,6 +321,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 if train_stats.optimizer_steps > 0 {
                     ema_initialized = true;
                 }
+                optimizer_steps += train_stats.optimizer_steps;
                 let train_seconds = started.elapsed().as_secs_f32();
                 if event_tx
                     .send(TrainerEvent {
@@ -385,6 +397,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         progress.update += 1;
         progress.total_games += event.batch.games;
         progress.total_samples += event.batch.samples.len();
+        progress.optimizer_steps += event.train_stats.optimizer_steps;
         progress.learning_rate = event.learning_rate;
         *published.write().unwrap_or_else(|e| e.into_inner()) = event.model.clone();
         version.store(progress.update as u64, Ordering::Release);
@@ -863,10 +876,11 @@ fn print_event(
         event.train_samples as f32 / event.batch.samples.len().max(1) as f32
     );
     println!(
-        "train    : device={} samples={} steps={} lr={:.6} loss={:.4} policy={:.4} value={:.4} time={:.2}s sps={:.1}",
+        "train    : device={} samples={} steps={} total_steps={} lr={:.6} loss={:.4} policy={:.4} value={:.4} time={:.2}s sps={:.1}",
         device,
         event.train_stats.samples,
         event.train_stats.optimizer_steps,
+        progress.optimizer_steps,
         event.learning_rate,
         event.train_stats.loss,
         event.train_stats.policy_loss,
@@ -876,9 +890,18 @@ fn print_event(
     );
 }
 
-fn current_lr(c: &AzLoopConfig, update: usize) -> f32 {
-    let exponent = update.min(i32::MAX as usize) as i32;
-    (c.learning_rate * c.learning_rate_decay.powi(exponent)).max(c.learning_rate_min)
+fn current_lr(c: &AzLoopConfig, optimizer_step: usize) -> f32 {
+    if optimizer_step < c.learning_rate_warmup_steps {
+        let progress = optimizer_step as f32 / c.learning_rate_warmup_steps as f32;
+        return c.learning_rate_min + (c.learning_rate - c.learning_rate_min) * progress;
+    }
+    let decay_step = optimizer_step - c.learning_rate_warmup_steps;
+    if decay_step >= c.learning_rate_cosine_steps {
+        return c.learning_rate_min;
+    }
+    let progress = decay_step as f32 / c.learning_rate_cosine_steps as f32;
+    let cosine = 0.5 * (1.0 + (std::f32::consts::PI * progress).cos());
+    c.learning_rate_min + (c.learning_rate - c.learning_rate_min) * cosine
 }
 
 fn ema_decay_for_update(configured_decay: f32, initialized: bool) -> f32 {
@@ -939,6 +962,17 @@ fn prune_checkpoints(c: &AzLoopConfig) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn learning_rate_warms_up_then_cosine_decays() {
+        let config = AzLoopConfig::default();
+        assert!((current_lr(&config, 0) - 0.0001).abs() < 1e-8);
+        assert!((current_lr(&config, 100) - 0.00045).abs() < 1e-8);
+        assert!((current_lr(&config, 200) - 0.0008).abs() < 1e-8);
+        assert!((current_lr(&config, 5_200) - 0.00045).abs() < 1e-8);
+        assert!((current_lr(&config, 10_200) - 0.0001).abs() < 1e-8);
+        assert!((current_lr(&config, 20_000) - 0.0001).abs() < 1e-8);
+    }
 
     #[test]
     fn ema_first_update_copies_online_model() {
