@@ -121,12 +121,26 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         config.temperature_visit_offset
     );
     println!(
-        "priors   : softmax_temp={:.2} root_noise(alpha={:.2}, fraction={:.2})",
-        config.policy_softmax_temp, config.root_dirichlet_alpha, config.root_exploration_fraction
+        "priors   : softmax_temp={:.2} root_noise(total_concentration={:.2}, fraction={:.2})",
+        config.policy_softmax_temp,
+        config.root_dirichlet_total_concentration,
+        config.root_exploration_fraction
     );
     println!(
-        "opening  : probability={:.1}% regions=3x3/4x4/5x5 random_plies=2 samples_after_opening=true",
-        config.selfplay_random_opening_probability * 100.0
+        "opening  : policy probability={:.1}% avg_plies={} temperature={:.2} samples_after_opening=true",
+        config.selfplay_policy_opening_probability * 100.0,
+        config.selfplay_policy_opening_avg_plies,
+        config.selfplay_policy_opening_temperature
+    );
+    println!(
+        "search   : sims={} cpuct={:.2}+{:.2}log/base{:.0} graph={} lcb={} symmetries={}",
+        config.simulations,
+        config.cpuct,
+        config.cpuct_log,
+        config.cpuct_base,
+        config.use_graph_search,
+        config.use_lcb_for_selection,
+        config.root_num_symmetries_to_sample
     );
     println!(
         "targets  : policy=mcts_visits value=terminal_wdl ema_decay={:.6} ema_model={} ema_state={}",
@@ -149,16 +163,33 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         SearchConfig {
             simulations: config.simulations,
             cpuct: config.cpuct,
-            root_dirichlet_alpha: config.root_dirichlet_alpha,
+            cpuct_log: config.cpuct_log,
+            cpuct_base: config.cpuct_base,
+            root_dirichlet_total_concentration: config.root_dirichlet_total_concentration,
             root_exploration_fraction: config.root_exploration_fraction,
             policy_softmax_temp: config.policy_softmax_temp,
+            root_policy_temperature_early: config.root_policy_temperature_early,
+            root_policy_temperature: config.root_policy_temperature,
+            root_policy_temperature_halflife: config.root_policy_temperature_halflife,
+            root_num_symmetries_to_sample: config.root_num_symmetries_to_sample,
+            use_graph_search: config.use_graph_search,
+            use_lcb_for_selection: config.use_lcb_for_selection,
+            lcb_stdevs: config.lcb_stdevs,
+            min_visit_prop_for_lcb: config.min_visit_prop_for_lcb,
             temperature_start: config.temperature_start,
             temperature_endgame: config.temperature_endgame,
             temperature_decay_delay_plies: config.temperature_decay_delay_plies,
             temperature_decay_plies: config.temperature_decay_plies,
             temperature_value_cutoff: config.temperature_value_cutoff,
             temperature_visit_offset: config.temperature_visit_offset,
-            random_opening_probability: config.selfplay_random_opening_probability,
+            random_opening_probability: config.selfplay_policy_opening_probability,
+            policy_opening_avg_plies: config.selfplay_policy_opening_avg_plies,
+            policy_opening_temperature: config.selfplay_policy_opening_temperature,
+            early_fork_game_prob: config.early_fork_game_prob,
+            early_fork_max_ply: config.early_fork_max_ply,
+            early_fork_max_choices: config.early_fork_max_choices,
+            asymmetric_playout_prob: config.asymmetric_playout_prob,
+            max_asymmetric_ratio: config.max_asymmetric_ratio,
             ..Default::default()
         },
         config.seed,
@@ -249,6 +280,8 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 trainer_config.train_samples_per_update,
                 trainer_config.replay_recent_sample_fraction,
                 trainer_config.replay_recent_updates,
+                trainer_config.replay_policy_surprise_fraction,
+                trainer_config.replay_value_surprise_fraction,
                 trainer_config.seed ^ update as u64,
             );
             let train_samples = sampled.samples.len();
@@ -486,6 +519,16 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             progress.update,
         );
         tb.add_scalar(
+            "search/policy_surprise",
+            event.batch.stats.policy_surprise_sum / searches,
+            progress.update,
+        );
+        tb.add_scalar(
+            "search/value_surprise",
+            event.batch.stats.value_surprise_sum / searches,
+            progress.update,
+        );
+        tb.add_scalar(
             "search/visited_actions",
             event.batch.stats.visited_actions_sum as f32 / searches,
             progress.update,
@@ -577,6 +620,17 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 SearchConfig {
                     simulations: config.arena_simulations,
                     cpuct: config.cpuct,
+                    cpuct_log: config.cpuct_log,
+                    cpuct_base: config.cpuct_base,
+                    policy_softmax_temp: config.policy_softmax_temp,
+                    root_policy_temperature_early: config.root_policy_temperature_early,
+                    root_policy_temperature: config.root_policy_temperature,
+                    root_policy_temperature_halflife: config.root_policy_temperature_halflife,
+                    root_num_symmetries_to_sample: config.root_num_symmetries_to_sample,
+                    use_graph_search: config.use_graph_search,
+                    use_lcb_for_selection: config.use_lcb_for_selection,
+                    lcb_stdevs: config.lcb_stdevs,
+                    min_visit_prop_for_lcb: config.min_visit_prop_for_lcb,
                     opening_random_plies: config.arena_opening_plies,
                     opening_seed: config.seed ^ progress.update as u64,
                     ..Default::default()
@@ -750,10 +804,12 @@ fn print_event(
         event.batch.stats.random_opening_plies
     );
     println!(
-        "search   : avg_sims={:.1} entropy={:.3} visited={:.1}",
+        "search   : avg_sims={:.1} entropy={:.3} visited={:.1} surprise={:.3}/{:.3}",
         event.batch.stats.simulations as f32 / searches,
         event.batch.stats.entropy_sum / searches,
-        event.batch.stats.visited_actions_sum as f32 / searches
+        event.batch.stats.visited_actions_sum as f32 / searches,
+        event.batch.stats.policy_surprise_sum / searches,
+        event.batch.stats.value_surprise_sum / searches
     );
     println!(
         "pipeline : actors={}/{} versions={}-{} collect={:.2}s",

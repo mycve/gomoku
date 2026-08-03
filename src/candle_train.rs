@@ -558,6 +558,10 @@ impl Replica {
             Tensor::from_vec(packed.policy_masks, (b, CELL_COUNT), &self.device).map_err(err)?;
         let value_wdl =
             Tensor::from_vec(packed.value_wdl, (b, WDL_SIZE), &self.device).map_err(err)?;
+        let policy_weights =
+            Tensor::from_vec(packed.policy_weights, (b,), &self.device).map_err(err)?;
+        let value_weights =
+            Tensor::from_vec(packed.value_weights, (b,), &self.device).map_err(err)?;
         let local_axis_indices = Tensor::from_vec(
             packed.local_axis_indices,
             (b * CELL_COUNT * LOCAL_AXES,),
@@ -677,6 +681,8 @@ impl Replica {
         let log_probs = log_softmax(&logits, 1).map_err(err)?;
         let policy_sum_tensor = targets
             .mul(&log_probs)
+            .and_then(|x| x.sum(1))
+            .and_then(|x| x.mul(&policy_weights))
             .and_then(|x| x.sum_all())
             .and_then(|x| x.affine(-1.0, 0.0))
             .map_err(err)?;
@@ -708,6 +714,8 @@ impl Replica {
         let value_log_probs = log_softmax(&value_logits, 1).map_err(err)?;
         let value_sum_tensor = value_wdl
             .mul(&value_log_probs)
+            .and_then(|x| x.sum(1))
+            .and_then(|x| x.mul(&value_weights))
             .and_then(|x| x.sum_all())
             .and_then(|x| x.affine(-1.0, 0.0))
             .map_err(err)?;
@@ -948,6 +956,8 @@ struct Packed {
     local_axis_indices: Vec<u32>,
     local_legal_mask: Vec<f32>,
     value_wdl: Vec<f32>,
+    policy_weights: Vec<f32>,
+    value_weights: Vec<f32>,
     policy_entropy_sum: f32,
     value_entropy_sum: f32,
 }
@@ -963,9 +973,13 @@ fn pack(samples: &[Sample]) -> Packed {
     let mut local_axis_indices = vec![0_u32; samples.len() * CELL_COUNT * LOCAL_AXES];
     let mut local_legal_mask = vec![0.0; samples.len() * CELL_COUNT];
     let mut value_wdl = Vec::with_capacity(samples.len() * WDL_SIZE);
+    let mut policy_weights = Vec::with_capacity(samples.len());
+    let mut value_weights = Vec::with_capacity(samples.len());
     let mut policy_entropy_sum = 0.0;
     let mut value_entropy_sum = 0.0;
     for (row, s) in samples.iter().enumerate() {
+        policy_weights.push(s.policy_weight.max(0.0));
+        value_weights.push(s.value_weight.max(0.0));
         let us = s.board.to_move().stone();
         for (sq, &stone) in s.board.cells().iter().enumerate() {
             if stone == us {
@@ -995,15 +1009,17 @@ fn pack(samples: &[Sample]) -> Packed {
             }
         }
         let sum: f32 = s.policy.iter().map(|(_, p)| p.max(0.0)).sum();
+        let mut policy_entropy = 0.0;
         for &(m, p) in &s.policy {
             if m.0 < CELL_COUNT && sum > 1e-12 {
                 let probability = p.max(0.0) / sum;
                 targets[row * CELL_COUNT + m.0] = probability;
                 if probability > 0.0 {
-                    policy_entropy_sum -= probability * probability.ln();
+                    policy_entropy -= probability * probability.ln();
                 }
             }
         }
+        policy_entropy_sum += policy_entropy * s.policy_weight.max(0.0);
         let final_wdl = s.value_wdl.unwrap_or_else(|| {
             if s.value > 0.5 {
                 [1.0, 0.0, 0.0]
@@ -1013,11 +1029,12 @@ fn pack(samples: &[Sample]) -> Packed {
                 [0.0, 1.0, 0.0]
             }
         });
-        value_entropy_sum -= final_wdl
-            .iter()
-            .filter(|&&probability| probability > 0.0)
-            .map(|&probability| probability * probability.ln())
-            .sum::<f32>();
+        value_entropy_sum -= s.value_weight.max(0.0)
+            * final_wdl
+                .iter()
+                .filter(|&&probability| probability > 0.0)
+                .map(|&probability| probability * probability.ln())
+                .sum::<f32>();
         value_wdl.extend_from_slice(&final_wdl);
     }
     Packed {
@@ -1032,6 +1049,8 @@ fn pack(samples: &[Sample]) -> Packed {
         local_axis_indices,
         local_legal_mask,
         value_wdl,
+        policy_weights,
+        value_weights,
         policy_entropy_sum,
         value_entropy_sum,
     }
@@ -1049,7 +1068,7 @@ mod tests {
     use crate::game::{Board, Move};
 
     #[test]
-    fn packing_uses_search_candidates_without_changing_rule_legality() {
+    fn packing_masks_only_rule_illegal_moves() {
         let mut board = Board::new();
         let occupied = Move::new(7, 7).unwrap();
         assert!(board.play(occupied));
@@ -1061,12 +1080,17 @@ mod tests {
             value: 0.0,
             value_wdl: None,
             generation: 0,
+            policy_weight: 1.0,
+            value_weight: 1.0,
+            policy_surprise: 0.0,
+            value_surprise: 0.0,
+            predicted_value: 0.0,
         }]);
 
         assert_eq!(packed.policy_masks[occupied.0], -1e9);
         assert_eq!(packed.local_legal_mask[occupied.0], 0.0);
-        assert_eq!(packed.policy_masks[corner.0], -1e9);
-        assert_eq!(packed.local_legal_mask[corner.0], 0.0);
+        assert_eq!(packed.policy_masks[corner.0], 0.0);
+        assert_eq!(packed.local_legal_mask[corner.0], 1.0);
         assert_eq!(packed.policy_masks[nearby.0], 0.0);
         assert_eq!(packed.local_legal_mask[nearby.0], 1.0);
         assert_eq!(packed.policy_targets[nearby.0], 1.0);
@@ -1086,6 +1110,11 @@ mod tests {
             value: -0.3,
             value_wdl: Some(wdl),
             generation: 0,
+            policy_weight: 1.0,
+            value_weight: 1.0,
+            policy_surprise: 0.0,
+            value_surprise: 0.0,
+            predicted_value: 0.0,
         }]);
         let expected_policy = -policy.iter().map(|p| p * p.ln()).sum::<f32>();
         let expected_value = -wdl.iter().map(|p| p * p.ln()).sum::<f32>();
@@ -1106,6 +1135,11 @@ mod tests {
             value: 1.0,
             value_wdl: None,
             generation: 0,
+            policy_weight: 1.0,
+            value_weight: 1.0,
+            policy_surprise: 0.0,
+            value_surprise: 0.0,
+            predicted_value: 0.0,
         };
         let stats = train(&mut model, &[sample], 2, 1e-3, 1).unwrap();
         assert_eq!(stats.optimizer_steps, 2);
@@ -1114,7 +1148,7 @@ mod tests {
         assert!(model.policy_local.iter().any(|&weight| weight != 0.0));
         assert_ne!(model.local_axis_embedding, before_local);
         let (policy, value) = model.evaluate(&Board::new());
-        assert_eq!(policy.len(), 1);
+        assert_eq!(policy.len(), CELL_COUNT);
         assert!(
             policy
                 .iter()

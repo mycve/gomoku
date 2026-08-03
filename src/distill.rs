@@ -176,6 +176,11 @@ pub fn load_npz_with_stats(
             value: wdl[0] - wdl[2],
             value_wdl: Some(wdl),
             generation: 0,
+            policy_weight: 1.0,
+            value_weight: 1.0,
+            policy_surprise: 0.0,
+            value_surprise: 0.0,
+            predicted_value: 0.0,
         });
         stats.accepted += 1;
         stats.policy_mass_total += total_mass;

@@ -12,11 +12,13 @@ pub struct Sample {
     pub board: Board,
     pub policy: Vec<(Move, f32)>,
     pub value: f32,
-    /// 可选的软胜/和/负标签；蒸馏数据使用它，自博弈旧回放保持兼容。
-    #[serde(default)]
     pub value_wdl: Option<[f32; 3]>,
-    #[serde(default)]
     pub generation: u64,
+    pub policy_weight: f32,
+    pub value_weight: f32,
+    pub policy_surprise: f32,
+    pub value_surprise: f32,
+    pub predicted_value: f32,
 }
 
 impl Sample {
@@ -31,6 +33,11 @@ impl Sample {
             value: self.value,
             value_wdl: self.value_wdl,
             generation: self.generation,
+            policy_weight: self.policy_weight,
+            value_weight: self.value_weight,
+            policy_surprise: self.policy_surprise,
+            value_surprise: self.value_surprise,
+            predicted_value: self.predicted_value,
         }
     }
 }
@@ -46,6 +53,8 @@ pub fn sample_mixed_recent(
     count: usize,
     recent_fraction: f32,
     recent_updates: u64,
+    policy_surprise_fraction: f32,
+    value_surprise_fraction: f32,
     seed: u64,
 ) -> MixedSampleBatch {
     if pool.is_empty() || count == 0 {
@@ -79,17 +88,32 @@ pub fn sample_mixed_recent(
     .min(count);
     let mut rng = SplitMix64(seed);
     let mut samples = Vec::with_capacity(count);
-    for _ in 0..recent_quota {
-        let sample = &pool[recent[rng.index(recent.len())]];
-        samples.push(sample.transformed(rng.index(8)));
+    let policy_quota = ((count as f32) * policy_surprise_fraction.clamp(0.0, 1.0)).round() as usize;
+    let value_quota = ((count as f32) * value_surprise_fraction.clamp(0.0, 1.0)).round() as usize;
+    let mut kinds = vec![0u8; count];
+    for kind in &mut kinds[..policy_quota.min(count)] {
+        *kind = 1;
     }
-    for _ in recent_quota..count {
-        let source = if historical.is_empty() {
+    for kind in
+        &mut kinds[policy_quota.min(count)..policy_quota.saturating_add(value_quota).min(count)]
+    {
+        *kind = 2;
+    }
+    for index in (1..kinds.len()).rev() {
+        let other = rng.index(index + 1);
+        kinds.swap(index, other);
+    }
+    for slot in 0..count {
+        let source = if slot < recent_quota {
+            &recent
+        } else if historical.is_empty() {
             &recent
         } else {
             &historical
         };
-        let sample = &pool[source[rng.index(source.len())]];
+        let kind = kinds[slot] as usize;
+        let selected = weighted_index(pool, source, kind, &mut rng);
+        let sample = &pool[selected];
         samples.push(sample.transformed(rng.index(8)));
     }
     for index in (1..samples.len()).rev() {
@@ -107,6 +131,36 @@ pub fn sample_mixed_recent(
     }
 }
 
+fn weighted_index(pool: &[Sample], source: &[usize], kind: usize, rng: &mut SplitMix64) -> usize {
+    if kind == 0 {
+        return source[rng.index(source.len())];
+    }
+    let total = source
+        .iter()
+        .map(|&index| {
+            if kind == 1 {
+                pool[index].policy_surprise
+            } else {
+                pool[index].value_surprise
+            }
+            .max(1e-4)
+        })
+        .sum::<f32>();
+    let mut draw = rng.unit() * total;
+    for &index in source {
+        draw -= if kind == 1 {
+            pool[index].policy_surprise
+        } else {
+            pool[index].value_surprise
+        }
+        .max(1e-4);
+        if draw <= 0.0 {
+            return index;
+        }
+    }
+    *source.last().expect("抽样来源不能为空")
+}
+
 struct SplitMix64(u64);
 impl SplitMix64 {
     fn next(&mut self) -> u64 {
@@ -118,6 +172,9 @@ impl SplitMix64 {
     }
     fn index(&mut self, len: usize) -> usize {
         (self.next() as usize) % len.max(1)
+    }
+    fn unit(&mut self) -> f32 {
+        (self.next() >> 40) as f32 / (1u32 << 24) as f32
     }
 }
 pub fn load(path: impl AsRef<Path>) -> io::Result<Vec<Sample>> {
@@ -169,6 +226,11 @@ mod tests {
             value: 0.0,
             value_wdl: None,
             generation,
+            policy_weight: 1.0,
+            value_weight: 1.0,
+            policy_surprise: 0.0,
+            value_surprise: 0.0,
+            predicted_value: 0.0,
         }
     }
 
@@ -176,7 +238,7 @@ mod tests {
     fn mixed_sampling_reserves_recent_quota() {
         let mut pool = vec![sample(1); 100];
         pool.extend(vec![sample(10); 10]);
-        let batch = sample_mixed_recent(&pool, 1000, 0.4, 2, 7);
+        let batch = sample_mixed_recent(&pool, 1000, 0.4, 2, 0.4, 0.1, 7);
         assert_eq!(batch.samples.len(), 1000);
         assert_eq!(batch.recent_quota, 400);
         assert_eq!(batch.actual_recent, 400);
@@ -186,17 +248,30 @@ mod tests {
                 .map(|sample| sample.generation)
                 .collect::<Vec<_>>()
         };
-        let again = sample_mixed_recent(&pool, 1000, 0.4, 2, 7);
+        let again = sample_mixed_recent(&pool, 1000, 0.4, 2, 0.4, 0.1, 7);
         assert_eq!(generations(&batch.samples), generations(&again.samples));
     }
 
     #[test]
     fn mixed_sampling_falls_back_when_there_is_no_history() {
         let pool = vec![sample(10); 10];
-        let batch = sample_mixed_recent(&pool, 100, 0.4, 5, 7);
+        let batch = sample_mixed_recent(&pool, 100, 0.4, 5, 0.4, 0.1, 7);
         assert_eq!(batch.samples.len(), 100);
         assert_eq!(batch.recent_quota, 40);
         assert_eq!(batch.actual_recent, 100);
+    }
+
+    #[test]
+    fn surprise_sampling_prefers_informative_samples() {
+        let mut pool = vec![sample(10); 20];
+        pool[0].policy_surprise = 1000.0;
+        let batch = sample_mixed_recent(&pool, 1000, 0.0, 1, 1.0, 0.0, 19);
+        let selected_high_surprise = batch
+            .samples
+            .iter()
+            .filter(|sample| sample.policy_surprise > 100.0)
+            .count();
+        assert!(selected_high_surprise > 900);
     }
 
     #[test]

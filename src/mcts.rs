@@ -1,17 +1,30 @@
 use crate::{
-    game::{Board, Move, Outcome},
+    game::{Board, CELL_COUNT, Move, Outcome, transform_index},
     model::{EvalAccumulator, EvalScratch, PolicyValueModel},
 };
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 #[derive(Clone, Copy)]
 pub struct SearchConfig {
     pub simulations: usize,
     pub cpuct: f32,
-    pub root_dirichlet_alpha: f32,
+    pub cpuct_log: f32,
+    pub cpuct_base: f32,
+    pub root_dirichlet_total_concentration: f32,
     pub root_exploration_fraction: f32,
     pub root_noise_seed: u64,
     pub policy_softmax_temp: f32,
+    pub root_policy_temperature_early: f32,
+    pub root_policy_temperature: f32,
+    pub root_policy_temperature_halflife: f32,
+    pub root_num_symmetries_to_sample: usize,
+    pub use_graph_search: bool,
+    pub use_lcb_for_selection: bool,
+    pub lcb_stdevs: f32,
+    pub min_visit_prop_for_lcb: f32,
     pub temperature_start: f32,
     pub temperature_endgame: f32,
     pub temperature_decay_delay_plies: usize,
@@ -19,6 +32,13 @@ pub struct SearchConfig {
     pub temperature_value_cutoff: f32,
     pub temperature_visit_offset: f32,
     pub random_opening_probability: f32,
+    pub policy_opening_avg_plies: usize,
+    pub policy_opening_temperature: f32,
+    pub early_fork_game_prob: f32,
+    pub early_fork_max_ply: usize,
+    pub early_fork_max_choices: usize,
+    pub asymmetric_playout_prob: f32,
+    pub max_asymmetric_ratio: f32,
     pub opening_random_plies: usize,
     pub opening_seed: u64,
 }
@@ -27,10 +47,20 @@ impl Default for SearchConfig {
         Self {
             simulations: 3000,
             cpuct: 1.5,
-            root_dirichlet_alpha: 0.0,
+            cpuct_log: 0.45,
+            cpuct_base: 500.0,
+            root_dirichlet_total_concentration: 0.0,
             root_exploration_fraction: 0.0,
             root_noise_seed: 0,
             policy_softmax_temp: 1.0,
+            root_policy_temperature_early: 1.6,
+            root_policy_temperature: 1.15,
+            root_policy_temperature_halflife: 6.0,
+            root_num_symmetries_to_sample: 2,
+            use_graph_search: true,
+            use_lcb_for_selection: true,
+            lcb_stdevs: 2.0,
+            min_visit_prop_for_lcb: 0.15,
             temperature_start: 0.0,
             temperature_endgame: 0.0,
             temperature_decay_delay_plies: 0,
@@ -38,6 +68,13 @@ impl Default for SearchConfig {
             temperature_value_cutoff: 0.0,
             temperature_visit_offset: 0.0,
             random_opening_probability: 0.0,
+            policy_opening_avg_plies: 0,
+            policy_opening_temperature: 1.0,
+            early_fork_game_prob: 0.0,
+            early_fork_max_ply: 0,
+            early_fork_max_choices: 0,
+            asymmetric_playout_prob: 0.0,
+            max_asymmetric_ratio: 1.0,
             opening_random_plies: 0,
             opening_seed: 0,
         }
@@ -50,22 +87,39 @@ pub struct Candidate {
     pub visits: u32,
     pub q: f32,
     pub prior: f32,
+    pub raw_prior: f32,
+    pub value_std_error: f32,
+}
+pub struct SearchOutput {
+    pub candidates: Vec<Candidate>,
+    pub root_value: f32,
 }
 struct Node {
     board: Board,
     accumulator: EvalAccumulator,
     children: Vec<Edge>,
     expanded: bool,
+    initial_value: f32,
 }
 struct Edge {
     mv: Move,
     prior: f32,
     visits: u32,
     value_sum: f32,
+    value_square_sum: f32,
+    raw_prior: f32,
     child: Option<usize>,
 }
 
 pub fn search(board: &Board, model: &PolicyValueModel, cfg: SearchConfig) -> Vec<Candidate> {
+    search_with_info(board, model, cfg).candidates
+}
+
+pub fn search_with_info(
+    board: &Board,
+    model: &PolicyValueModel,
+    cfg: SearchConfig,
+) -> SearchOutput {
     search_until(board, model, cfg, None)
 }
 
@@ -75,7 +129,7 @@ pub fn search_timed(
     cfg: SearchConfig,
     time_limit: Duration,
 ) -> Vec<Candidate> {
-    search_until(board, model, cfg, Some(Instant::now() + time_limit))
+    search_until(board, model, cfg, Some(Instant::now() + time_limit)).candidates
 }
 
 fn search_until(
@@ -83,7 +137,7 @@ fn search_until(
     model: &PolicyValueModel,
     cfg: SearchConfig,
     deadline: Option<Instant>,
-) -> Vec<Candidate> {
+) -> SearchOutput {
     crate::scope_profile!("mcts.search");
     let mut scratch = EvalScratch::new(model.hidden_size);
     let mut nodes = vec![Node {
@@ -91,13 +145,16 @@ fn search_until(
         accumulator: model.accumulator(board),
         children: vec![],
         expanded: false,
+        initial_value: 0.0,
     }];
+    let mut transpositions = HashMap::new();
+    transpositions.insert(board_hash(board), 0);
     expand(&mut nodes, 0, model, cfg, &mut scratch);
     for simulation in 0..cfg.simulations {
         if simulation > 0 && deadline.is_some_and(|limit| Instant::now() >= limit) {
             break;
         }
-        simulate(&mut nodes, 0, model, cfg, &mut scratch);
+        simulate(&mut nodes, &mut transpositions, 0, model, cfg, &mut scratch);
     }
     let mut out: Vec<_> = nodes[0]
         .children
@@ -111,10 +168,23 @@ fn search_until(
                 e.value_sum / e.visits as f32
             },
             prior: e.prior,
+            raw_prior: e.raw_prior,
+            value_std_error: edge_std_error(e),
         })
         .collect();
-    out.sort_by_key(|x| std::cmp::Reverse(x.visits));
-    out
+    if cfg.use_lcb_for_selection {
+        let max_visits = out.iter().map(|x| x.visits).max().unwrap_or(0) as f32;
+        out.sort_by(|a, b| {
+            lcb_selection_value(b, max_visits, cfg)
+                .total_cmp(&lcb_selection_value(a, max_visits, cfg))
+        });
+    } else {
+        out.sort_by_key(|x| std::cmp::Reverse(x.visits));
+    }
+    SearchOutput {
+        candidates: out,
+        root_value: nodes[0].initial_value,
+    }
 }
 fn expand(
     nodes: &mut Vec<Node>,
@@ -138,13 +208,25 @@ fn expand(
     }
     let (mut policy, value) = {
         crate::scope_profile!("mcts.nn_eval");
-        model.evaluate_accumulator_with_scratch(
-            &nodes[idx].board,
-            &nodes[idx].accumulator,
-            cfg.policy_softmax_temp,
-            scratch,
-        )
+        if idx == 0 && cfg.root_num_symmetries_to_sample > 1 {
+            evaluate_root_symmetries(&nodes[idx].board, model, cfg)
+        } else {
+            model.evaluate_accumulator_with_scratch(
+                &nodes[idx].board,
+                &nodes[idx].accumulator,
+                cfg.policy_softmax_temp,
+                scratch,
+            )
+        }
     };
+    nodes[idx].initial_value = value;
+    let raw_priors = policy.iter().copied().collect::<HashMap<_, _>>();
+    if idx == 0 {
+        apply_policy_temperature(
+            &mut policy,
+            root_policy_temperature(cfg, nodes[idx].board.move_count()),
+        );
+    }
     let us = nodes[idx].board.to_move();
     let winning = policy
         .iter()
@@ -186,11 +268,15 @@ fn expand(
             }
         }
     }
-    if idx == 0 && cfg.root_dirichlet_alpha > 0.0 && cfg.root_exploration_fraction > 0.0 {
+    if idx == 0
+        && cfg.root_dirichlet_total_concentration > 0.0
+        && cfg.root_exploration_fraction > 0.0
+    {
         let mut priors = policy.iter().map(|(_, prior)| *prior).collect::<Vec<_>>();
+        let alpha = cfg.root_dirichlet_total_concentration / priors.len().max(1) as f32;
         apply_root_dirichlet_noise(
             &mut priors,
-            cfg.root_dirichlet_alpha,
+            alpha,
             cfg.root_exploration_fraction.clamp(0.0, 1.0),
             cfg.root_noise_seed,
         );
@@ -205,8 +291,10 @@ fn expand(
             .map(|(mv, prior)| Edge {
                 mv,
                 prior,
+                raw_prior: raw_priors.get(&mv).copied().unwrap_or(0.0),
                 visits: 0,
                 value_sum: 0.0,
+                value_square_sum: 0.0,
                 child: None,
             })
             .collect();
@@ -216,6 +304,7 @@ fn expand(
 }
 fn simulate(
     nodes: &mut Vec<Node>,
+    transpositions: &mut HashMap<u64, usize>,
     idx: usize,
     model: &PolicyValueModel,
     cfg: SearchConfig,
@@ -246,7 +335,10 @@ fn simulate(
             .max(1) as f32;
         let mut best = 0;
         let mut score = f32::NEG_INFINITY;
-        let exploration = cfg.cpuct * total.sqrt();
+        let cpuct = cfg.cpuct
+            + cfg.cpuct_log.max(0.0)
+                * ((total + cfg.cpuct_base.max(1.0) + 1.0) / cfg.cpuct_base.max(1.0)).ln();
+        let exploration = cpuct * total.sqrt();
         for (i, e) in nodes[idx].children.iter().enumerate() {
             let q = if e.visits == 0 {
                 0.0
@@ -270,21 +362,116 @@ fn simulate(
         let player = b.to_move();
         let accumulator = model.accumulator_after_move(&nodes[idx].accumulator, mv, player);
         b.play(mv);
-        let c = nodes.len();
-        nodes.push(Node {
-            board: b,
-            accumulator,
-            children: vec![],
-            expanded: false,
+        let key = board_hash(&b);
+        let c = if cfg.use_graph_search {
+            transpositions.get(&key).copied()
+        } else {
+            None
+        }
+        .unwrap_or_else(|| {
+            let c = nodes.len();
+            nodes.push(Node {
+                board: b,
+                accumulator,
+                children: vec![],
+                expanded: false,
+                initial_value: 0.0,
+            });
+            transpositions.insert(key, c);
+            c
         });
         nodes[idx].children[best].child = Some(c);
         c
     };
-    let value = -simulate(nodes, child, model, cfg, scratch);
+    let value = -simulate(nodes, transpositions, child, model, cfg, scratch);
     let e = &mut nodes[idx].children[best];
     e.visits += 1;
     e.value_sum += value;
+    e.value_square_sum += value * value;
     value
+}
+
+fn board_hash(board: &Board) -> u64 {
+    let mut hash = 0xCBF2_9CE4_8422_2325u64 ^ board.to_move().stone() as u64;
+    for (index, &stone) in board.cells().iter().enumerate() {
+        hash ^= ((stone as i64 + 2) as u64).wrapping_mul((index as u64 + 1) * 0x9E37_79B9);
+        hash = hash.wrapping_mul(0x100_0000_01B3);
+    }
+    hash
+}
+
+fn edge_std_error(edge: &Edge) -> f32 {
+    if edge.visits <= 1 {
+        return 1.0;
+    }
+    let n = edge.visits as f32;
+    let mean = edge.value_sum / n;
+    ((edge.value_square_sum / n - mean * mean).max(0.0) / n).sqrt()
+}
+
+fn lcb_selection_value(candidate: &Candidate, max_visits: f32, cfg: SearchConfig) -> f32 {
+    if candidate.visits == 0
+        || (candidate.visits as f32) < max_visits * cfg.min_visit_prop_for_lcb.max(0.0)
+    {
+        return f32::NEG_INFINITY;
+    }
+    candidate.q - cfg.lcb_stdevs.max(0.0) * candidate.value_std_error
+}
+
+fn root_policy_temperature(cfg: SearchConfig, ply: usize) -> f32 {
+    let half_life = cfg.root_policy_temperature_halflife.max(1e-3);
+    cfg.root_policy_temperature
+        + (cfg.root_policy_temperature_early - cfg.root_policy_temperature)
+            * 2.0_f32.powf(-(ply as f32) / half_life)
+}
+
+fn apply_policy_temperature(policy: &mut [(Move, f32)], temperature: f32) {
+    let inverse = temperature.max(1e-3).recip();
+    let sum = policy
+        .iter_mut()
+        .map(|(_, probability)| {
+            *probability = probability.max(1e-12).powf(inverse);
+            *probability
+        })
+        .sum::<f32>()
+        .max(1e-12);
+    for (_, probability) in policy {
+        *probability /= sum;
+    }
+}
+
+fn evaluate_root_symmetries(
+    board: &Board,
+    model: &PolicyValueModel,
+    cfg: SearchConfig,
+) -> (Vec<(Move, f32)>, f32) {
+    let count = cfg.root_num_symmetries_to_sample.clamp(1, 8);
+    let mut probabilities = vec![0.0f32; CELL_COUNT];
+    let mut value = 0.0;
+    for index in 0..count {
+        let symmetry = (cfg.root_noise_seed as usize + index * 3) % 8;
+        let mut inverse = [0usize; CELL_COUNT];
+        for original in 0..CELL_COUNT {
+            inverse[transform_index(original, symmetry)] = original;
+        }
+        let transformed = board.transformed(symmetry);
+        let accumulator = model.accumulator(&transformed);
+        let (policy, prediction) = model.evaluate_accumulator_with_temperature(
+            &transformed,
+            &accumulator,
+            cfg.policy_softmax_temp,
+        );
+        value += prediction / count as f32;
+        for (mv, probability) in policy {
+            probabilities[inverse[mv.0]] += probability / count as f32;
+        }
+    }
+    let policy = board
+        .rule_legal_moves()
+        .into_iter()
+        .map(|mv| (mv, probabilities[mv.0]))
+        .collect();
+    (policy, value)
 }
 
 fn apply_root_dirichlet_noise(priors: &mut [f32], alpha: f32, fraction: f32, seed: u64) {
@@ -449,7 +636,7 @@ mod tests {
             one.iter().filter(|candidate| candidate.visits > 0).count(),
             1
         );
-        assert_eq!(one.len(), 48);
+        assert_eq!(one.len(), 224);
 
         let full = search(
             &board,

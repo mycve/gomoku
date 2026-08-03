@@ -1,6 +1,6 @@
 use crate::{
     game::{BOARD_SIZE, Board, Move, Outcome},
-    mcts::{SearchConfig, search},
+    mcts::{SearchConfig, search, search_with_info},
     model::PolicyValueModel,
     replay::Sample,
 };
@@ -39,6 +39,8 @@ pub struct SelfplayStats {
     pub sampled_moves: usize,
     pub sampled_best_moves: usize,
     pub sampled_q_gap_sum: f32,
+    pub policy_surprise_sum: f32,
+    pub value_surprise_sum: f32,
 }
 
 impl SelfplayStats {
@@ -62,6 +64,8 @@ impl SelfplayStats {
         self.sampled_moves += other.sampled_moves;
         self.sampled_best_moves += other.sampled_best_moves;
         self.sampled_q_gap_sum += other.sampled_q_gap_sum;
+        self.policy_surprise_sum += other.policy_surprise_sum;
+        self.value_surprise_sum += other.value_surprise_sum;
     }
 }
 
@@ -91,16 +95,42 @@ pub fn generate_one_detailed_controlled(
         games: 1,
         ..Default::default()
     };
-    let opening_plies = apply_random_opening(&mut board, cfg.random_opening_probability, &mut seed);
+    let opening_plies = apply_policy_opening(
+        &mut board,
+        model,
+        cfg.random_opening_probability,
+        cfg.policy_opening_avg_plies,
+        cfg.policy_opening_temperature,
+        &mut seed,
+    );
     stats.random_opening_games = usize::from(opening_plies > 0);
     stats.random_opening_plies = opening_plies;
+    let asymmetric = random_unit(&mut seed) < cfg.asymmetric_playout_prob.clamp(0.0, 1.0);
+    let strong_player = if random_index(&mut seed, 2) == 0 {
+        crate::game::Player::Black
+    } else {
+        crate::game::Player::White
+    };
+    let asymmetric_ratio = if asymmetric {
+        1.0 + random_unit(&mut seed) * (cfg.max_asymmetric_ratio.max(1.0) - 1.0)
+    } else {
+        1.0
+    };
+    let fork_ply = (random_unit(&mut seed) < cfg.early_fork_game_prob.clamp(0.0, 1.0)
+        && cfg.early_fork_max_ply > 0)
+        .then(|| random_index(&mut seed, cfg.early_fork_max_ply));
     while board.outcome().is_none() && !stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
         let mut ply_cfg = cfg;
+        if asymmetric && board.to_move() != strong_player {
+            ply_cfg.simulations = ((cfg.simulations as f32 / asymmetric_ratio).round() as usize)
+                .clamp(1, cfg.simulations);
+        }
         ply_cfg.root_noise_seed = seed ^ board.move_count() as u64;
-        let c = {
+        let result = {
             crate::scope_profile!("selfplay.search");
-            search(&board, model, ply_cfg)
+            search_with_info(&board, model, ply_cfg)
         };
+        let c = result.candidates;
         if c.is_empty() {
             break;
         }
@@ -124,25 +154,54 @@ pub fn generate_one_detailed_controlled(
         stats.policy_top1_sum += top[0];
         stats.policy_top2_sum += top[0] + top[1];
         let temperature = temperature_for_ply(cfg, board.move_count());
-        let mv = sample_with_temperature(
-            &c,
-            temperature,
-            cfg.temperature_value_cutoff,
-            cfg.temperature_visit_offset,
-            &mut seed,
-        );
+        let mv = if fork_ply == Some(board.move_count().saturating_sub(opening_plies))
+            && cfg.early_fork_max_choices > 1
+        {
+            sample_fork_move(&c, cfg.early_fork_max_choices, &mut seed)
+        } else {
+            sample_with_temperature(
+                &c,
+                temperature,
+                cfg.temperature_value_cutoff,
+                cfg.temperature_visit_offset,
+                &mut seed,
+            )
+        };
         if temperature > 1e-6 {
             stats.sampled_moves += 1;
             stats.sampled_best_moves += usize::from(mv == c[0].mv);
             let played_q = c.iter().find(|x| x.mv == mv).map(|x| x.q).unwrap_or(0.0);
             stats.sampled_q_gap_sum += (c[0].q - played_q).max(0.0);
         }
+        let policy_surprise = policy
+            .iter()
+            .map(|&(mv, target)| {
+                let raw = c
+                    .iter()
+                    .find(|candidate| candidate.mv == mv)
+                    .map(|candidate| candidate.raw_prior)
+                    .unwrap_or(0.0)
+                    .max(1e-12);
+                if target > 0.0 {
+                    target * (target / raw).ln()
+                } else {
+                    0.0
+                }
+            })
+            .sum::<f32>()
+            .max(0.0);
+        stats.policy_surprise_sum += policy_surprise;
         samples.push(Sample {
             board: board.clone(),
             policy,
             value: 0.0,
             value_wdl: None,
             generation: 0,
+            policy_weight: ply_cfg.simulations as f32 / cfg.simulations.max(1) as f32,
+            value_weight: 1.0,
+            policy_surprise,
+            value_surprise: 0.0,
+            predicted_value: result.root_value,
         });
         board.play(mv);
     }
@@ -173,18 +232,91 @@ pub fn generate_one_detailed_controlled(
                 }
             }
         };
+        s.value_surprise = (s.value - s.predicted_value).abs();
+        stats.value_surprise_sum += s.value_surprise;
     }
     GeneratedGame { samples, stats }
 }
 
-fn apply_random_opening(board: &mut Board, probability: f32, seed: &mut u64) -> usize {
-    const OPENING_PLIES: usize = 2;
-
-    if board.move_count() != 0 || probability <= 0.0 || random_unit(seed) >= probability.min(1.0) {
+fn apply_policy_opening(
+    board: &mut Board,
+    model: &PolicyValueModel,
+    probability: f32,
+    avg_plies: usize,
+    temperature: f32,
+    seed: &mut u64,
+) -> usize {
+    if board.move_count() != 0
+        || avg_plies == 0
+        || probability <= 0.0
+        || random_unit(seed) >= probability.min(1.0)
+    {
         return 0;
     }
+    let max_plies = avg_plies.saturating_mul(3).max(1);
+    let mut played = 0;
+    for _ in 0..max_plies {
+        if board.outcome().is_some() {
+            break;
+        }
+        let (policy, _) = model.evaluate(board);
+        if policy.is_empty() {
+            break;
+        }
+        let inverse_temperature = temperature.max(1e-3).recip();
+        let weights = policy
+            .iter()
+            .map(|(_, probability)| probability.max(1e-12).powf(inverse_temperature))
+            .collect::<Vec<_>>();
+        let mv = sample_weighted_moves(&policy, &weights, seed);
+        if !board.play(mv) {
+            break;
+        }
+        played += 1;
+        if random_unit(seed) < 1.0 / avg_plies as f32 {
+            break;
+        }
+    }
+    played
+}
 
-    apply_region_opening(board, OPENING_PLIES, seed)
+fn sample_fork_move(
+    candidates: &[crate::mcts::Candidate],
+    max_choices: usize,
+    seed: &mut u64,
+) -> Move {
+    let mut choices = candidates
+        .iter()
+        .filter(|candidate| candidate.visits > 0)
+        .take(max_choices.max(2))
+        .collect::<Vec<_>>();
+    if choices.len() <= 1 {
+        return candidates[0].mv;
+    }
+    choices.remove(0);
+    let weights = choices
+        .iter()
+        .map(|candidate| candidate.visits.max(1) as f32)
+        .collect::<Vec<_>>();
+    let mut draw = random_unit(seed) * weights.iter().sum::<f32>();
+    for (candidate, weight) in choices.into_iter().zip(weights) {
+        draw -= weight;
+        if draw <= 0.0 {
+            return candidate.mv;
+        }
+    }
+    candidates[0].mv
+}
+
+fn sample_weighted_moves(policy: &[(Move, f32)], weights: &[f32], seed: &mut u64) -> Move {
+    let mut draw = random_unit(seed) * weights.iter().sum::<f32>();
+    for (&(mv, _), &weight) in policy.iter().zip(weights) {
+        draw -= weight;
+        if draw <= 0.0 {
+            return mv;
+        }
+    }
+    policy[0].0
 }
 
 fn apply_region_opening(board: &mut Board, plies: usize, seed: &mut u64) -> usize {
@@ -504,34 +636,56 @@ mod tests {
     }
 
     #[test]
-    fn random_opening_can_be_disabled() {
+    fn policy_opening_can_be_disabled() {
         let mut board = Board::new();
         let mut seed = 7;
-        assert_eq!(apply_random_opening(&mut board, 0.0, &mut seed), 0);
+        let model = PolicyValueModel::random(8, 9);
+        assert_eq!(
+            apply_policy_opening(&mut board, &model, 0.0, 6, 1.6, &mut seed),
+            0
+        );
         assert_eq!(board.move_count(), 0);
     }
 
     #[test]
-    fn random_opening_is_deterministic_and_stays_in_one_region() {
+    fn policy_opening_is_deterministic_and_has_variable_length() {
+        let model = PolicyValueModel::random(8, 9);
         let mut first = Board::new();
         let mut first_seed = 7;
-        assert_eq!(apply_random_opening(&mut first, 1.0, &mut first_seed), 2);
-
-        let stones = first
-            .cells()
-            .iter()
-            .enumerate()
-            .filter_map(|(index, &stone)| (stone != 0).then_some(Move(index)))
-            .collect::<Vec<_>>();
-        assert_eq!(stones.len(), 2);
-        assert!(stones[0].row().abs_diff(stones[1].row()) <= 4);
-        assert!(stones[0].col().abs_diff(stones[1].col()) <= 4);
-        assert_eq!(first.cells().iter().filter(|&&x| x == 1).count(), 1);
-        assert_eq!(first.cells().iter().filter(|&&x| x == -1).count(), 1);
+        let plies = apply_policy_opening(&mut first, &model, 1.0, 6, 1.6, &mut first_seed);
+        assert!((1..=18).contains(&plies));
+        assert_eq!(first.move_count(), plies);
 
         let mut second = Board::new();
         let mut second_seed = 7;
-        assert_eq!(apply_random_opening(&mut second, 1.0, &mut second_seed), 2);
+        assert_eq!(
+            apply_policy_opening(&mut second, &model, 1.0, 6, 1.6, &mut second_seed),
+            plies
+        );
         assert_eq!(first.cells(), second.cells());
+    }
+
+    #[test]
+    fn selfplay_records_finite_surprise_and_weights() {
+        let model = PolicyValueModel::random(8, 21);
+        let game = generate_one_detailed(
+            &model,
+            SearchConfig {
+                simulations: 4,
+                random_opening_probability: 0.0,
+                root_num_symmetries_to_sample: 2,
+                use_graph_search: true,
+                use_lcb_for_selection: true,
+                ..Default::default()
+            },
+            31,
+        );
+        assert!(!game.samples.is_empty());
+        assert!(game.samples.iter().all(|sample| {
+            sample.policy_weight > 0.0
+                && sample.value_weight > 0.0
+                && sample.policy_surprise.is_finite()
+                && sample.value_surprise.is_finite()
+        }));
     }
 }

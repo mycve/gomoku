@@ -17,28 +17,47 @@ pub struct AzLoopConfig {
     pub selfplay_samples_per_update: usize,
     pub selfplay_workers: usize,
     pub selfplay_queue_capacity: usize,
-    pub selfplay_random_opening_probability: f32,
+    pub selfplay_policy_opening_probability: f32,
+    pub selfplay_policy_opening_avg_plies: usize,
+    pub selfplay_policy_opening_temperature: f32,
     pub learning_rate: f32,
     pub learning_rate_min: f32,
     pub learning_rate_decay: f32,
     pub batch_epochs: usize,
     pub batch_size: usize,
     pub cpuct: f32,
+    pub cpuct_log: f32,
+    pub cpuct_base: f32,
     pub temperature_start: f32,
     pub temperature_endgame: f32,
     pub temperature_decay_delay_plies: usize,
     pub temperature_decay_plies: usize,
     pub temperature_value_cutoff: f32,
     pub temperature_visit_offset: f32,
-    pub root_dirichlet_alpha: f32,
+    pub root_dirichlet_total_concentration: f32,
     pub root_exploration_fraction: f32,
     pub policy_softmax_temp: f32,
+    pub root_policy_temperature_early: f32,
+    pub root_policy_temperature: f32,
+    pub root_policy_temperature_halflife: f32,
+    pub root_num_symmetries_to_sample: usize,
+    pub use_graph_search: bool,
+    pub use_lcb_for_selection: bool,
+    pub lcb_stdevs: f32,
+    pub min_visit_prop_for_lcb: f32,
+    pub early_fork_game_prob: f32,
+    pub early_fork_max_ply: usize,
+    pub early_fork_max_choices: usize,
+    pub asymmetric_playout_prob: f32,
+    pub max_asymmetric_ratio: f32,
     pub ema_decay: f32,
     pub replay_capacity: usize,
     pub replay_warmup_samples: usize,
     pub train_samples_per_update: usize,
     pub replay_recent_sample_fraction: f32,
     pub replay_recent_updates: u64,
+    pub replay_policy_surprise_fraction: f32,
+    pub replay_value_surprise_fraction: f32,
     pub checkpoint_interval: usize,
     pub checkpoint_dir: String,
     pub max_checkpoints: usize,
@@ -54,39 +73,58 @@ pub struct AzLoopConfig {
 impl Default for AzLoopConfig {
     fn default() -> Self {
         Self {
-            format_version: 3,
+            format_version: 5,
             model_path: "model.safetensors".into(),
             ema_model_path: "ema.safetensors".into(),
             best_model_path: "best.safetensors".into(),
             replay_path: "data/replay.jsonl".into(),
             progress_path: "data/azloop-progress.json".into(),
-            simulations: 3000,
+            simulations: 400,
             seed: 20260730,
             selfplay_samples_per_update: 50_000,
             selfplay_workers: 196,
             selfplay_queue_capacity: 0,
-            selfplay_random_opening_probability: 0.25,
+            selfplay_policy_opening_probability: 0.8,
+            selfplay_policy_opening_avg_plies: 6,
+            selfplay_policy_opening_temperature: 1.6,
             learning_rate: 0.0008,
             learning_rate_min: 0.0002,
             learning_rate_decay: 0.90,
             batch_epochs: 1,
             batch_size: 256,
             cpuct: 1.5,
-            temperature_start: 0.9,
-            temperature_endgame: 0.35,
-            temperature_decay_delay_plies: 12,
-            temperature_decay_plies: 24,
+            cpuct_log: 0.45,
+            cpuct_base: 500.0,
+            temperature_start: 0.75,
+            temperature_endgame: 0.15,
+            temperature_decay_delay_plies: 0,
+            temperature_decay_plies: 12,
             temperature_value_cutoff: 0.12,
             temperature_visit_offset: -0.8,
-            root_dirichlet_alpha: 0.12,
+            root_dirichlet_total_concentration: 10.83,
             root_exploration_fraction: 0.25,
-            policy_softmax_temp: 1.45,
+            policy_softmax_temp: 1.1,
+            root_policy_temperature_early: 1.6,
+            root_policy_temperature: 1.15,
+            root_policy_temperature_halflife: 6.0,
+            root_num_symmetries_to_sample: 2,
+            use_graph_search: true,
+            use_lcb_for_selection: true,
+            lcb_stdevs: 2.0,
+            min_visit_prop_for_lcb: 0.15,
+            early_fork_game_prob: 0.04,
+            early_fork_max_ply: 8,
+            early_fork_max_choices: 12,
+            asymmetric_playout_prob: 0.1,
+            max_asymmetric_ratio: 4.0,
             ema_decay: 0.999,
             replay_capacity: 500_000,
             replay_warmup_samples: 100_000,
             train_samples_per_update: 50_000,
             replay_recent_sample_fraction: 0.4,
             replay_recent_updates: 5,
+            replay_policy_surprise_fraction: 0.4,
+            replay_value_surprise_fraction: 0.1,
             checkpoint_interval: 20,
             checkpoint_dir: "checkpoints".into(),
             max_checkpoints: 20,
@@ -120,19 +158,42 @@ impl AzLoopConfig {
         let finite = [
             ("learning_rate", self.learning_rate),
             (
-                "selfplay_random_opening_probability",
-                self.selfplay_random_opening_probability,
+                "selfplay_policy_opening_probability",
+                self.selfplay_policy_opening_probability,
+            ),
+            (
+                "selfplay_policy_opening_temperature",
+                self.selfplay_policy_opening_temperature,
             ),
             ("learning_rate_min", self.learning_rate_min),
             ("learning_rate_decay", self.learning_rate_decay),
             ("cpuct", self.cpuct),
+            ("cpuct_log", self.cpuct_log),
+            ("cpuct_base", self.cpuct_base),
             ("temperature_start", self.temperature_start),
             ("temperature_endgame", self.temperature_endgame),
             ("temperature_value_cutoff", self.temperature_value_cutoff),
             ("temperature_visit_offset", self.temperature_visit_offset),
-            ("root_dirichlet_alpha", self.root_dirichlet_alpha),
+            (
+                "root_dirichlet_total_concentration",
+                self.root_dirichlet_total_concentration,
+            ),
             ("root_exploration_fraction", self.root_exploration_fraction),
             ("policy_softmax_temp", self.policy_softmax_temp),
+            (
+                "root_policy_temperature_early",
+                self.root_policy_temperature_early,
+            ),
+            ("root_policy_temperature", self.root_policy_temperature),
+            (
+                "root_policy_temperature_halflife",
+                self.root_policy_temperature_halflife,
+            ),
+            ("lcb_stdevs", self.lcb_stdevs),
+            ("min_visit_prop_for_lcb", self.min_visit_prop_for_lcb),
+            ("early_fork_game_prob", self.early_fork_game_prob),
+            ("asymmetric_playout_prob", self.asymmetric_playout_prob),
+            ("max_asymmetric_ratio", self.max_asymmetric_ratio),
             ("ema_decay", self.ema_decay),
             ("arena_promotion_rate", self.arena_promotion_rate),
             (
@@ -143,14 +204,22 @@ impl AzLoopConfig {
                 "replay_recent_sample_fraction",
                 self.replay_recent_sample_fraction,
             ),
+            (
+                "replay_policy_surprise_fraction",
+                self.replay_policy_surprise_fraction,
+            ),
+            (
+                "replay_value_surprise_fraction",
+                self.replay_value_surprise_fraction,
+            ),
         ];
         for (name, value) in finite {
             if !value.is_finite() {
                 return Err(io::Error::other(format!("配置 `{name}` 必须是有限数值")));
             }
         }
-        if self.format_version != 3 {
-            return Err(io::Error::other("仅支持 format_version = 3"));
+        if self.format_version != 5 {
+            return Err(io::Error::other("仅支持 format_version = 5"));
         }
         if self.simulations == 0
             || self.selfplay_samples_per_update == 0
@@ -167,17 +236,30 @@ impl AzLoopConfig {
             || self.learning_rate_min < 0.0
             || !(0.0..=1.0).contains(&self.learning_rate_decay)
             || self.cpuct <= 0.0
+            || self.cpuct_log < 0.0
+            || self.cpuct_base <= 0.0
             || self.temperature_start < 0.0
             || self.temperature_endgame < 0.0
             || self.temperature_value_cutoff < 0.0
-            || self.root_dirichlet_alpha < 0.0
+            || self.root_dirichlet_total_concentration < 0.0
             || self.policy_softmax_temp <= 0.0
+            || self.selfplay_policy_opening_temperature <= 0.0
+            || self.root_policy_temperature_early <= 0.0
+            || self.root_policy_temperature <= 0.0
+            || self.root_policy_temperature_halflife <= 0.0
+            || self.lcb_stdevs < 0.0
+            || !(0.0..=1.0).contains(&self.min_visit_prop_for_lcb)
+            || !(0.0..=1.0).contains(&self.early_fork_game_prob)
+            || !(0.0..=1.0).contains(&self.asymmetric_playout_prob)
+            || self.max_asymmetric_ratio < 1.0
             || !(0.0..=1.0).contains(&self.root_exploration_fraction)
             || !(0.0..=1.0).contains(&self.ema_decay)
             || !(0.0..=1.0).contains(&self.arena_promotion_rate)
             || self.arena_promotion_confidence_z < 0.0
             || !(0.0..=1.0).contains(&self.replay_recent_sample_fraction)
-            || !(0.0..=1.0).contains(&self.selfplay_random_opening_probability)
+            || !(0.0..=1.0).contains(&self.selfplay_policy_opening_probability)
+            || !(0.0..=1.0).contains(&self.replay_policy_surprise_fraction)
+            || !(0.0..=1.0).contains(&self.replay_value_surprise_fraction)
         {
             return Err(io::Error::other(
                 "配置中的学习率、搜索或比例参数超出合法范围",
@@ -193,43 +275,79 @@ impl AzLoopConfig {
                 "replay_warmup_samples 不能超过 replay_capacity",
             ));
         }
+        if self.selfplay_policy_opening_probability > 0.0
+            && self.selfplay_policy_opening_avg_plies == 0
+        {
+            return Err(io::Error::other(
+                "启用策略开局时 selfplay_policy_opening_avg_plies 必须大于 0",
+            ));
+        }
+        if self.replay_policy_surprise_fraction + self.replay_value_surprise_fraction > 1.0 {
+            return Err(io::Error::other(
+                "Policy 和 Value surprise 抽样比例之和不能超过 1",
+            ));
+        }
+        if !(1..=8).contains(&self.root_num_symmetries_to_sample) {
+            return Err(io::Error::other(
+                "root_num_symmetries_to_sample 必须在 1..=8",
+            ));
+        }
         Ok(())
     }
 }
 
-const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 3
+const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 5
 model_path = "model.safetensors"
 ema_model_path = "ema.safetensors"
 best_model_path = "best.safetensors"
 replay_path = "data/replay.jsonl"
 progress_path = "data/azloop-progress.json"
-simulations = 3000
+simulations = 400
 seed = 20260730
 selfplay_samples_per_update = 50000
 selfplay_workers = 196
 selfplay_queue_capacity = 0
-selfplay_random_opening_probability = 0.25
+selfplay_policy_opening_probability = 0.8
+selfplay_policy_opening_avg_plies = 6
+selfplay_policy_opening_temperature = 1.6
 learning_rate = 0.0008
 learning_rate_min = 0.0002
 learning_rate_decay = 0.90
 batch_epochs = 1
 batch_size = 256
 cpuct = 1.5
-temperature_start = 0.9
-temperature_endgame = 0.35
-temperature_decay_delay_plies = 12
-temperature_decay_plies = 24
+cpuct_log = 0.45
+cpuct_base = 500.0
+temperature_start = 0.75
+temperature_endgame = 0.15
+temperature_decay_delay_plies = 0
+temperature_decay_plies = 12
 temperature_value_cutoff = 0.12
 temperature_visit_offset = -0.8
-root_dirichlet_alpha = 0.12
+root_dirichlet_total_concentration = 10.83
 root_exploration_fraction = 0.25
-policy_softmax_temp = 1.45
+policy_softmax_temp = 1.1
+root_policy_temperature_early = 1.6
+root_policy_temperature = 1.15
+root_policy_temperature_halflife = 6.0
+root_num_symmetries_to_sample = 2
+use_graph_search = true
+use_lcb_for_selection = true
+lcb_stdevs = 2.0
+min_visit_prop_for_lcb = 0.15
+early_fork_game_prob = 0.04
+early_fork_max_ply = 8
+early_fork_max_choices = 12
+asymmetric_playout_prob = 0.1
+max_asymmetric_ratio = 4.0
 ema_decay = 0.999
 replay_capacity = 500000
 replay_warmup_samples = 100000
 train_samples_per_update = 50000
 replay_recent_sample_fraction = 0.4
 replay_recent_updates = 5
+replay_policy_surprise_fraction = 0.4
+replay_value_surprise_fraction = 0.1
 checkpoint_interval = 20
 checkpoint_dir = "checkpoints"
 max_checkpoints = 20
@@ -250,10 +368,10 @@ mod tests {
     fn default_text_is_exact_and_valid() {
         let config: AzLoopConfig = toml::from_str(DEFAULT_CONFIG_TEXT).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.format_version, 3);
+        assert_eq!(config.format_version, 5);
         assert_eq!(config.selfplay_samples_per_update, 50_000);
         assert_eq!(config.selfplay_workers, 196);
-        assert_eq!(config.selfplay_random_opening_probability, 0.25);
+        assert_eq!(config.selfplay_policy_opening_probability, 0.8);
         assert_eq!(config.replay_capacity, 500_000);
         assert_eq!(config.replay_warmup_samples, 100_000);
         assert_eq!(config.train_samples_per_update, 50_000);
