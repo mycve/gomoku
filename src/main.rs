@@ -215,7 +215,7 @@ fn main() -> io::Result<()> {
             PolicyValueModel::random(args.hidden, args.seed).save(&args.output)?;
             println!("model    : initialized {}", args.output);
             println!(
-                "arch     : input=451 hidden={} rmsnorm local=4axesx8cells-pattern{} policy=global64+local-gate+relu->225 value=96x96xWDL3",
+                "arch     : input=451 hidden={} rmsnorm local=4axesx8cells-pattern{} policy=global64-relu->225+scalar-local-gate value=96x96xWDL3",
                 args.hidden,
                 gomoku::model::LOCAL_AXIS_FEATURE_SIZE,
             );

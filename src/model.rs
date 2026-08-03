@@ -18,7 +18,7 @@ pub const LOCAL_AXIS_FEATURE_SIZE: usize = 32;
 pub const LOCAL_CANDIDATE_SIZE: usize = LOCAL_AXIS_FEATURE_SIZE * 3;
 pub const VALUE_LOCAL_SIZE: usize = LOCAL_CANDIDATE_SIZE * 2;
 pub const POLICY_HEAD_SIZE: usize = 64;
-const FORMAT_VERSION: f32 = 17.0;
+const FORMAT_VERSION: f32 = 18.0;
 const LOCAL_BOUNDARY: u8 = u8::MAX;
 const LOCAL_NEIGHBORS: [u8; CELL_COUNT * LOCAL_AXES * 2 * LOCAL_RADIUS] = build_local_neighbors();
 
@@ -70,7 +70,8 @@ pub struct PolicyValueModel {
     pub(crate) hidden_bias: Vec<f32>,
     pub(crate) policy_global: Vec<f32>,
     pub(crate) policy_global_bias: Vec<f32>,
-    pub(crate) policy_local_gate: Vec<f32>,
+    pub(crate) policy_gate: Vec<f32>,
+    pub(crate) policy_gate_bias: Vec<f32>,
     pub(crate) policy_output: Vec<f32>,
     pub(crate) policy_bias: Vec<f32>,
     pub(crate) local_axis_embedding: Vec<f32>,
@@ -146,9 +147,8 @@ impl PolicyValueModel {
             hidden_bias: vec![0.0; hidden_size],
             policy_global,
             policy_global_bias: vec![0.0; POLICY_HEAD_SIZE],
-            policy_local_gate: (0..POLICY_HEAD_SIZE)
-                .map(|_| rng.weight((2.0 / POLICY_HEAD_SIZE as f32).sqrt() * 0.25))
-                .collect(),
+            policy_gate: vec![0.0; POLICY_HEAD_SIZE],
+            policy_gate_bias: vec![1.0],
             policy_output: (0..CELL_COUNT * POLICY_HEAD_SIZE)
                 .map(|_| rng.weight((2.0 / POLICY_HEAD_SIZE as f32).sqrt() * 0.25))
                 .collect(),
@@ -230,6 +230,9 @@ impl PolicyValueModel {
                     &scratch.hidden,
                     &self.policy_global[start..start + self.hidden_size],
                 );
+            }
+            for value in &mut scratch.policy_global {
+                *value = value.max(0.0);
             }
             scratch.logits.clear();
             scratch.local_value.fill(0.0);
@@ -431,13 +434,8 @@ impl PolicyValueModel {
     fn policy_logit(&self, global: &[f32], local: &[f32], mv: Move) -> f32 {
         let local_signal = dot(local, &self.policy_local);
         let weights = &self.policy_output[mv.0 * POLICY_HEAD_SIZE..(mv.0 + 1) * POLICY_HEAD_SIZE];
-        global
-            .iter()
-            .zip(&self.policy_local_gate)
-            .zip(weights)
-            .map(|((&g, &gate), &weight)| (g + gate * local_signal).max(0.0) * weight)
-            .sum::<f32>()
-            + self.policy_bias[mv.0]
+        let gate = dot(global, &self.policy_gate) + self.policy_gate_bias[0];
+        dot(global, weights) + gate * local_signal + self.policy_bias[mv.0]
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
@@ -495,12 +493,8 @@ impl PolicyValueModel {
             &self.policy_global_bias,
             (POLICY_HEAD_SIZE,),
         )?;
-        insert(
-            &vars,
-            "policy_local_gate",
-            &self.policy_local_gate,
-            (POLICY_HEAD_SIZE,),
-        )?;
+        insert(&vars, "policy_gate", &self.policy_gate, (POLICY_HEAD_SIZE,))?;
+        insert(&vars, "policy_gate_bias", &self.policy_gate_bias, (1,))?;
         insert(
             &vars,
             "policy_output",
@@ -602,7 +596,8 @@ impl PolicyValueModel {
             hidden_bias,
             policy_global: load(&tensors, "policy_global")?,
             policy_global_bias: load(&tensors, "policy_global_bias")?,
-            policy_local_gate: load(&tensors, "policy_local_gate")?,
+            policy_gate: load(&tensors, "policy_gate")?,
+            policy_gate_bias: load(&tensors, "policy_gate_bias")?,
             policy_output: load(&tensors, "policy_output")?,
             policy_bias: load(&tensors, "policy_bias")?,
             local_axis_embedding: load(&tensors, "local_axis_embedding")?,
@@ -624,7 +619,8 @@ impl PolicyValueModel {
             || model.anti_diagonal_hidden.len() != DIAGONAL_FEATURES * hidden_size
             || model.policy_global.len() != POLICY_HEAD_SIZE * hidden_size
             || model.policy_global_bias.len() != POLICY_HEAD_SIZE
-            || model.policy_local_gate.len() != POLICY_HEAD_SIZE
+            || model.policy_gate.len() != POLICY_HEAD_SIZE
+            || model.policy_gate_bias.len() != 1
             || model.policy_output.len() != CELL_COUNT * POLICY_HEAD_SIZE
             || model.policy_bias.len() != CELL_COUNT
             || model.local_axis_embedding.len() != LOCAL_AXIS_PATTERNS * LOCAL_AXIS_FEATURE_SIZE
@@ -665,7 +661,8 @@ impl PolicyValueModel {
         blend!(hidden_bias);
         blend!(policy_global);
         blend!(policy_global_bias);
-        blend!(policy_local_gate);
+        blend!(policy_gate);
+        blend!(policy_gate_bias);
         blend!(policy_output);
         blend!(policy_bias);
         blend!(local_axis_embedding);
