@@ -28,6 +28,7 @@ pub struct AzLoopConfig {
     pub cpuct: f32,
     pub cpuct_log: f32,
     pub cpuct_base: f32,
+    pub root_desired_per_child_visits_coeff: f32,
     pub temperature_start: f32,
     pub temperature_endgame: f32,
     pub temperature_decay_delay_plies: usize,
@@ -42,6 +43,7 @@ pub struct AzLoopConfig {
     pub root_policy_temperature_halflife: f32,
     pub root_num_symmetries_to_sample: usize,
     pub use_graph_search: bool,
+    pub graph_search_max_nodes: usize,
     pub use_lcb_for_selection: bool,
     pub lcb_stdevs: f32,
     pub min_visit_prop_for_lcb: f32,
@@ -73,7 +75,7 @@ pub struct AzLoopConfig {
 impl Default for AzLoopConfig {
     fn default() -> Self {
         Self {
-            format_version: 5,
+            format_version: 6,
             model_path: "model.safetensors".into(),
             ema_model_path: "ema.safetensors".into(),
             best_model_path: "best.safetensors".into(),
@@ -95,6 +97,7 @@ impl Default for AzLoopConfig {
             cpuct: 1.5,
             cpuct_log: 0.45,
             cpuct_base: 500.0,
+            root_desired_per_child_visits_coeff: 2.0,
             temperature_start: 0.75,
             temperature_endgame: 0.15,
             temperature_decay_delay_plies: 0,
@@ -107,10 +110,11 @@ impl Default for AzLoopConfig {
             root_policy_temperature_early: 1.6,
             root_policy_temperature: 1.15,
             root_policy_temperature_halflife: 6.0,
-            root_num_symmetries_to_sample: 2,
+            root_num_symmetries_to_sample: 4,
             use_graph_search: true,
+            graph_search_max_nodes: 65_536,
             use_lcb_for_selection: true,
-            lcb_stdevs: 2.0,
+            lcb_stdevs: 3.0,
             min_visit_prop_for_lcb: 0.15,
             early_fork_game_prob: 0.04,
             early_fork_max_ply: 8,
@@ -170,6 +174,10 @@ impl AzLoopConfig {
             ("cpuct", self.cpuct),
             ("cpuct_log", self.cpuct_log),
             ("cpuct_base", self.cpuct_base),
+            (
+                "root_desired_per_child_visits_coeff",
+                self.root_desired_per_child_visits_coeff,
+            ),
             ("temperature_start", self.temperature_start),
             ("temperature_endgame", self.temperature_endgame),
             ("temperature_value_cutoff", self.temperature_value_cutoff),
@@ -218,8 +226,8 @@ impl AzLoopConfig {
                 return Err(io::Error::other(format!("配置 `{name}` 必须是有限数值")));
             }
         }
-        if self.format_version != 5 {
-            return Err(io::Error::other("仅支持 format_version = 5"));
+        if self.format_version != 6 {
+            return Err(io::Error::other("仅支持 format_version = 6"));
         }
         if self.simulations == 0
             || self.selfplay_samples_per_update == 0
@@ -238,6 +246,7 @@ impl AzLoopConfig {
             || self.cpuct <= 0.0
             || self.cpuct_log < 0.0
             || self.cpuct_base <= 0.0
+            || self.root_desired_per_child_visits_coeff < 0.0
             || self.temperature_start < 0.0
             || self.temperature_endgame < 0.0
             || self.temperature_value_cutoff < 0.0
@@ -292,11 +301,16 @@ impl AzLoopConfig {
                 "root_num_symmetries_to_sample 必须在 1..=8",
             ));
         }
+        if self.use_graph_search && self.graph_search_max_nodes == 0 {
+            return Err(io::Error::other(
+                "启用 Graph Search 时 graph_search_max_nodes 必须大于 0",
+            ));
+        }
         Ok(())
     }
 }
 
-const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 5
+const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 6
 model_path = "model.safetensors"
 ema_model_path = "ema.safetensors"
 best_model_path = "best.safetensors"
@@ -318,6 +332,7 @@ batch_size = 256
 cpuct = 1.5
 cpuct_log = 0.45
 cpuct_base = 500.0
+root_desired_per_child_visits_coeff = 2.0
 temperature_start = 0.75
 temperature_endgame = 0.15
 temperature_decay_delay_plies = 0
@@ -330,10 +345,11 @@ policy_softmax_temp = 1.1
 root_policy_temperature_early = 1.6
 root_policy_temperature = 1.15
 root_policy_temperature_halflife = 6.0
-root_num_symmetries_to_sample = 2
+root_num_symmetries_to_sample = 4
 use_graph_search = true
+graph_search_max_nodes = 65536
 use_lcb_for_selection = true
-lcb_stdevs = 2.0
+lcb_stdevs = 3.0
 min_visit_prop_for_lcb = 0.15
 early_fork_game_prob = 0.04
 early_fork_max_ply = 8
@@ -368,7 +384,7 @@ mod tests {
     fn default_text_is_exact_and_valid() {
         let config: AzLoopConfig = toml::from_str(DEFAULT_CONFIG_TEXT).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.format_version, 5);
+        assert_eq!(config.format_version, 6);
         assert_eq!(config.selfplay_samples_per_update, 50_000);
         assert_eq!(config.selfplay_workers, 196);
         assert_eq!(config.selfplay_policy_opening_probability, 0.8);

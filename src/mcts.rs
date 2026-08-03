@@ -13,6 +13,7 @@ pub struct SearchConfig {
     pub cpuct: f32,
     pub cpuct_log: f32,
     pub cpuct_base: f32,
+    pub root_desired_per_child_visits_coeff: f32,
     pub root_dirichlet_total_concentration: f32,
     pub root_exploration_fraction: f32,
     pub root_noise_seed: u64,
@@ -22,6 +23,7 @@ pub struct SearchConfig {
     pub root_policy_temperature_halflife: f32,
     pub root_num_symmetries_to_sample: usize,
     pub use_graph_search: bool,
+    pub graph_search_max_nodes: usize,
     pub use_lcb_for_selection: bool,
     pub lcb_stdevs: f32,
     pub min_visit_prop_for_lcb: f32,
@@ -49,6 +51,7 @@ impl Default for SearchConfig {
             cpuct: 1.5,
             cpuct_log: 0.45,
             cpuct_base: 500.0,
+            root_desired_per_child_visits_coeff: 2.0,
             root_dirichlet_total_concentration: 0.0,
             root_exploration_fraction: 0.0,
             root_noise_seed: 0,
@@ -56,10 +59,11 @@ impl Default for SearchConfig {
             root_policy_temperature_early: 1.6,
             root_policy_temperature: 1.15,
             root_policy_temperature_halflife: 6.0,
-            root_num_symmetries_to_sample: 2,
+            root_num_symmetries_to_sample: 4,
             use_graph_search: true,
+            graph_search_max_nodes: 65_536,
             use_lcb_for_selection: true,
-            lcb_stdevs: 2.0,
+            lcb_stdevs: 3.0,
             min_visit_prop_for_lcb: 0.15,
             temperature_start: 0.0,
             temperature_endgame: 0.0,
@@ -148,7 +152,7 @@ fn search_until(
         initial_value: 0.0,
     }];
     let mut transpositions = HashMap::new();
-    transpositions.insert(board_hash(board), 0);
+    transpositions.insert(board_hash(board), vec![0]);
     expand(&mut nodes, 0, model, cfg, &mut scratch);
     for simulation in 0..cfg.simulations {
         if simulation > 0 && deadline.is_some_and(|limit| Instant::now() >= limit) {
@@ -304,7 +308,7 @@ fn expand(
 }
 fn simulate(
     nodes: &mut Vec<Node>,
-    transpositions: &mut HashMap<u64, usize>,
+    transpositions: &mut HashMap<u64, Vec<usize>>,
     idx: usize,
     model: &PolicyValueModel,
     cfg: SearchConfig,
@@ -345,7 +349,13 @@ fn simulate(
             } else {
                 e.value_sum / e.visits as f32
             };
-            let s = q + exploration * e.prior / (1.0 + e.visits as f32);
+            let desired = if idx == 0 {
+                cfg.root_desired_per_child_visits_coeff.max(0.0) * e.prior * total.sqrt()
+            } else {
+                0.0
+            };
+            let effective_visits = (e.visits as f32 - desired).max(0.0);
+            let s = q + exploration * e.prior / (1.0 + effective_visits);
             if s > score {
                 score = s;
                 best = i
@@ -364,7 +374,12 @@ fn simulate(
         b.play(mv);
         let key = board_hash(&b);
         let c = if cfg.use_graph_search {
-            transpositions.get(&key).copied()
+            transpositions.get(&key).and_then(|candidates| {
+                candidates
+                    .iter()
+                    .copied()
+                    .find(|&candidate| same_position(&nodes[candidate].board, &b))
+            })
         } else {
             None
         }
@@ -377,7 +392,9 @@ fn simulate(
                 expanded: false,
                 initial_value: 0.0,
             });
-            transpositions.insert(key, c);
+            if cfg.use_graph_search && nodes.len() <= cfg.graph_search_max_nodes.max(1) {
+                transpositions.entry(key).or_insert_with(Vec::new).push(c);
+            }
             c
         });
         nodes[idx].children[best].child = Some(c);
@@ -398,6 +415,10 @@ fn board_hash(board: &Board) -> u64 {
         hash = hash.wrapping_mul(0x100_0000_01B3);
     }
     hash
+}
+
+fn same_position(a: &Board, b: &Board) -> bool {
+    a.to_move() == b.to_move() && a.cells() == b.cells()
 }
 
 fn edge_std_error(edge: &Edge) -> f32 {

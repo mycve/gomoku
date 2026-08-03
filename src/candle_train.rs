@@ -2,8 +2,8 @@ use crate::{
     game::CELL_COUNT,
     model::{
         AXIS_FEATURES, DIAGONAL_FEATURES, INPUT_SIZE, LOCAL_AXES, LOCAL_AXIS_FEATURE_SIZE,
-        LOCAL_AXIS_PATTERNS, LOCAL_CANDIDATE_SIZE, PolicyValueModel, STONE_TYPES, VALUE_HEAD_SIZE,
-        VALUE_LOCAL_SIZE, WDL_SIZE, local_ray_codes,
+        LOCAL_AXIS_PATTERNS, LOCAL_CANDIDATE_SIZE, POLICY_HEAD_SIZE, PolicyValueModel, STONE_TYPES,
+        VALUE_HEAD_SIZE, VALUE_LOCAL_SIZE, WDL_SIZE, local_ray_codes,
     },
     replay::Sample,
     selfplay::TrainStats,
@@ -442,7 +442,10 @@ struct Replica {
     diagonal_hidden: Var,
     anti_diagonal_hidden: Var,
     hidden_bias: Var,
-    policy_hidden: Var,
+    policy_global: Var,
+    policy_global_bias: Var,
+    policy_local_gate: Var,
+    policy_output: Var,
     policy_bias: Var,
     local_axis_embedding: Var,
     local_axis_scale: Var,
@@ -467,7 +470,10 @@ impl Replica {
             diagonal_hidden: var(&model.diagonal_hidden, (DIAGONAL_FEATURES, h), device)?,
             anti_diagonal_hidden: var(&model.anti_diagonal_hidden, (DIAGONAL_FEATURES, h), device)?,
             hidden_bias: var(&model.hidden_bias, (h,), device)?,
-            policy_hidden: var(&model.policy_hidden, (CELL_COUNT, h), device)?,
+            policy_global: var(&model.policy_global, (POLICY_HEAD_SIZE, h), device)?,
+            policy_global_bias: var(&model.policy_global_bias, (POLICY_HEAD_SIZE,), device)?,
+            policy_local_gate: var(&model.policy_local_gate, (POLICY_HEAD_SIZE,), device)?,
+            policy_output: var(&model.policy_output, (CELL_COUNT, POLICY_HEAD_SIZE), device)?,
             policy_bias: var(&model.policy_bias, (CELL_COUNT,), device)?,
             local_axis_embedding: var(
                 &model.local_axis_embedding,
@@ -510,7 +516,10 @@ impl Replica {
             self.diagonal_hidden.clone(),
             self.anti_diagonal_hidden.clone(),
             self.hidden_bias.clone(),
-            self.policy_hidden.clone(),
+            self.policy_global.clone(),
+            self.policy_global_bias.clone(),
+            self.policy_local_gate.clone(),
+            self.policy_output.clone(),
             self.policy_bias.clone(),
             self.local_axis_embedding.clone(),
             self.local_axis_scale.clone(),
@@ -672,10 +681,23 @@ impl Replica {
             })
             .and_then(|x| x.reshape((b, CELL_COUNT)))
             .map_err(err)?;
-        let logits = hidden
-            .matmul(&self.policy_hidden.t().map_err(err)?)
+        let policy_global = hidden
+            .matmul(&self.policy_global.t().map_err(err)?)
+            .and_then(|x| x.broadcast_add(&self.policy_global_bias))
+            .and_then(|x| x.unsqueeze(1))
+            .map_err(err)?;
+        let policy_features = local_policy_logits
+            .unsqueeze(2)
+            .and_then(|x| {
+                x.broadcast_mul(&self.policy_local_gate.reshape((1, 1, POLICY_HEAD_SIZE))?)
+            })
+            .and_then(|x| x.broadcast_add(&policy_global))
+            .and_then(|x| x.relu())
+            .map_err(err)?;
+        let logits = policy_features
+            .mul(&self.policy_output.unsqueeze(0).map_err(err)?)
+            .and_then(|x| x.sum(2))
             .and_then(|x| x.broadcast_add(&self.policy_bias))
-            .and_then(|x| x.add(&local_policy_logits))
             .and_then(|x| x.add(&masks))
             .map_err(err)?;
         let log_probs = log_softmax(&logits, 1).map_err(err)?;
@@ -773,18 +795,21 @@ impl Replica {
         m.diagonal_hidden = v[4].clone();
         m.anti_diagonal_hidden = v[5].clone();
         m.hidden_bias = v[6].clone();
-        m.policy_hidden = v[7].clone();
-        m.policy_bias = v[8].clone();
-        m.local_axis_embedding = v[9].clone();
-        m.local_axis_scale = v[10].clone();
-        m.local_axis_bias = v[11].clone();
-        m.policy_local = v[12].clone();
-        m.value_head_hidden = v[13].clone();
-        m.value_local_output = v[14].clone();
-        m.value_head_bias = v[15].clone();
-        m.value_head_hidden2 = v[16].clone();
-        m.value_head_bias2 = v[17].clone();
-        m.value_head_output = v[18].clone();
+        m.policy_global = v[7].clone();
+        m.policy_global_bias = v[8].clone();
+        m.policy_local_gate = v[9].clone();
+        m.policy_output = v[10].clone();
+        m.policy_bias = v[11].clone();
+        m.local_axis_embedding = v[12].clone();
+        m.local_axis_scale = v[13].clone();
+        m.local_axis_bias = v[14].clone();
+        m.policy_local = v[15].clone();
+        m.value_head_hidden = v[16].clone();
+        m.value_local_output = v[17].clone();
+        m.value_head_bias = v[18].clone();
+        m.value_head_hidden2 = v[19].clone();
+        m.value_head_bias2 = v[20].clone();
+        m.value_head_output = v[21].clone();
         Ok(())
     }
 }
