@@ -247,6 +247,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         }
     });
     let (event_tx, event_rx) = mpsc::sync_channel::<TrainerEvent>(0);
+    let (trainer_error_tx, trainer_error_rx) = mpsc::sync_channel::<String>(1);
     let (trainer_ack_tx, trainer_ack_rx) = mpsc::sync_channel::<()>(0);
     let trainer_stop = Arc::clone(&stop);
     let trainer_interrupted = Arc::clone(&interrupted);
@@ -254,93 +255,99 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     let trainer_config = config.clone();
     let start_update = progress.update;
     let trainer = thread::spawn(move || -> io::Result<()> {
-        let mut model = initial_model;
-        let mut ema_model = initial_ema;
-        let mut ema_initialized = ema_checkpoint_exists;
-        let mut training = candle_train::TrainingSession::new(
-            &model,
-            Some(&ema_model),
-            current_lr(&trainer_config, start_update),
-        )?;
-        let mut pool = initial_pool;
-        let mut index = 0usize;
-        while let Ok(batch) = ready_rx.recv() {
-            if trainer_stop.load(Ordering::SeqCst) {
-                break;
-            }
-            if batch.newest_version < trainer_version.load(Ordering::Acquire) {
-                continue;
-            }
-            pool.extend(batch.samples.iter().cloned());
-            if pool.len() > trainer_config.replay_capacity {
-                pool.drain(..pool.len() - trainer_config.replay_capacity);
-            }
-            let update = start_update + index + 1;
-            let lr = current_lr(&trainer_config, update - 1);
-            let started = Instant::now();
-            let sampled = replay::sample_mixed_recent(
-                &pool,
-                trainer_config.train_samples_per_update,
-                trainer_config.replay_recent_sample_fraction,
-                trainer_config.replay_recent_updates,
-                trainer_config.replay_policy_surprise_fraction,
-                trainer_config.replay_value_surprise_fraction,
-                trainer_config.seed ^ update as u64,
-            );
-            let train_samples = sampled.samples.len();
-            let recent_quota_rate = sampled.recent_quota as f32 / train_samples.max(1) as f32;
-            let actual_recent_rate = sampled.actual_recent as f32 / train_samples.max(1) as f32;
-            let effective_ema_decay =
-                ema_decay_for_update(trainer_config.ema_decay, ema_initialized);
-            let train_stats = training.train_controlled(
-                &mut model,
-                Some(&mut ema_model),
-                &sampled.samples,
-                trainer_config.batch_epochs,
-                lr,
-                trainer_config.batch_size,
-                effective_ema_decay,
-                Some(&trainer_stop),
+        let result = (|| -> io::Result<()> {
+            let mut model = initial_model;
+            let mut ema_model = initial_ema;
+            let mut ema_initialized = ema_checkpoint_exists;
+            let mut training = candle_train::TrainingSession::new(
+                &model,
+                Some(&ema_model),
+                current_lr(&trainer_config, start_update),
             )?;
-            if trainer_stop.load(Ordering::SeqCst) {
-                break;
+            let mut pool = initial_pool;
+            let mut index = 0usize;
+            while let Ok(batch) = ready_rx.recv() {
+                if trainer_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                if batch.newest_version < trainer_version.load(Ordering::Acquire) {
+                    continue;
+                }
+                pool.extend(batch.samples.iter().cloned());
+                if pool.len() > trainer_config.replay_capacity {
+                    pool.drain(..pool.len() - trainer_config.replay_capacity);
+                }
+                let update = start_update + index + 1;
+                let lr = current_lr(&trainer_config, update - 1);
+                let started = Instant::now();
+                let sampled = replay::sample_mixed_recent(
+                    &pool,
+                    trainer_config.train_samples_per_update,
+                    trainer_config.replay_recent_sample_fraction,
+                    trainer_config.replay_recent_updates,
+                    trainer_config.replay_policy_surprise_fraction,
+                    trainer_config.replay_value_surprise_fraction,
+                    trainer_config.seed ^ update as u64,
+                );
+                let train_samples = sampled.samples.len();
+                let recent_quota_rate = sampled.recent_quota as f32 / train_samples.max(1) as f32;
+                let actual_recent_rate = sampled.actual_recent as f32 / train_samples.max(1) as f32;
+                let effective_ema_decay =
+                    ema_decay_for_update(trainer_config.ema_decay, ema_initialized);
+                let train_stats = training.train_controlled(
+                    &mut model,
+                    Some(&mut ema_model),
+                    &sampled.samples,
+                    trainer_config.batch_epochs,
+                    lr,
+                    trainer_config.batch_size,
+                    effective_ema_decay,
+                    Some(&trainer_stop),
+                )?;
+                if trainer_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                if train_stats.optimizer_steps > 0 {
+                    ema_initialized = true;
+                }
+                let train_seconds = started.elapsed().as_secs_f32();
+                if event_tx
+                    .send(TrainerEvent {
+                        model: ema_model.clone(),
+                        online_model: model.clone(),
+                        batch,
+                        train_stats,
+                        train_seconds,
+                        pool_samples: pool.len(),
+                        learning_rate: lr,
+                        train_samples,
+                        recent_quota_rate,
+                        actual_recent_rate,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                index += 1;
+                if trainer_ack_rx.recv().is_err() {
+                    break;
+                }
             }
-            if train_stats.optimizer_steps > 0 {
-                ema_initialized = true;
+            if trainer_interrupted.load(Ordering::SeqCst) {
+                replay::save(&trainer_config.replay_path, &pool)?;
+                println!(
+                    "replay   : interrupt snapshot {} ({}/{})",
+                    trainer_config.replay_path,
+                    pool.len(),
+                    trainer_config.replay_capacity
+                );
             }
-            let train_seconds = started.elapsed().as_secs_f32();
-            if event_tx
-                .send(TrainerEvent {
-                    model: ema_model.clone(),
-                    online_model: model.clone(),
-                    batch,
-                    train_stats,
-                    train_seconds,
-                    pool_samples: pool.len(),
-                    learning_rate: lr,
-                    train_samples,
-                    recent_quota_rate,
-                    actual_recent_rate,
-                })
-                .is_err()
-            {
-                break;
-            }
-            index += 1;
-            if trainer_ack_rx.recv().is_err() {
-                break;
-            }
+            Ok(())
+        })();
+        if let Err(error) = &result {
+            let _ = trainer_error_tx.try_send(format!("{error:#}"));
         }
-        if trainer_interrupted.load(Ordering::SeqCst) {
-            replay::save(&trainer_config.replay_path, &pool)?;
-            println!(
-                "replay   : interrupt snapshot {} ({}/{})",
-                trainer_config.replay_path,
-                pool.len(),
-                trainer_config.replay_capacity
-            );
-        }
-        Ok(())
+        result
     });
     let train_device = candle_train::training_device_name()?;
     let end = target_update.unwrap_or(usize::MAX);
@@ -366,7 +373,12 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                     break 'main;
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(io::Error::other("Trainer 在线程完成更新前退出"));
+                    let detail = trainer_error_rx
+                        .try_recv()
+                        .unwrap_or_else(|_| "未知错误（训练线程未返回详细信息）".into());
+                    return Err(io::Error::other(format!(
+                        "Trainer 在线程完成更新前退出: {detail}"
+                    )));
                 }
             }
         };

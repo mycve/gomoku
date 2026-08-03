@@ -695,7 +695,7 @@ impl Replica {
             .and_then(|x| x.relu())
             .map_err(err)?;
         let logits = policy_features
-            .mul(&self.policy_output.unsqueeze(0).map_err(err)?)
+            .broadcast_mul(&self.policy_output.unsqueeze(0).map_err(err)?)
             .and_then(|x| x.sum(2))
             .and_then(|x| x.broadcast_add(&self.policy_bias))
             .and_then(|x| x.add(&masks))
@@ -1166,7 +1166,14 @@ mod tests {
             value_surprise: 0.0,
             predicted_value: 0.0,
         };
-        let stats = train(&mut model, &[sample], 2, 1e-3, 1).unwrap();
+        let stats = train(
+            &mut model,
+            &[sample.clone(), sample.clone(), sample],
+            2,
+            1e-3,
+            3,
+        )
+        .unwrap();
         assert_eq!(stats.optimizer_steps, 2);
         assert!(stats.policy_loss.is_finite());
         assert!(stats.value_loss.is_finite());
