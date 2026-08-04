@@ -17,10 +17,7 @@ pub struct SearchConfig {
     pub root_dirichlet_total_concentration: f32,
     pub root_exploration_fraction: f32,
     pub root_noise_seed: u64,
-    pub policy_softmax_temp: f32,
-    pub root_policy_temperature_early: f32,
     pub root_policy_temperature: f32,
-    pub root_policy_temperature_halflife: f32,
     pub root_num_symmetries_to_sample: usize,
     pub use_graph_search: bool,
     pub graph_search_max_nodes: usize,
@@ -54,10 +51,7 @@ impl Default for SearchConfig {
             root_dirichlet_total_concentration: 0.0,
             root_exploration_fraction: 0.0,
             root_noise_seed: 0,
-            policy_softmax_temp: 1.0,
-            root_policy_temperature_early: 1.6,
-            root_policy_temperature: 1.15,
-            root_policy_temperature_halflife: 6.0,
+            root_policy_temperature: 1.0,
             root_num_symmetries_to_sample: 4,
             use_graph_search: true,
             graph_search_max_nodes: 65_536,
@@ -217,7 +211,7 @@ fn expand(
             model.evaluate_accumulator_with_scratch(
                 &nodes[idx].board,
                 &nodes[idx].accumulator,
-                cfg.policy_softmax_temp,
+                1.0,
                 scratch,
             )
         }
@@ -228,10 +222,7 @@ fn expand(
         raw_priors[mv.0] = prior;
     }
     if idx == 0 {
-        apply_policy_temperature(
-            &mut policy,
-            root_policy_temperature(cfg, nodes[idx].board.move_count()),
-        );
+        apply_policy_temperature(&mut policy, cfg.root_policy_temperature);
     }
     let us = nodes[idx].board.to_move();
     let winning = policy
@@ -450,13 +441,6 @@ fn lcb_selection_value(candidate: &Candidate, max_visits: f32, cfg: SearchConfig
     candidate.q - cfg.lcb_stdevs.max(0.0) * candidate.value_std_error
 }
 
-fn root_policy_temperature(cfg: SearchConfig, ply: usize) -> f32 {
-    let half_life = cfg.root_policy_temperature_halflife.max(1e-3);
-    cfg.root_policy_temperature
-        + (cfg.root_policy_temperature_early - cfg.root_policy_temperature)
-            * 2.0_f32.powf(-(ply as f32) / half_life)
-}
-
 fn apply_policy_temperature(policy: &mut [(Move, f32)], temperature: f32) {
     let inverse = temperature.max(1e-3).recip();
     let sum = policy
@@ -488,11 +472,8 @@ fn evaluate_root_symmetries(
         }
         let transformed = board.transformed(symmetry);
         let accumulator = model.accumulator(&transformed);
-        let (policy, prediction) = model.evaluate_accumulator_with_temperature(
-            &transformed,
-            &accumulator,
-            cfg.policy_softmax_temp,
-        );
+        let (policy, prediction) =
+            model.evaluate_accumulator_with_temperature(&transformed, &accumulator, 1.0);
         value += prediction / count as f32;
         for (mv, probability) in policy {
             probabilities[inverse[mv.0]] += probability / count as f32;

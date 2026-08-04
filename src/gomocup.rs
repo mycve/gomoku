@@ -228,8 +228,6 @@ fn play_and_respond(
     let search_config = SearchConfig {
         simulations: usize::MAX,
         cpuct: config.cpuct,
-        policy_softmax_temp: 1.0,
-        root_policy_temperature_early: 1.0,
         root_policy_temperature: 1.0,
         ..Default::default()
     };

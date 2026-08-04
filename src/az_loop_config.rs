@@ -39,10 +39,7 @@ pub struct AzLoopConfig {
     pub temperature_visit_offset: f32,
     pub root_dirichlet_total_concentration: f32,
     pub root_exploration_fraction: f32,
-    pub policy_softmax_temp: f32,
-    pub root_policy_temperature_early: f32,
     pub root_policy_temperature: f32,
-    pub root_policy_temperature_halflife: f32,
     pub root_num_symmetries_to_sample: usize,
     pub use_graph_search: bool,
     pub graph_search_max_nodes: usize,
@@ -74,7 +71,7 @@ pub struct AzLoopConfig {
 impl Default for AzLoopConfig {
     fn default() -> Self {
         Self {
-            format_version: 11,
+            format_version: 12,
             model_path: "model.safetensors".into(),
             ema_model_path: "ema.safetensors".into(),
             best_model_path: "best.safetensors".into(),
@@ -107,10 +104,7 @@ impl Default for AzLoopConfig {
             temperature_visit_offset: -0.8,
             root_dirichlet_total_concentration: 10.83,
             root_exploration_fraction: 0.25,
-            policy_softmax_temp: 1.1,
-            root_policy_temperature_early: 1.6,
-            root_policy_temperature: 1.15,
-            root_policy_temperature_halflife: 6.0,
+            root_policy_temperature: 1.1,
             root_num_symmetries_to_sample: 4,
             use_graph_search: true,
             graph_search_max_nodes: 65_536,
@@ -188,16 +182,7 @@ impl AzLoopConfig {
                 self.root_dirichlet_total_concentration,
             ),
             ("root_exploration_fraction", self.root_exploration_fraction),
-            ("policy_softmax_temp", self.policy_softmax_temp),
-            (
-                "root_policy_temperature_early",
-                self.root_policy_temperature_early,
-            ),
             ("root_policy_temperature", self.root_policy_temperature),
-            (
-                "root_policy_temperature_halflife",
-                self.root_policy_temperature_halflife,
-            ),
             ("lcb_stdevs", self.lcb_stdevs),
             ("min_visit_prop_for_lcb", self.min_visit_prop_for_lcb),
             ("early_fork_game_prob", self.early_fork_game_prob),
@@ -225,8 +210,8 @@ impl AzLoopConfig {
                 return Err(io::Error::other(format!("配置 `{name}` 必须是有限数值")));
             }
         }
-        if self.format_version != 11 {
-            return Err(io::Error::other("仅支持 format_version = 11"));
+        if self.format_version != 12 {
+            return Err(io::Error::other("仅支持 format_version = 12"));
         }
         if self.simulations == 0
             || self.selfplay_samples_per_update == 0
@@ -252,11 +237,8 @@ impl AzLoopConfig {
             || self.temperature_endgame < 0.0
             || self.temperature_value_cutoff < 0.0
             || self.root_dirichlet_total_concentration < 0.0
-            || self.policy_softmax_temp <= 0.0
             || self.selfplay_policy_opening_temperature <= 0.0
-            || self.root_policy_temperature_early <= 0.0
             || self.root_policy_temperature <= 0.0
-            || self.root_policy_temperature_halflife <= 0.0
             || self.lcb_stdevs < 0.0
             || !(0.0..=1.0).contains(&self.min_visit_prop_for_lcb)
             || !(0.0..=1.0).contains(&self.early_fork_game_prob)
@@ -308,7 +290,7 @@ impl AzLoopConfig {
     }
 }
 
-const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 11
+const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 12
 model_path = "model.safetensors"
 ema_model_path = "ema.safetensors"
 best_model_path = "best.safetensors"
@@ -341,10 +323,7 @@ temperature_value_cutoff = 0.12
 temperature_visit_offset = -0.8
 root_dirichlet_total_concentration = 10.83
 root_exploration_fraction = 0.25
-policy_softmax_temp = 1.1
-root_policy_temperature_early = 1.6
-root_policy_temperature = 1.15
-root_policy_temperature_halflife = 6.0
+root_policy_temperature = 1.1
 root_num_symmetries_to_sample = 4
 use_graph_search = true
 graph_search_max_nodes = 65536
@@ -381,7 +360,7 @@ mod tests {
     fn default_text_is_exact_and_valid() {
         let config: AzLoopConfig = toml::from_str(DEFAULT_CONFIG_TEXT).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.format_version, 11);
+        assert_eq!(config.format_version, 12);
         assert_eq!(config.batch_size, 1024);
         assert_eq!(config.selfplay_samples_per_update, 50_000);
         assert_eq!(config.selfplay_workers, 196);

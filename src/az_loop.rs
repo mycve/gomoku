@@ -123,8 +123,8 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         config.temperature_visit_offset
     );
     println!(
-        "priors   : softmax_temp={:.2} root_noise(total_concentration={:.2}, fraction={:.2})",
-        config.policy_softmax_temp,
+        "priors   : root_temp={:.2} root_noise(total_concentration={:.2}, fraction={:.2})",
+        config.root_policy_temperature,
         config.root_dirichlet_total_concentration,
         config.root_exploration_fraction
     );
@@ -180,10 +180,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             root_desired_per_child_visits_coeff: config.root_desired_per_child_visits_coeff,
             root_dirichlet_total_concentration: config.root_dirichlet_total_concentration,
             root_exploration_fraction: config.root_exploration_fraction,
-            policy_softmax_temp: config.policy_softmax_temp,
-            root_policy_temperature_early: config.root_policy_temperature_early,
             root_policy_temperature: config.root_policy_temperature,
-            root_policy_temperature_halflife: config.root_policy_temperature_halflife,
             root_num_symmetries_to_sample: config.root_num_symmetries_to_sample,
             use_graph_search: config.use_graph_search,
             graph_search_max_nodes: config.graph_search_max_nodes,
@@ -733,10 +730,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                     cpuct_log: config.cpuct_log,
                     cpuct_base: config.cpuct_base,
                     root_desired_per_child_visits_coeff: config.root_desired_per_child_visits_coeff,
-                    policy_softmax_temp: 1.0,
-                    root_policy_temperature_early: 1.0,
                     root_policy_temperature: 1.0,
-                    root_policy_temperature_halflife: config.root_policy_temperature_halflife,
                     root_num_symmetries_to_sample: config.root_num_symmetries_to_sample,
                     use_graph_search: config.use_graph_search,
                     graph_search_max_nodes: config.graph_search_max_nodes,
