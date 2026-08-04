@@ -129,7 +129,8 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         config.root_exploration_fraction
     );
     println!(
-        "opening  : policy probability={:.1}% avg_plies={} temperature={:.2} samples_after_opening=true",
+        "opening  : balanced={:.1}% policy={:.1}% avg_plies={} temperature={:.2} samples_after_opening=true",
+        config.selfplay_balanced_opening_probability * 100.0,
         config.selfplay_policy_opening_probability * 100.0,
         config.selfplay_policy_opening_avg_plies,
         config.selfplay_policy_opening_temperature
@@ -195,7 +196,8 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             temperature_decay_plies: config.temperature_decay_plies,
             temperature_value_cutoff: config.temperature_value_cutoff,
             temperature_visit_offset: config.temperature_visit_offset,
-            random_opening_probability: config.selfplay_policy_opening_probability,
+            balanced_opening_probability: config.selfplay_balanced_opening_probability,
+            policy_opening_probability: config.selfplay_policy_opening_probability,
             policy_opening_avg_plies: config.selfplay_policy_opening_avg_plies,
             policy_opening_temperature: config.selfplay_policy_opening_temperature,
             early_fork_game_prob: config.early_fork_game_prob,
@@ -531,6 +533,23 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             progress.update,
         );
         tb.add_scalar(
+            "selfplay/balanced_opening_rate",
+            event.batch.stats.balanced_opening_games as f32 / games,
+            progress.update,
+        );
+        tb.add_scalar(
+            "selfplay/balanced_opening_attempts",
+            event.batch.stats.balanced_opening_attempts as f32
+                / event.batch.stats.balanced_opening_games.max(1) as f32,
+            progress.update,
+        );
+        tb.add_scalar(
+            "selfplay/balanced_opening_abs_value",
+            event.batch.stats.balanced_opening_abs_value_sum
+                / event.batch.stats.balanced_opening_games.max(1) as f32,
+            progress.update,
+        );
+        tb.add_scalar(
             "selfplay/black_win_rate",
             event.batch.stats.black_wins as f32 / games,
             progress.update,
@@ -836,11 +855,17 @@ fn print_event(
         event.batch.stats.plies as f32 / event.batch.games.max(1) as f32
     );
     println!(
-        "opening  : randomized={}/{} rate={:.1}% plies={}",
+        "opening  : randomized={}/{} rate={:.1}% plies={} balanced={}/{} attempts={:.2} abs_v={:.3}",
         event.batch.stats.random_opening_games,
         event.batch.games,
         event.batch.stats.random_opening_games as f32 * 100.0 / event.batch.games.max(1) as f32,
-        event.batch.stats.random_opening_plies
+        event.batch.stats.random_opening_plies,
+        event.batch.stats.balanced_opening_games,
+        event.batch.games,
+        event.batch.stats.balanced_opening_attempts as f32
+            / event.batch.stats.balanced_opening_games.max(1) as f32,
+        event.batch.stats.balanced_opening_abs_value_sum
+            / event.batch.stats.balanced_opening_games.max(1) as f32
     );
     println!(
         "search   : avg_sims={:.1} entropy={:.3} visited={:.1} surprise={:.3}/{:.3}",

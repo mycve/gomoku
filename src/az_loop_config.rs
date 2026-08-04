@@ -17,6 +17,7 @@ pub struct AzLoopConfig {
     pub selfplay_samples_per_update: usize,
     pub selfplay_workers: usize,
     pub selfplay_queue_capacity: usize,
+    pub selfplay_balanced_opening_probability: f32,
     pub selfplay_policy_opening_probability: f32,
     pub selfplay_policy_opening_avg_plies: usize,
     pub selfplay_policy_opening_temperature: f32,
@@ -76,7 +77,7 @@ pub struct AzLoopConfig {
 impl Default for AzLoopConfig {
     fn default() -> Self {
         Self {
-            format_version: 7,
+            format_version: 8,
             model_path: "model.safetensors".into(),
             ema_model_path: "ema.safetensors".into(),
             best_model_path: "best.safetensors".into(),
@@ -87,6 +88,7 @@ impl Default for AzLoopConfig {
             selfplay_samples_per_update: 50_000,
             selfplay_workers: 196,
             selfplay_queue_capacity: 0,
+            selfplay_balanced_opening_probability: 0.99,
             selfplay_policy_opening_probability: 0.8,
             selfplay_policy_opening_avg_plies: 6,
             selfplay_policy_opening_temperature: 1.6,
@@ -164,6 +166,10 @@ impl AzLoopConfig {
         let finite = [
             ("learning_rate", self.learning_rate),
             (
+                "selfplay_balanced_opening_probability",
+                self.selfplay_balanced_opening_probability,
+            ),
+            (
                 "selfplay_policy_opening_probability",
                 self.selfplay_policy_opening_probability,
             ),
@@ -227,8 +233,8 @@ impl AzLoopConfig {
                 return Err(io::Error::other(format!("配置 `{name}` 必须是有限数值")));
             }
         }
-        if self.format_version != 7 {
-            return Err(io::Error::other("仅支持 format_version = 7"));
+        if self.format_version != 8 {
+            return Err(io::Error::other("仅支持 format_version = 8"));
         }
         if self.simulations == 0
             || self.selfplay_samples_per_update == 0
@@ -270,6 +276,7 @@ impl AzLoopConfig {
             || self.arena_promotion_confidence_z < 0.0
             || !(0.0..=1.0).contains(&self.replay_recent_sample_fraction)
             || !(0.0..=1.0).contains(&self.selfplay_policy_opening_probability)
+            || !(0.0..=1.0).contains(&self.selfplay_balanced_opening_probability)
             || !(0.0..=1.0).contains(&self.replay_policy_surprise_fraction)
             || !(0.0..=1.0).contains(&self.replay_value_surprise_fraction)
         {
@@ -313,7 +320,7 @@ impl AzLoopConfig {
     }
 }
 
-const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 7
+const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 8
 model_path = "model.safetensors"
 ema_model_path = "ema.safetensors"
 best_model_path = "best.safetensors"
@@ -324,6 +331,7 @@ seed = 20260730
 selfplay_samples_per_update = 50000
 selfplay_workers = 196
 selfplay_queue_capacity = 0
+selfplay_balanced_opening_probability = 0.99
 selfplay_policy_opening_probability = 0.8
 selfplay_policy_opening_avg_plies = 6
 selfplay_policy_opening_temperature = 1.6
@@ -388,9 +396,10 @@ mod tests {
     fn default_text_is_exact_and_valid() {
         let config: AzLoopConfig = toml::from_str(DEFAULT_CONFIG_TEXT).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.format_version, 7);
+        assert_eq!(config.format_version, 8);
         assert_eq!(config.selfplay_samples_per_update, 50_000);
         assert_eq!(config.selfplay_workers, 196);
+        assert_eq!(config.selfplay_balanced_opening_probability, 0.99);
         assert_eq!(config.selfplay_policy_opening_probability, 0.8);
         assert_eq!(config.replay_capacity, 500_000);
         assert_eq!(config.replay_warmup_samples, 100_000);
