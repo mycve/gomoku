@@ -114,13 +114,11 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         config.selfplay_queue_capacity.max(1)
     };
     println!(
-        "explore  : temp={:.2}->{:.2} delay={} decay={} value_cutoff={:.2} visit_offset={:.2}",
+        "explore  : visit_temp={:.2}->{:.2} delay={} decay={}",
         config.temperature_start,
         config.temperature_endgame,
         config.temperature_decay_delay_plies,
-        config.temperature_decay_plies,
-        config.temperature_value_cutoff,
-        config.temperature_visit_offset
+        config.temperature_decay_plies
     );
     println!(
         "priors   : root_temp={:.2} root_noise(total_concentration={:.2}, fraction={:.2})",
@@ -130,12 +128,11 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     );
     println!("opening  : pure_selfplay=true start=empty_board");
     println!(
-        "search   : sims={} cpuct={:.2}+{:.2}log/base{:.0} desired={:.1} graph={} lcb={} symmetries={}",
+        "search   : sims={} cpuct={:.2}+{:.2}log/base{:.0} graph={} lcb={} symmetries={}",
         config.simulations,
         config.cpuct,
         config.cpuct_log,
         config.cpuct_base,
-        config.root_desired_per_child_visits_coeff,
         config.use_graph_search,
         config.use_lcb_for_selection,
         config.root_num_symmetries_to_sample
@@ -171,7 +168,6 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             cpuct: config.cpuct,
             cpuct_log: config.cpuct_log,
             cpuct_base: config.cpuct_base,
-            root_desired_per_child_visits_coeff: config.root_desired_per_child_visits_coeff,
             root_dirichlet_total_concentration: config.root_dirichlet_total_concentration,
             root_exploration_fraction: config.root_exploration_fraction,
             root_policy_temperature: config.root_policy_temperature,
@@ -185,8 +181,6 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             temperature_endgame: config.temperature_endgame,
             temperature_decay_delay_plies: config.temperature_decay_delay_plies,
             temperature_decay_plies: config.temperature_decay_plies,
-            temperature_value_cutoff: config.temperature_value_cutoff,
-            temperature_visit_offset: config.temperature_visit_offset,
             ..Default::default()
         },
         config.seed,
@@ -666,7 +660,6 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                     cpuct: config.cpuct,
                     cpuct_log: config.cpuct_log,
                     cpuct_base: config.cpuct_base,
-                    root_desired_per_child_visits_coeff: config.root_desired_per_child_visits_coeff,
                     root_policy_temperature: 1.0,
                     root_num_symmetries_to_sample: config.root_num_symmetries_to_sample,
                     use_graph_search: config.use_graph_search,

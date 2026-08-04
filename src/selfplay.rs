@@ -140,13 +140,7 @@ pub fn generate_one_detailed_controlled(
         stats.policy_top1_sum += top[0];
         stats.policy_top2_sum += top[0] + top[1];
         let temperature = temperature_for_ply(cfg, board.move_count());
-        let mv = sample_with_temperature(
-            &c,
-            temperature,
-            cfg.temperature_value_cutoff,
-            cfg.temperature_visit_offset,
-            &mut seed,
-        );
+        let mv = sample_with_temperature(&c, temperature, &mut seed);
         if temperature > 1e-6 {
             stats.sampled_moves += 1;
             stats.sampled_best_moves += usize::from(mv == c[0].mv);
@@ -280,31 +274,17 @@ fn temperature_for_ply(cfg: SearchConfig, ply: usize) -> f32 {
 fn sample_with_temperature(
     c: &[crate::mcts::Candidate],
     temperature: f32,
-    value_cutoff: f32,
-    visit_offset: f32,
     seed: &mut u64,
 ) -> crate::game::Move {
     if temperature <= 1e-6 {
         return c[0].mv;
     }
-    let anchor_q = c
-        .iter()
-        .max_by(|a, b| {
-            (a.visits as f32 + visit_offset).total_cmp(&(b.visits as f32 + visit_offset))
-        })
-        .map(|x| x.q)
-        .unwrap_or(0.0);
-    let min_q = anchor_q - 2.0 * value_cutoff;
     let weights = c
         .iter()
         .map(|x| {
-            if value_cutoff > 0.0 && value_cutoff < 1.0 && x.q < min_q {
-                0.0
-            } else {
-                (x.visits as f32 + visit_offset)
-                    .max(1e-9)
-                    .powf(temperature.max(1e-3).recip())
-            }
+            (x.visits as f32)
+                .max(1e-9)
+                .powf(temperature.max(1e-3).recip())
         })
         .collect::<Vec<_>>();
     *seed = seed.wrapping_add(0x9e3779b97f4a7c15);

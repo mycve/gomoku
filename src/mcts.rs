@@ -13,7 +13,6 @@ pub struct SearchConfig {
     pub cpuct: f32,
     pub cpuct_log: f32,
     pub cpuct_base: f32,
-    pub root_desired_per_child_visits_coeff: f32,
     pub root_dirichlet_total_concentration: f32,
     pub root_exploration_fraction: f32,
     pub root_noise_seed: u64,
@@ -28,8 +27,6 @@ pub struct SearchConfig {
     pub temperature_endgame: f32,
     pub temperature_decay_delay_plies: usize,
     pub temperature_decay_plies: usize,
-    pub temperature_value_cutoff: f32,
-    pub temperature_visit_offset: f32,
     pub opening_random_plies: usize,
     pub opening_seed: u64,
 }
@@ -40,7 +37,6 @@ impl Default for SearchConfig {
             cpuct: 1.5,
             cpuct_log: 0.45,
             cpuct_base: 500.0,
-            root_desired_per_child_visits_coeff: 2.0,
             root_dirichlet_total_concentration: 0.0,
             root_exploration_fraction: 0.0,
             root_noise_seed: 0,
@@ -55,8 +51,6 @@ impl Default for SearchConfig {
             temperature_endgame: 0.0,
             temperature_decay_delay_plies: 0,
             temperature_decay_plies: 0,
-            temperature_value_cutoff: 0.0,
-            temperature_visit_offset: 0.0,
             opening_random_plies: 0,
             opening_seed: 0,
         }
@@ -337,13 +331,7 @@ fn simulate(
             } else {
                 e.value_sum / e.visits as f32
             };
-            let desired = if idx == 0 {
-                cfg.root_desired_per_child_visits_coeff.max(0.0) * e.prior * total.sqrt()
-            } else {
-                0.0
-            };
-            let effective_visits = (e.visits as f32 - desired).max(0.0);
-            let s = q + exploration * e.prior / (1.0 + effective_visits);
+            let s = q + exploration * e.prior / (1.0 + e.visits as f32);
             if s > score {
                 score = s;
                 best = i

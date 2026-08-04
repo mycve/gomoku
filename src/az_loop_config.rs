@@ -26,13 +26,10 @@ pub struct AzLoopConfig {
     pub cpuct: f32,
     pub cpuct_log: f32,
     pub cpuct_base: f32,
-    pub root_desired_per_child_visits_coeff: f32,
     pub temperature_start: f32,
     pub temperature_endgame: f32,
     pub temperature_decay_delay_plies: usize,
     pub temperature_decay_plies: usize,
-    pub temperature_value_cutoff: f32,
-    pub temperature_visit_offset: f32,
     pub root_dirichlet_total_concentration: f32,
     pub root_exploration_fraction: f32,
     pub root_policy_temperature: f32,
@@ -64,7 +61,7 @@ pub struct AzLoopConfig {
 impl Default for AzLoopConfig {
     fn default() -> Self {
         Self {
-            format_version: 13,
+            format_version: 14,
             model_path: "model.safetensors".into(),
             ema_model_path: "ema.safetensors".into(),
             best_model_path: "best.safetensors".into(),
@@ -84,13 +81,10 @@ impl Default for AzLoopConfig {
             cpuct: 1.5,
             cpuct_log: 0.45,
             cpuct_base: 500.0,
-            root_desired_per_child_visits_coeff: 2.0,
-            temperature_start: 0.75,
-            temperature_endgame: 0.15,
-            temperature_decay_delay_plies: 0,
-            temperature_decay_plies: 12,
-            temperature_value_cutoff: 0.12,
-            temperature_visit_offset: -0.8,
+            temperature_start: 1.0,
+            temperature_endgame: 0.0,
+            temperature_decay_delay_plies: 4,
+            temperature_decay_plies: 8,
             root_dirichlet_total_concentration: 10.83,
             root_exploration_fraction: 0.25,
             root_policy_temperature: 1.1,
@@ -143,14 +137,8 @@ impl AzLoopConfig {
             ("cpuct", self.cpuct),
             ("cpuct_log", self.cpuct_log),
             ("cpuct_base", self.cpuct_base),
-            (
-                "root_desired_per_child_visits_coeff",
-                self.root_desired_per_child_visits_coeff,
-            ),
             ("temperature_start", self.temperature_start),
             ("temperature_endgame", self.temperature_endgame),
-            ("temperature_value_cutoff", self.temperature_value_cutoff),
-            ("temperature_visit_offset", self.temperature_visit_offset),
             (
                 "root_dirichlet_total_concentration",
                 self.root_dirichlet_total_concentration,
@@ -183,8 +171,8 @@ impl AzLoopConfig {
                 return Err(io::Error::other(format!("配置 `{name}` 必须是有限数值")));
             }
         }
-        if self.format_version != 13 {
-            return Err(io::Error::other("仅支持 format_version = 13"));
+        if self.format_version != 14 {
+            return Err(io::Error::other("仅支持 format_version = 14"));
         }
         if self.simulations == 0
             || self.selfplay_samples_per_update == 0
@@ -205,10 +193,8 @@ impl AzLoopConfig {
             || self.cpuct <= 0.0
             || self.cpuct_log < 0.0
             || self.cpuct_base <= 0.0
-            || self.root_desired_per_child_visits_coeff < 0.0
             || self.temperature_start < 0.0
             || self.temperature_endgame < 0.0
-            || self.temperature_value_cutoff < 0.0
             || self.root_dirichlet_total_concentration < 0.0
             || self.root_policy_temperature <= 0.0
             || self.lcb_stdevs < 0.0
@@ -252,7 +238,7 @@ impl AzLoopConfig {
     }
 }
 
-const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 13
+const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 14
 model_path = "model.safetensors"
 ema_model_path = "ema.safetensors"
 best_model_path = "best.safetensors"
@@ -272,13 +258,10 @@ batch_size = 1024
 cpuct = 1.5
 cpuct_log = 0.45
 cpuct_base = 500.0
-root_desired_per_child_visits_coeff = 2.0
-temperature_start = 0.75
-temperature_endgame = 0.15
-temperature_decay_delay_plies = 0
-temperature_decay_plies = 12
-temperature_value_cutoff = 0.12
-temperature_visit_offset = -0.8
+temperature_start = 1.0
+temperature_endgame = 0.0
+temperature_decay_delay_plies = 4
+temperature_decay_plies = 8
 root_dirichlet_total_concentration = 10.83
 root_exploration_fraction = 0.25
 root_policy_temperature = 1.1
@@ -315,7 +298,7 @@ mod tests {
     fn default_text_is_exact_and_valid() {
         let config: AzLoopConfig = toml::from_str(DEFAULT_CONFIG_TEXT).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.format_version, 13);
+        assert_eq!(config.format_version, 14);
         assert_eq!(config.batch_size, 1024);
         assert_eq!(config.selfplay_samples_per_update, 50_000);
         assert_eq!(config.selfplay_workers, 196);
