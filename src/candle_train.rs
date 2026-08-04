@@ -813,6 +813,7 @@ impl Replica {
         m.value_head_hidden2 = v[20].clone();
         m.value_head_bias2 = v[21].clone();
         m.value_head_output = v[22].clone();
+        m.refresh_local_axis_features();
         Ok(())
     }
 }

@@ -77,6 +77,7 @@ pub struct PolicyValueModel {
     pub(crate) local_axis_embedding: Vec<f32>,
     pub(crate) local_axis_scale: Vec<f32>,
     pub(crate) local_axis_bias: Vec<f32>,
+    local_axis_features: Vec<f32>,
     pub(crate) policy_local: Vec<f32>,
     pub(crate) value_head_hidden: Vec<f32>,
     pub(crate) value_local_output: Vec<f32>,
@@ -101,6 +102,9 @@ pub(crate) struct EvalScratch {
     value1: Vec<f32>,
     value2: Vec<f32>,
     policy_global: Vec<f32>,
+    local_states: Vec<u8>,
+    winning_us: Vec<bool>,
+    winning_them: Vec<bool>,
 }
 
 impl EvalScratch {
@@ -113,6 +117,17 @@ impl EvalScratch {
             value1: Vec::with_capacity(VALUE_HEAD_SIZE),
             value2: Vec::with_capacity(VALUE_HEAD_SIZE),
             policy_global: Vec::with_capacity(POLICY_HEAD_SIZE),
+            local_states: vec![0; CELL_COUNT],
+            winning_us: vec![false; CELL_COUNT],
+            winning_them: vec![false; CELL_COUNT],
+        }
+    }
+
+    pub(crate) fn is_winning_move(&self, mv: Move, opponent: bool) -> bool {
+        if opponent {
+            self.winning_them[mv.0]
+        } else {
+            self.winning_us[mv.0]
         }
     }
 }
@@ -136,7 +151,7 @@ impl PolicyValueModel {
             .map(|_| rng.weight(head_scale))
             .collect();
         let policy_bias = vec![0.0; CELL_COUNT];
-        Self {
+        let mut model = Self {
             hidden_size,
             input_hidden,
             stone_hidden: vec![0.0; STONE_TYPES * hidden_size],
@@ -158,6 +173,7 @@ impl PolicyValueModel {
                 .collect(),
             local_axis_scale: vec![1.0; 2 * LOCAL_AXIS_FEATURE_SIZE],
             local_axis_bias: vec![0.0; 2 * LOCAL_AXIS_FEATURE_SIZE],
+            local_axis_features: Vec::new(),
             policy_local: vec![0.0; LOCAL_CANDIDATE_SIZE],
             value_head_hidden: (0..hidden_size * VALUE_HEAD_SIZE)
                 .map(|_| rng.weight((2.0 / hidden_size as f32).sqrt() * 0.5))
@@ -169,7 +185,9 @@ impl PolicyValueModel {
                 .collect(),
             value_head_bias2: vec![0.0; VALUE_HEAD_SIZE],
             value_head_output: vec![0.0; VALUE_HEAD_SIZE * WDL_SIZE],
-        }
+        };
+        model.refresh_local_axis_features();
+        model
     }
 
     pub fn evaluate(&self, board: &Board) -> (Vec<(Move, f32)>, f32) {
@@ -237,8 +255,24 @@ impl PolicyValueModel {
             scratch.logits.clear();
             scratch.local_value.fill(0.0);
             scratch.local_value[LOCAL_CANDIDATE_SIZE..].fill(f32::NEG_INFINITY);
+            let us = board.to_move().stone();
+            for (state, &stone) in scratch.local_states.iter_mut().zip(board.cells()) {
+                *state = if stone == us {
+                    1
+                } else if stone == -us {
+                    2
+                } else {
+                    0
+                };
+            }
             for &mv in &moves {
-                self.local_candidate_into(board, mv, &mut scratch.local_candidate);
+                let (winning_us, winning_them) = self.local_candidate_into(
+                    &scratch.local_states,
+                    mv,
+                    &mut scratch.local_candidate,
+                );
+                scratch.winning_us[mv.0] = winning_us;
+                scratch.winning_them[mv.0] = winning_them;
                 scratch.logits.push(self.policy_logit(
                     &scratch.policy_global,
                     &scratch.local_candidate,
@@ -408,21 +442,41 @@ impl PolicyValueModel {
         }
     }
 
-    fn local_candidate_into(&self, board: &Board, mv: Move, output: &mut [f32]) {
+    fn local_candidate_into(&self, states: &[u8], mv: Move, output: &mut [f32]) -> (bool, bool) {
         output.fill(0.0);
         let (mean, max) = output.split_at_mut(LOCAL_AXIS_FEATURE_SIZE);
         max.fill(f32::NEG_INFINITY);
-        for (axis, (dr, dc)) in [(1, 0), (0, 1), (1, 1), (1, -1)].into_iter().enumerate() {
-            let (first_code, second_code) = local_ray_codes(board, mv, dr, dc);
+        let mut winning_us = false;
+        let mut winning_them = false;
+        for axis in 0..LOCAL_AXES {
+            let (first_code, second_code) = local_ray_codes_from_states(states, mv, axis);
+            winning_us |= ray_prefix(first_code, 1) + ray_prefix(second_code, 1) >= 4;
+            winning_them |= ray_prefix(first_code, 2) + ray_prefix(second_code, 2) >= 4;
             let pattern = second_code * (second_code + 1) / 2 + first_code;
-            let axis_feature = &self.local_axis_embedding
-                [pattern * LOCAL_AXIS_FEATURE_SIZE..(pattern + 1) * LOCAL_AXIS_FEATURE_SIZE];
-            let kind_offset = (axis / 2) * LOCAL_AXIS_FEATURE_SIZE;
+            let start = ((axis / 2) * LOCAL_AXIS_PATTERNS + pattern) * LOCAL_AXIS_FEATURE_SIZE;
+            let axis_feature = &self.local_axis_features[start..start + LOCAL_AXIS_FEATURE_SIZE];
             for i in 0..LOCAL_AXIS_FEATURE_SIZE {
-                let feature = axis_feature[i] * self.local_axis_scale[kind_offset + i]
-                    + self.local_axis_bias[kind_offset + i];
+                let feature = axis_feature[i];
                 mean[i] += feature / LOCAL_AXES as f32;
                 max[i] = max[i].max(feature);
+            }
+        }
+        (winning_us, winning_them)
+    }
+
+    pub(crate) fn refresh_local_axis_features(&mut self) {
+        self.local_axis_features
+            .resize(2 * LOCAL_AXIS_PATTERNS * LOCAL_AXIS_FEATURE_SIZE, 0.0);
+        for kind in 0..2 {
+            let transform = kind * LOCAL_AXIS_FEATURE_SIZE;
+            for pattern in 0..LOCAL_AXIS_PATTERNS {
+                let source = pattern * LOCAL_AXIS_FEATURE_SIZE;
+                let target = (kind * LOCAL_AXIS_PATTERNS + pattern) * LOCAL_AXIS_FEATURE_SIZE;
+                for i in 0..LOCAL_AXIS_FEATURE_SIZE {
+                    self.local_axis_features[target + i] = self.local_axis_embedding[source + i]
+                        * self.local_axis_scale[transform + i]
+                        + self.local_axis_bias[transform + i];
+                }
             }
         }
     }
@@ -599,6 +653,7 @@ impl PolicyValueModel {
             local_axis_embedding: load(&tensors, "local_axis_embedding")?,
             local_axis_scale: load(&tensors, "local_axis_scale")?,
             local_axis_bias: load(&tensors, "local_axis_bias")?,
+            local_axis_features: Vec::new(),
             policy_local: load(&tensors, "policy_local")?,
             value_head_hidden: load(&tensors, "value_head_hidden")?,
             value_local_output: load(&tensors, "value_local_output")?,
@@ -635,6 +690,8 @@ impl PolicyValueModel {
                 "五子棋模型张量尺寸错误",
             ));
         }
+        let mut model = model;
+        model.refresh_local_axis_features();
         Ok(model)
     }
 
@@ -671,6 +728,7 @@ impl PolicyValueModel {
         blend!(value_head_hidden2);
         blend!(value_head_bias2);
         blend!(value_head_output);
+        self.refresh_local_axis_features();
     }
 }
 
@@ -708,6 +766,39 @@ pub(crate) fn local_ray_codes(board: &Board, mv: Move, dr: i32, dc: i32) -> (usi
     } else {
         (rays.1, rays.0)
     }
+}
+
+fn local_ray_codes_from_states(states: &[u8], mv: Move, axis: usize) -> (usize, usize) {
+    let encode = |ray: usize| {
+        let start = ((mv.0 * LOCAL_AXES + axis) * 2 + ray) * LOCAL_RADIUS;
+        let mut code = 0_usize;
+        let mut place = 1_usize;
+        for &cell in &LOCAL_NEIGHBORS[start..start + LOCAL_RADIUS] {
+            let state = if cell == LOCAL_BOUNDARY {
+                3
+            } else {
+                states[cell as usize] as usize
+            };
+            code += state * place;
+            place *= 4;
+        }
+        code
+    };
+    let rays = (encode(0), encode(1));
+    if rays.0 <= rays.1 {
+        rays
+    } else {
+        (rays.1, rays.0)
+    }
+}
+
+fn ray_prefix(mut code: usize, state: usize) -> usize {
+    let mut count = 0;
+    while code & 3 == state {
+        count += 1;
+        code >>= 2;
+    }
+    count
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {

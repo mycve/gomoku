@@ -212,6 +212,7 @@ fn expand(
             }
         };
     }
+    let cached_tactics = !(idx == 0 && cfg.root_num_symmetries_to_sample > 1);
     let (mut policy, value) = {
         crate::scope_profile!("mcts.nn_eval");
         if idx == 0 && cfg.root_num_symmetries_to_sample > 1 {
@@ -226,7 +227,10 @@ fn expand(
         }
     };
     nodes[idx].initial_value = value;
-    let raw_priors = policy.iter().copied().collect::<HashMap<_, _>>();
+    let mut raw_priors = [0.0_f32; CELL_COUNT];
+    for &(mv, prior) in &policy {
+        raw_priors[mv.0] = prior;
+    }
     if idx == 0 {
         apply_policy_temperature(
             &mut policy,
@@ -236,7 +240,14 @@ fn expand(
     let us = nodes[idx].board.to_move();
     let winning = policy
         .iter()
-        .filter_map(|&(mv, _)| nodes[idx].board.is_winning_move(mv, us).then_some(mv))
+        .filter_map(|&(mv, _)| {
+            (if cached_tactics {
+                scratch.is_winning_move(mv, false)
+            } else {
+                nodes[idx].board.is_winning_move(mv, us)
+            })
+            .then_some(mv)
+        })
         .collect::<Vec<_>>();
     if !winning.is_empty() {
         let prior = 1.0 / winning.len() as f32;
@@ -245,10 +256,12 @@ fn expand(
         let forced_blocks = policy
             .iter()
             .filter_map(|&(mv, _)| {
-                nodes[idx]
-                    .board
-                    .is_winning_move(mv, us.other())
-                    .then_some(mv)
+                (if cached_tactics {
+                    scratch.is_winning_move(mv, true)
+                } else {
+                    nodes[idx].board.is_winning_move(mv, us.other())
+                })
+                .then_some(mv)
             })
             .collect::<Vec<_>>();
         if !forced_blocks.is_empty() {
@@ -297,7 +310,7 @@ fn expand(
             .map(|(mv, prior)| Edge {
                 mv,
                 prior,
-                raw_prior: raw_priors.get(&mv).copied().unwrap_or(0.0),
+                raw_prior: raw_priors[mv.0],
                 visits: 0,
                 value_sum: 0.0,
                 value_square_sum: 0.0,
