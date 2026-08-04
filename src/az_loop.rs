@@ -550,6 +550,23 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             progress.update,
         );
         tb.add_scalar(
+            "selfplay/balanced_opening_average_plies",
+            event.batch.stats.balanced_opening_plies as f32
+                / event.batch.stats.balanced_opening_games.max(1) as f32,
+            progress.update,
+        );
+        tb.add_scalar(
+            "selfplay/policy_opening_average_plies",
+            event.batch.stats.policy_opening_plies as f32 / games,
+            progress.update,
+        );
+        tb.add_scalar(
+            "selfplay/final_opening_abs_value",
+            event.batch.stats.final_opening_abs_value_sum
+                / event.batch.stats.random_opening_games.max(1) as f32,
+            progress.update,
+        );
+        tb.add_scalar(
             "selfplay/black_win_rate",
             event.batch.stats.black_wins as f32 / games,
             progress.update,
@@ -855,17 +872,21 @@ fn print_event(
         event.batch.stats.plies as f32 / event.batch.games.max(1) as f32
     );
     println!(
-        "opening  : randomized={}/{} rate={:.1}% plies={} balanced={}/{} attempts={:.2} abs_v={:.3}",
+        "opening  : randomized={}/{} rate={:.1}% shape/policy={:.2}/{:.2} balanced={}/{} attempts={:.2} abs_v={:.3}->{:.3}",
         event.batch.stats.random_opening_games,
         event.batch.games,
         event.batch.stats.random_opening_games as f32 * 100.0 / event.batch.games.max(1) as f32,
-        event.batch.stats.random_opening_plies,
+        event.batch.stats.balanced_opening_plies as f32
+            / event.batch.stats.balanced_opening_games.max(1) as f32,
+        event.batch.stats.policy_opening_plies as f32 / event.batch.games.max(1) as f32,
         event.batch.stats.balanced_opening_games,
         event.batch.games,
         event.batch.stats.balanced_opening_attempts as f32
             / event.batch.stats.balanced_opening_games.max(1) as f32,
         event.batch.stats.balanced_opening_abs_value_sum
-            / event.batch.stats.balanced_opening_games.max(1) as f32
+            / event.batch.stats.balanced_opening_games.max(1) as f32,
+        event.batch.stats.final_opening_abs_value_sum
+            / event.batch.stats.random_opening_games.max(1) as f32
     );
     println!(
         "search   : avg_sims={:.1} entropy={:.3} visited={:.1} surprise={:.3}/{:.3}",

@@ -31,8 +31,11 @@ pub struct SelfplayStats {
     pub random_opening_games: usize,
     pub random_opening_plies: usize,
     pub balanced_opening_games: usize,
+    pub balanced_opening_plies: usize,
     pub balanced_opening_attempts: usize,
     pub balanced_opening_abs_value_sum: f32,
+    pub policy_opening_plies: usize,
+    pub final_opening_abs_value_sum: f32,
     pub searches: usize,
     pub simulations: usize,
     pub entropy_sum: f32,
@@ -59,8 +62,11 @@ impl SelfplayStats {
         self.random_opening_games += other.random_opening_games;
         self.random_opening_plies += other.random_opening_plies;
         self.balanced_opening_games += other.balanced_opening_games;
+        self.balanced_opening_plies += other.balanced_opening_plies;
         self.balanced_opening_attempts += other.balanced_opening_attempts;
         self.balanced_opening_abs_value_sum += other.balanced_opening_abs_value_sum;
+        self.policy_opening_plies += other.policy_opening_plies;
+        self.final_opening_abs_value_sum += other.final_opening_abs_value_sum;
         self.searches += other.searches;
         self.simulations += other.simulations;
         self.entropy_sum += other.entropy_sum;
@@ -106,8 +112,10 @@ pub fn generate_one_detailed_controlled(
         model,
         cfg.balanced_opening_probability,
         &mut seed,
+        stop,
     );
     stats.balanced_opening_games = usize::from(balanced.plies > 0);
+    stats.balanced_opening_plies = balanced.plies;
     stats.balanced_opening_attempts = balanced.attempts;
     stats.balanced_opening_abs_value_sum = balanced.abs_value;
     let policy_plies = apply_policy_opening(
@@ -119,8 +127,12 @@ pub fn generate_one_detailed_controlled(
         &mut seed,
     );
     let opening_plies = balanced.plies + policy_plies;
+    stats.policy_opening_plies = policy_plies;
     stats.random_opening_games = usize::from(opening_plies > 0);
     stats.random_opening_plies = opening_plies;
+    if opening_plies > 0 && board.outcome().is_none() {
+        stats.final_opening_abs_value_sum = model.evaluate(&board).1.abs();
+    }
     let asymmetric = random_unit(&mut seed) < cfg.asymmetric_playout_prob.clamp(0.0, 1.0);
     let strong_player = if random_index(&mut seed, 2) == 0 {
         crate::game::Player::Black
@@ -262,10 +274,13 @@ fn apply_policy_opening(
     temperature: f32,
     seed: &mut u64,
 ) -> usize {
-    if avg_plies == 0 || probability <= 0.0 || random_unit(seed) >= probability.min(1.0) {
+    if avg_plies == 0
+        || probability <= 0.0
+        || (probability < 1.0 && random_unit(seed) >= probability)
+    {
         return 0;
     }
-    let max_plies = avg_plies.saturating_mul(3).max(1);
+    let max_plies = sample_policy_opening_plies(board.move_count(), avg_plies, seed);
     let mut played = 0;
     for _ in 0..max_plies {
         if board.outcome().is_some() {
@@ -280,16 +295,22 @@ fn apply_policy_opening(
             .iter()
             .map(|(_, probability)| probability.max(1e-12).powf(inverse_temperature))
             .collect::<Vec<_>>();
-        let mv = sample_weighted_moves(&policy, &weights, seed);
+        let mv = if random_unit(seed) < 0.0002 {
+            policy[random_index(seed, policy.len())].0
+        } else {
+            sample_weighted_moves(&policy, &weights, seed)
+        };
         if !board.play(mv) {
             break;
         }
         played += 1;
-        if random_unit(seed) < 1.0 / avg_plies as f32 {
-            break;
-        }
     }
     played
+}
+
+fn sample_policy_opening_plies(existing_plies: usize, avg_plies: usize, seed: &mut u64) -> usize {
+    let sampled = (-random_unit(seed).max(1e-12).ln() * avg_plies as f32).floor() as usize;
+    sampled.saturating_sub(existing_plies.saturating_mul(2))
 }
 
 #[derive(Default)]
@@ -304,87 +325,123 @@ fn apply_balanced_opening(
     model: &PolicyValueModel,
     probability: f32,
     seed: &mut u64,
+    stop: Option<&AtomicBool>,
 ) -> BalancedOpening {
-    const PLY_WEIGHTS: [f32; 10] = [10.0, 30.0, 50.0, 80.0, 60.0, 40.0, 20.0, 10.0, 5.0, 1.0];
-    const MAX_ATTEMPTS: usize = 20;
+    const PLY_WEIGHTS: [f32; 12] = [
+        10.0, 30.0, 50.0, 80.0, 60.0, 40.0, 20.0, 10.0, 5.0, 1.0, 0.0, 0.0,
+    ];
     if board.move_count() != 0 || probability <= 0.0 || random_unit(seed) >= probability.min(1.0) {
         return BalancedOpening::default();
     }
 
-    let mut fallback = None;
-    for attempt in 1..=MAX_ATTEMPTS {
+    let mut attempts = 0;
+    let mut attempts_at_strictness = 0;
+    let mut reject_probability = 0.995;
+    loop {
+        if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return BalancedOpening::default();
+        }
+        attempts += 1;
         let mut candidate = Board::new();
         let random_plies = sample_weighted_index(&PLY_WEIGHTS, seed);
+        let average_distance = -random_unit(seed).max(1e-12).ln() * 0.8;
         for _ in 0..random_plies {
             let legal = candidate.rule_legal_moves();
             if legal.is_empty() {
                 break;
             }
-            let weights = nearby_move_weights(&candidate, &legal, seed);
-            candidate.play(legal[sample_weighted_index(&weights, seed)]);
+            let mv = if candidate.move_count() == 0 {
+                sample_centered_first_move(seed)
+            } else {
+                let weights = nearby_move_weights(&candidate, &legal, average_distance);
+                legal[sample_weighted_index(&weights, seed)]
+            };
+            candidate.play(mv);
         }
-        if candidate.outcome().is_some() {
-            continue;
+        if candidate.outcome().is_none()
+            && let Some((mv, abs_value)) =
+                select_balancing_move(&candidate, model, reject_probability, seed, stop)
+        {
+            candidate.play(mv);
+            if candidate.outcome().is_none() {
+                *board = candidate;
+                return BalancedOpening {
+                    plies: board.move_count(),
+                    attempts,
+                    abs_value,
+                };
+            }
         }
+        attempts_at_strictness += 1;
+        if attempts_at_strictness > 20 {
+            attempts_at_strictness = 0;
+            reject_probability = 0.8;
+        }
+    }
+}
 
-        let legal = candidate.rule_legal_moves();
-        let mut weights = Vec::with_capacity(legal.len());
-        let mut values = Vec::with_capacity(legal.len());
-        for &mv in &legal {
-            let mut child = candidate.clone();
-            child.play(mv);
-            let (_, value) = model.evaluate(&child);
-            let value = value.clamp(-1.0, 1.0);
-            values.push(value);
-            weights.push(balance_weight(value));
+fn select_balancing_move(
+    board: &Board,
+    model: &PolicyValueModel,
+    reject_probability: f32,
+    seed: &mut u64,
+    stop: Option<&AtomicBool>,
+) -> Option<(Move, f32)> {
+    let root_value = model.evaluate(board).1.clamp(-1.0, 1.0);
+    for value in [root_value, -root_value] {
+        if value < 0.0 {
+            let reject_factor = 1.0 - (-3.0 * value * value).exp();
+            if random_unit(seed) < reject_factor && random_unit(seed) < reject_probability {
+                return None;
+            }
         }
-        if legal.is_empty() {
+    }
+    let only_nearby = -root_value > 0.0 && board.move_count() > 0;
+    let mut moves = Vec::new();
+    let mut values = Vec::new();
+    let mut weights = Vec::new();
+    for mv in board.rule_legal_moves() {
+        if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return None;
+        }
+        if only_nearby && !has_stone_within_three(board, mv) {
             continue;
         }
-        let best_weight = weights.iter().copied().fold(0.0_f32, f32::max);
-        let selected = sample_weighted_index(&weights, seed);
-        candidate.play(legal[selected]);
-        let result = BalancedOpening {
-            plies: candidate.move_count(),
-            attempts: attempt,
-            abs_value: values[selected].abs(),
-        };
-        fallback = Some((candidate.clone(), result));
-        let accept_probability = 0.005 + 0.995 * best_weight;
-        if attempt == MAX_ATTEMPTS || random_unit(seed) < accept_probability {
-            *board = candidate;
-            return fallback.expect("刚刚写入平衡开局").1;
+        let mut child = board.clone();
+        child.play(mv);
+        if child.outcome().is_some() {
+            continue;
         }
+        let value = model.evaluate(&child).1.clamp(-1.0, 1.0);
+        moves.push(mv);
+        values.push(value);
+        weights.push(balance_weight(value));
     }
-    if let Some((candidate, result)) = fallback {
-        *board = candidate;
-        result
-    } else {
-        BalancedOpening::default()
+    let max_weight = weights.iter().copied().fold(0.0_f32, f32::max);
+    if weights.is_empty()
+        || (random_unit(seed) < 1.0 - max_weight && random_unit(seed) < reject_probability)
+    {
+        return None;
     }
+    let selected = sample_weighted_index(&weights, seed);
+    Some((moves[selected], values[selected].abs()))
 }
 
 fn balance_weight(value: f32) -> f32 {
     (1.0 - value.clamp(-1.0, 1.0).powi(2)).max(0.0).powi(4)
 }
 
-fn nearby_move_weights(board: &Board, legal: &[Move], seed: &mut u64) -> Vec<f32> {
+fn nearby_move_weights(board: &Board, legal: &[Move], average_distance: f32) -> Vec<f32> {
     let center = (BOARD_SIZE as f32 - 1.0) * 0.5;
-    if board.move_count() == 0 {
-        return legal
-            .iter()
-            .map(|mv| {
-                let distance2 =
-                    (mv.row() as f32 - center).powi(2) + (mv.col() as f32 - center).powi(2);
-                (-distance2 / 18.0).exp()
-            })
-            .collect();
-    }
-    let scale2 = (-random_unit(seed).max(1e-6).ln() * 0.8).powi(2).max(0.04);
+    let half_board = center.max(0.5);
     legal
         .iter()
         .map(|mv| {
-            let proximity = board
+            let distance_from_center = (mv.row() as f32 - center)
+                .abs()
+                .max((mv.col() as f32 - center).abs());
+            let middle_bonus = 1.5 * (half_board - distance_from_center) / half_board;
+            board
                 .cells()
                 .iter()
                 .enumerate()
@@ -393,15 +450,41 @@ fn nearby_move_weights(board: &Board, legal: &[Move], seed: &mut u64) -> Vec<f32
                     let other = Move(index);
                     let distance2 = (mv.row() as f32 - other.row() as f32).powi(2)
                         + (mv.col() as f32 - other.col() as f32).powi(2);
-                    (distance2 + scale2).powi(-2)
+                    (1.0 + middle_bonus)
+                        * (distance2 + average_distance * average_distance).powi(-2)
                 })
-                .sum::<f32>();
-            let middle_bonus =
-                (-((mv.row() as f32 - center).powi(2) + (mv.col() as f32 - center).powi(2)) / 32.0)
-                    .exp();
-            proximity * (1.0 + middle_bonus)
+                .sum()
         })
         .collect()
+}
+
+fn sample_centered_first_move(seed: &mut u64) -> Move {
+    let center = (BOARD_SIZE as f32 - 1.0) * 0.5;
+    let limit = 1.5 * 0.999;
+    let coordinate = |seed: &mut u64| {
+        (truncated_gaussian(seed, limit) / 3.0 * BOARD_SIZE as f32 + center)
+            .round()
+            .clamp(0.0, (BOARD_SIZE - 1) as f32) as usize
+    };
+    Move::new(coordinate(seed), coordinate(seed)).expect("截断高斯采样必须位于棋盘内")
+}
+
+fn truncated_gaussian(seed: &mut u64, limit: f32) -> f32 {
+    loop {
+        let radius = (-2.0 * random_unit(seed).max(1e-12).ln()).sqrt();
+        let value = radius * (std::f32::consts::TAU * random_unit(seed)).cos();
+        if value.abs() <= limit {
+            return value;
+        }
+    }
+}
+
+fn has_stone_within_three(board: &Board, mv: Move) -> bool {
+    board.cells().iter().enumerate().any(|(index, &stone)| {
+        stone != 0
+            && mv.row().abs_diff(index / BOARD_SIZE) <= 3
+            && mv.col().abs_diff(index % BOARD_SIZE) <= 3
+    })
 }
 
 fn sample_weighted_index(weights: &[f32], seed: &mut u64) -> usize {
@@ -799,7 +882,7 @@ mod tests {
         let model = PolicyValueModel::random(8, 9);
         let mut first = Board::new();
         let mut first_seed = 17;
-        let first_result = apply_balanced_opening(&mut first, &model, 1.0, &mut first_seed);
+        let first_result = apply_balanced_opening(&mut first, &model, 1.0, &mut first_seed, None);
         assert!((1..=10).contains(&first_result.plies));
         assert!((1..=20).contains(&first_result.attempts));
         assert!(first_result.abs_value.is_finite());
@@ -808,7 +891,8 @@ mod tests {
 
         let mut second = Board::new();
         let mut second_seed = 17;
-        let second_result = apply_balanced_opening(&mut second, &model, 1.0, &mut second_seed);
+        let second_result =
+            apply_balanced_opening(&mut second, &model, 1.0, &mut second_seed, None);
         assert_eq!(first.cells(), second.cells());
         assert_eq!(first_result.plies, second_result.plies);
         assert_eq!(first_result.attempts, second_result.attempts);
@@ -831,6 +915,35 @@ mod tests {
             plies
         );
         assert_eq!(first.cells(), second.cells());
+    }
+
+    #[test]
+    fn policy_opening_length_deducts_twice_existing_plies() {
+        let mut empty_seed = 123;
+        let empty_plies = sample_policy_opening_plies(0, 6, &mut empty_seed);
+        let mut started_seed = 123;
+        let started_plies = sample_policy_opening_plies(3, 6, &mut started_seed);
+        assert_eq!(started_plies, empty_plies.saturating_sub(6));
+    }
+
+    #[test]
+    fn balanced_opening_honors_stop_before_evaluation() {
+        let model = PolicyValueModel::random(8, 9);
+        let mut board = Board::new();
+        let mut seed = 17;
+        let stop = AtomicBool::new(true);
+        let result = apply_balanced_opening(&mut board, &model, 1.0, &mut seed, Some(&stop));
+        assert_eq!(result.plies, 0);
+        assert_eq!(result.attempts, 0);
+        assert_eq!(board.move_count(), 0);
+    }
+
+    #[test]
+    fn nearby_filter_uses_chebyshev_radius_three() {
+        let board =
+            Board::from_stones(&[(Move::new(7, 7).unwrap(), crate::game::Player::Black)]).unwrap();
+        assert!(has_stone_within_three(&board, Move::new(4, 10).unwrap()));
+        assert!(!has_stone_within_three(&board, Move::new(3, 7).unwrap()));
     }
 
     #[test]
