@@ -1,6 +1,6 @@
 use crate::{
     game::{BOARD_SIZE, Board, Move, Player},
-    mcts::{SearchConfig, search, search_timed},
+    mcts::{SearchConfig, search_timed},
     model::PolicyValueModel,
 };
 use std::{
@@ -75,6 +75,8 @@ pub fn run(model: &PolicyValueModel, config: GomocupConfig) -> io::Result<()> {
                 respond(&mut output, "OK")?;
             }
             "BEGIN" => {
+                board = Board::new();
+                stones.clear();
                 play_and_respond(&mut board, &mut stones, model, &config, limits, &mut output)?
             }
             "TURN" => {
@@ -91,7 +93,6 @@ pub fn run(model: &PolicyValueModel, config: GomocupConfig) -> io::Result<()> {
                 play_and_respond(&mut board, &mut stones, model, &config, limits, &mut output)?;
             }
             "BOARD" => {
-                stones.clear();
                 let mut entries = Vec::new();
                 let mut invalid_entry = false;
                 loop {
@@ -138,21 +139,25 @@ pub fn run(model: &PolicyValueModel, config: GomocupConfig) -> io::Result<()> {
                     respond(&mut output, "ERROR invalid board")?;
                     continue;
                 };
-                stones.extend(entries.into_iter().map(|(mv, field)| {
-                    (
-                        mv,
-                        if field == 1 {
-                            own_player
-                        } else {
-                            own_player.other()
-                        },
-                    )
-                }));
-                let Some(restored) = Board::from_stones(&stones) else {
+                let restored_stones = entries
+                    .into_iter()
+                    .map(|(mv, field)| {
+                        (
+                            mv,
+                            if field == 1 {
+                                own_player
+                            } else {
+                                own_player.other()
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let Some(restored) = Board::from_stones(&restored_stones) else {
                     respond(&mut output, "ERROR invalid board")?;
                     continue;
                 };
                 board = restored;
+                stones = restored_stones;
                 play_and_respond(&mut board, &mut stones, model, &config, limits, &mut output)?;
             }
             "TAKEBACK" => {
@@ -219,19 +224,18 @@ fn play_and_respond(
         limits.timeout_turn_ms,
         limits.time_left_ms,
         board.move_count(),
-    );
+    )?;
     let search_config = SearchConfig {
-        simulations: if budget_ms == 0 { 1 } else { usize::MAX },
+        simulations: usize::MAX,
         cpuct: config.cpuct,
+        policy_softmax_temp: 1.0,
+        root_policy_temperature_early: 1.0,
+        root_policy_temperature: 1.0,
         ..Default::default()
     };
-    let result = if budget_ms == 0 {
-        search(board, model, search_config)
-    } else {
-        let safety_ms = (budget_ms / 20).clamp(5, 100);
-        let limit = Duration::from_millis(budget_ms.saturating_sub(safety_ms).max(1));
-        search_timed(board, model, search_config, limit)
-    };
+    let safety_ms = (budget_ms / 20).clamp(5, 100);
+    let limit = Duration::from_millis(budget_ms.saturating_sub(safety_ms).max(1));
+    let result = search_timed(board, model, search_config, limit);
     let Some(best) = result.first() else {
         return respond(output, "ERROR no legal move");
     };
@@ -242,20 +246,24 @@ fn play_and_respond(
     respond(output, &format!("{},{}", mv.col(), mv.row()))
 }
 
-fn turn_budget_ms(timeout_turn_ms: u64, time_left_ms: Option<u64>, move_count: usize) -> u64 {
+fn turn_budget_ms(
+    timeout_turn_ms: u64,
+    time_left_ms: Option<u64>,
+    move_count: usize,
+) -> io::Result<u64> {
     if timeout_turn_ms == 0 {
-        return 0;
+        return Err(io::Error::other("协议提供的 timeout_turn 必须大于 0"));
     }
     let Some(time_left_ms) = time_left_ms else {
-        return timeout_turn_ms;
+        return Ok(timeout_turn_ms);
     };
     if time_left_ms == 0 {
-        return 0;
+        return Err(io::Error::other("协议提供的 time_left 必须大于 0"));
     }
     let remaining_own_turns =
         ((crate::game::CELL_COUNT - move_count).saturating_add(1) / 2).clamp(1, 20) as u64;
     let match_budget = time_left_ms.saturating_sub(100).max(1) / remaining_own_turns;
-    timeout_turn_ms.min(match_budget.max(1))
+    Ok(timeout_turn_ms.min(match_budget.max(1)))
 }
 
 fn parse_move(text: &str) -> Option<Move> {
@@ -283,9 +291,9 @@ mod tests {
 
     #[test]
     fn turn_budget_respects_turn_and_match_limits() {
-        assert_eq!(turn_budget_ms(0, Some(10_000), 0), 0);
-        assert_eq!(turn_budget_ms(5_000, None, 0), 5_000);
-        assert!(turn_budget_ms(5_000, Some(10_000), 0) < 5_000);
-        assert_eq!(turn_budget_ms(5_000, Some(0), 0), 0);
+        assert!(turn_budget_ms(0, Some(10_000), 0).is_err());
+        assert_eq!(turn_budget_ms(5_000, None, 0).unwrap(), 5_000);
+        assert!(turn_budget_ms(5_000, Some(10_000), 0).unwrap() < 5_000);
+        assert!(turn_budget_ms(5_000, Some(0), 0).is_err());
     }
 }
