@@ -448,19 +448,16 @@ impl PolicyValueModel {
         max.fill(f32::NEG_INFINITY);
         let mut winning_us = false;
         let mut winning_them = false;
+        let mut feature_starts = [0; LOCAL_AXES];
         for axis in 0..LOCAL_AXES {
             let (first_code, second_code) = local_ray_codes_from_states(states, mv, axis);
             winning_us |= ray_prefix(first_code, 1) + ray_prefix(second_code, 1) >= 4;
             winning_them |= ray_prefix(first_code, 2) + ray_prefix(second_code, 2) >= 4;
             let pattern = second_code * (second_code + 1) / 2 + first_code;
-            let start = ((axis / 2) * LOCAL_AXIS_PATTERNS + pattern) * LOCAL_AXIS_FEATURE_SIZE;
-            let axis_feature = &self.local_axis_features[start..start + LOCAL_AXIS_FEATURE_SIZE];
-            for i in 0..LOCAL_AXIS_FEATURE_SIZE {
-                let feature = axis_feature[i];
-                mean[i] += feature / LOCAL_AXES as f32;
-                max[i] = max[i].max(feature);
-            }
+            feature_starts[axis] =
+                ((axis / 2) * LOCAL_AXIS_PATTERNS + pattern) * LOCAL_AXIS_FEATURE_SIZE;
         }
+        aggregate_axis_features(&self.local_axis_features, feature_starts, mean, max);
         (winning_us, winning_them)
     }
 
@@ -801,6 +798,54 @@ fn ray_prefix(mut code: usize, state: usize) -> usize {
     count
 }
 
+#[inline(always)]
+fn aggregate_axis_features(
+    features: &[f32],
+    starts: [usize; LOCAL_AXES],
+    mean: &mut [f32],
+    max: &mut [f32],
+) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        unsafe {
+            aggregate_axis_features_avx2(features, starts, mean, max);
+        }
+        return;
+    }
+    for start in starts {
+        let axis = &features[start..start + LOCAL_AXIS_FEATURE_SIZE];
+        for i in 0..LOCAL_AXIS_FEATURE_SIZE {
+            mean[i] += axis[i] / LOCAL_AXES as f32;
+            max[i] = max[i].max(axis[i]);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn aggregate_axis_features_avx2(
+    features: &[f32],
+    starts: [usize; LOCAL_AXES],
+    mean: &mut [f32],
+    max: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    let quarter = _mm256_set1_ps(1.0 / LOCAL_AXES as f32);
+    for offset in (0..LOCAL_AXIS_FEATURE_SIZE).step_by(8) {
+        let mut sum = _mm256_setzero_ps();
+        let mut maximum = _mm256_set1_ps(f32::NEG_INFINITY);
+        for start in starts {
+            let value = unsafe { _mm256_loadu_ps(features.as_ptr().add(start + offset)) };
+            sum = _mm256_add_ps(sum, _mm256_mul_ps(value, quarter));
+            maximum = _mm256_max_ps(maximum, value);
+        }
+        unsafe {
+            _mm256_storeu_ps(mean.as_mut_ptr().add(offset), sum);
+            _mm256_storeu_ps(max.as_mut_ptr().add(offset), maximum);
+        }
+    }
+}
+
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     #[cfg(target_arch = "aarch64")]
@@ -1016,6 +1061,33 @@ impl SplitMix64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simd_axis_aggregation_matches_scalar_formula() {
+        let features = (0..LOCAL_AXES * LOCAL_AXIS_FEATURE_SIZE)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 17.0)
+            .collect::<Vec<_>>();
+        let starts = [
+            0,
+            LOCAL_AXIS_FEATURE_SIZE,
+            LOCAL_AXIS_FEATURE_SIZE * 2,
+            LOCAL_AXIS_FEATURE_SIZE * 3,
+        ];
+        let mut mean = vec![0.0; LOCAL_AXIS_FEATURE_SIZE];
+        let mut max = vec![f32::NEG_INFINITY; LOCAL_AXIS_FEATURE_SIZE];
+        aggregate_axis_features(&features, starts, &mut mean, &mut max);
+        for i in 0..LOCAL_AXIS_FEATURE_SIZE {
+            let mut expected_mean = 0.0;
+            let mut expected_max = f32::NEG_INFINITY;
+            for start in starts {
+                let value = features[start + i];
+                expected_mean += value / LOCAL_AXES as f32;
+                expected_max = expected_max.max(value);
+            }
+            assert!((mean[i] - expected_mean).abs() < 1.0e-6);
+            assert_eq!(max[i], expected_max);
+        }
+    }
 
     #[test]
     fn ema_blends_every_parameter_group() {
