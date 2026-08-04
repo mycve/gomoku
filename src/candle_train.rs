@@ -669,9 +669,7 @@ impl Replica {
             .map_err(err)?;
         let local_mean = local_axes.mean(2).map_err(err)?;
         let local_max = local_axes.max(2).map_err(err)?;
-        let local_mean_square = local_mean.sqr().map_err(err)?;
-        let local_candidates =
-            Tensor::cat(&[&local_mean, &local_max, &local_mean_square], 2).map_err(err)?;
+        let local_candidates = Tensor::cat(&[&local_mean, &local_max], 2).map_err(err)?;
         let local_policy_logits = local_candidates
             .reshape((b * CELL_COUNT, LOCAL_CANDIDATE_SIZE))
             .and_then(|x| {

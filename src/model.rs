@@ -15,10 +15,10 @@ pub const LOCAL_RADIUS: usize = 4;
 pub const LOCAL_RAY_PATTERNS: usize = 4usize.pow(LOCAL_RADIUS as u32);
 pub const LOCAL_AXIS_PATTERNS: usize = LOCAL_RAY_PATTERNS * (LOCAL_RAY_PATTERNS + 1) / 2;
 pub const LOCAL_AXIS_FEATURE_SIZE: usize = 32;
-pub const LOCAL_CANDIDATE_SIZE: usize = LOCAL_AXIS_FEATURE_SIZE * 3;
+pub const LOCAL_CANDIDATE_SIZE: usize = LOCAL_AXIS_FEATURE_SIZE * 2;
 pub const VALUE_LOCAL_SIZE: usize = LOCAL_CANDIDATE_SIZE * 2;
 pub const POLICY_HEAD_SIZE: usize = 64;
-const FORMAT_VERSION: f32 = 20.0;
+const FORMAT_VERSION: f32 = 21.0;
 const LOCAL_BOUNDARY: u8 = u8::MAX;
 const LOCAL_NEIGHBORS: [u8; CELL_COUNT * LOCAL_AXES * 2 * LOCAL_RADIUS] = build_local_neighbors();
 
@@ -410,8 +410,7 @@ impl PolicyValueModel {
 
     fn local_candidate_into(&self, board: &Board, mv: Move, output: &mut [f32]) {
         output.fill(0.0);
-        let (mean, rest) = output.split_at_mut(LOCAL_AXIS_FEATURE_SIZE);
-        let (max, mean_square) = rest.split_at_mut(LOCAL_AXIS_FEATURE_SIZE);
+        let (mean, max) = output.split_at_mut(LOCAL_AXIS_FEATURE_SIZE);
         max.fill(f32::NEG_INFINITY);
         for (axis, (dr, dc)) in [(1, 0), (0, 1), (1, 1), (1, -1)].into_iter().enumerate() {
             let (first_code, second_code) = local_ray_codes(board, mv, dr, dc);
@@ -425,9 +424,6 @@ impl PolicyValueModel {
                 mean[i] += feature / LOCAL_AXES as f32;
                 max[i] = max[i].max(feature);
             }
-        }
-        for i in 0..LOCAL_AXIS_FEATURE_SIZE {
-            mean_square[i] = mean[i] * mean[i];
         }
     }
 
