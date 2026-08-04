@@ -52,8 +52,6 @@ pub struct AzLoopConfig {
     pub early_fork_game_prob: f32,
     pub early_fork_max_ply: usize,
     pub early_fork_max_choices: usize,
-    pub asymmetric_playout_prob: f32,
-    pub max_asymmetric_ratio: f32,
     pub ema_decay: f32,
     pub replay_capacity: usize,
     pub replay_warmup_samples: usize,
@@ -67,7 +65,6 @@ pub struct AzLoopConfig {
     pub max_checkpoints: usize,
     pub arena_interval: usize,
     pub arena_games: usize,
-    pub arena_simulations: usize,
     pub arena_opening_plies: usize,
     pub arena_promotion_rate: f32,
     pub arena_promotion_confidence_z: f32,
@@ -77,7 +74,7 @@ pub struct AzLoopConfig {
 impl Default for AzLoopConfig {
     fn default() -> Self {
         Self {
-            format_version: 9,
+            format_version: 11,
             model_path: "model.safetensors".into(),
             ema_model_path: "ema.safetensors".into(),
             best_model_path: "best.safetensors".into(),
@@ -97,7 +94,7 @@ impl Default for AzLoopConfig {
             learning_rate_warmup_steps: 200,
             learning_rate_cosine_steps: 10_000,
             batch_epochs: 1,
-            batch_size: 256,
+            batch_size: 1024,
             cpuct: 1.5,
             cpuct_log: 0.45,
             cpuct_base: 500.0,
@@ -123,8 +120,6 @@ impl Default for AzLoopConfig {
             early_fork_game_prob: 0.04,
             early_fork_max_ply: 8,
             early_fork_max_choices: 12,
-            asymmetric_playout_prob: 0.1,
-            max_asymmetric_ratio: 4.0,
             ema_decay: 0.999,
             replay_capacity: 500_000,
             replay_warmup_samples: 100_000,
@@ -138,7 +133,6 @@ impl Default for AzLoopConfig {
             max_checkpoints: 20,
             arena_interval: 10,
             arena_games: 100,
-            arena_simulations: 3000,
             arena_opening_plies: 2,
             arena_promotion_rate: 0.55,
             arena_promotion_confidence_z: 1.28,
@@ -207,8 +201,6 @@ impl AzLoopConfig {
             ("lcb_stdevs", self.lcb_stdevs),
             ("min_visit_prop_for_lcb", self.min_visit_prop_for_lcb),
             ("early_fork_game_prob", self.early_fork_game_prob),
-            ("asymmetric_playout_prob", self.asymmetric_playout_prob),
-            ("max_asymmetric_ratio", self.max_asymmetric_ratio),
             ("ema_decay", self.ema_decay),
             ("arena_promotion_rate", self.arena_promotion_rate),
             (
@@ -233,8 +225,8 @@ impl AzLoopConfig {
                 return Err(io::Error::other(format!("配置 `{name}` 必须是有限数值")));
             }
         }
-        if self.format_version != 9 {
-            return Err(io::Error::other("仅支持 format_version = 9"));
+        if self.format_version != 11 {
+            return Err(io::Error::other("仅支持 format_version = 11"));
         }
         if self.simulations == 0
             || self.selfplay_samples_per_update == 0
@@ -268,8 +260,6 @@ impl AzLoopConfig {
             || self.lcb_stdevs < 0.0
             || !(0.0..=1.0).contains(&self.min_visit_prop_for_lcb)
             || !(0.0..=1.0).contains(&self.early_fork_game_prob)
-            || !(0.0..=1.0).contains(&self.asymmetric_playout_prob)
-            || self.max_asymmetric_ratio < 1.0
             || !(0.0..=1.0).contains(&self.root_exploration_fraction)
             || !(0.0..=1.0).contains(&self.ema_decay)
             || !(0.0..=1.0).contains(&self.arena_promotion_rate)
@@ -284,10 +274,8 @@ impl AzLoopConfig {
                 "配置中的学习率、搜索或比例参数超出合法范围",
             ));
         }
-        if self.arena_interval > 0 && (self.arena_games == 0 || self.arena_simulations == 0) {
-            return Err(io::Error::other(
-                "启用 Arena 时 arena_games 和 arena_simulations 必须大于 0",
-            ));
+        if self.arena_interval > 0 && self.arena_games == 0 {
+            return Err(io::Error::other("启用 Arena 时 arena_games 必须大于 0"));
         }
         if self.replay_warmup_samples > self.replay_capacity {
             return Err(io::Error::other(
@@ -320,7 +308,7 @@ impl AzLoopConfig {
     }
 }
 
-const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 9
+const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 11
 model_path = "model.safetensors"
 ema_model_path = "ema.safetensors"
 best_model_path = "best.safetensors"
@@ -340,7 +328,7 @@ learning_rate_min = 0.0001
 learning_rate_warmup_steps = 200
 learning_rate_cosine_steps = 10000
 batch_epochs = 1
-batch_size = 256
+batch_size = 1024
 cpuct = 1.5
 cpuct_log = 0.45
 cpuct_base = 500.0
@@ -366,8 +354,6 @@ min_visit_prop_for_lcb = 0.15
 early_fork_game_prob = 0.04
 early_fork_max_ply = 8
 early_fork_max_choices = 12
-asymmetric_playout_prob = 0.1
-max_asymmetric_ratio = 4.0
 ema_decay = 0.999
 replay_capacity = 500000
 replay_warmup_samples = 100000
@@ -381,7 +367,6 @@ checkpoint_dir = "checkpoints"
 max_checkpoints = 20
 arena_interval = 10
 arena_games = 100
-arena_simulations = 3000
 arena_opening_plies = 2
 arena_promotion_rate = 0.550000011920929
 arena_promotion_confidence_z = 1.2799999713897705
@@ -396,7 +381,8 @@ mod tests {
     fn default_text_is_exact_and_valid() {
         let config: AzLoopConfig = toml::from_str(DEFAULT_CONFIG_TEXT).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.format_version, 9);
+        assert_eq!(config.format_version, 11);
+        assert_eq!(config.batch_size, 1024);
         assert_eq!(config.selfplay_samples_per_update, 50_000);
         assert_eq!(config.selfplay_workers, 196);
         assert_eq!(config.selfplay_balanced_opening_probability, 0.99);

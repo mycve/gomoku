@@ -31,6 +31,7 @@ pub struct SelfplayStats {
     pub random_opening_games: usize,
     pub random_opening_plies: usize,
     pub balanced_opening_games: usize,
+    pub balanced_opening_target_games: usize,
     pub balanced_opening_plies: usize,
     pub balanced_opening_attempts: usize,
     pub balanced_opening_abs_value_sum: f32,
@@ -47,6 +48,14 @@ pub struct SelfplayStats {
     pub sampled_q_gap_sum: f32,
     pub policy_surprise_sum: f32,
     pub value_surprise_sum: f32,
+    pub black_searches: usize,
+    pub white_searches: usize,
+    pub black_entropy_sum: f32,
+    pub white_entropy_sum: f32,
+    pub black_policy_surprise_sum: f32,
+    pub white_policy_surprise_sum: f32,
+    pub black_value_surprise_sum: f32,
+    pub white_value_surprise_sum: f32,
 }
 
 impl SelfplayStats {
@@ -62,6 +71,7 @@ impl SelfplayStats {
         self.random_opening_games += other.random_opening_games;
         self.random_opening_plies += other.random_opening_plies;
         self.balanced_opening_games += other.balanced_opening_games;
+        self.balanced_opening_target_games += other.balanced_opening_target_games;
         self.balanced_opening_plies += other.balanced_opening_plies;
         self.balanced_opening_attempts += other.balanced_opening_attempts;
         self.balanced_opening_abs_value_sum += other.balanced_opening_abs_value_sum;
@@ -78,6 +88,14 @@ impl SelfplayStats {
         self.sampled_q_gap_sum += other.sampled_q_gap_sum;
         self.policy_surprise_sum += other.policy_surprise_sum;
         self.value_surprise_sum += other.value_surprise_sum;
+        self.black_searches += other.black_searches;
+        self.white_searches += other.white_searches;
+        self.black_entropy_sum += other.black_entropy_sum;
+        self.white_entropy_sum += other.white_entropy_sum;
+        self.black_policy_surprise_sum += other.black_policy_surprise_sum;
+        self.white_policy_surprise_sum += other.white_policy_surprise_sum;
+        self.black_value_surprise_sum += other.black_value_surprise_sum;
+        self.white_value_surprise_sum += other.white_value_surprise_sum;
     }
 }
 
@@ -111,48 +129,45 @@ pub fn generate_one_detailed_controlled(
         &mut board,
         model,
         cfg.balanced_opening_probability,
-        &mut seed,
-        stop,
-    );
-    stats.balanced_opening_games = usize::from(balanced.plies > 0);
-    stats.balanced_opening_plies = balanced.plies;
-    stats.balanced_opening_attempts = balanced.attempts;
-    stats.balanced_opening_abs_value_sum = balanced.abs_value;
-    let policy_plies = apply_policy_opening(
-        &mut board,
-        model,
         cfg.policy_opening_probability,
         cfg.policy_opening_avg_plies,
         cfg.policy_opening_temperature,
         &mut seed,
+        stop,
     );
-    let opening_plies = balanced.plies + policy_plies;
+    stats.balanced_opening_games = usize::from(balanced.plies > 0);
+    stats.balanced_opening_target_games = usize::from(balanced.within_target);
+    stats.balanced_opening_plies = balanced.plies.saturating_sub(balanced.policy_plies);
+    stats.balanced_opening_attempts = balanced.attempts;
+    stats.balanced_opening_abs_value_sum = balanced.initial_abs_value;
+    let policy_plies = if balanced.plies > 0 {
+        balanced.policy_plies
+    } else {
+        apply_policy_opening(
+            &mut board,
+            model,
+            cfg.policy_opening_probability,
+            cfg.policy_opening_avg_plies,
+            cfg.policy_opening_temperature,
+            &mut seed,
+        )
+    };
+    let opening_plies = board.move_count();
     stats.policy_opening_plies = policy_plies;
     stats.random_opening_games = usize::from(opening_plies > 0);
     stats.random_opening_plies = opening_plies;
     if opening_plies > 0 && board.outcome().is_none() {
-        stats.final_opening_abs_value_sum = model.evaluate(&board).1.abs();
+        stats.final_opening_abs_value_sum = if balanced.plies > 0 {
+            balanced.final_abs_value
+        } else {
+            model.evaluate(&board).1.abs()
+        };
     }
-    let asymmetric = random_unit(&mut seed) < cfg.asymmetric_playout_prob.clamp(0.0, 1.0);
-    let strong_player = if random_index(&mut seed, 2) == 0 {
-        crate::game::Player::Black
-    } else {
-        crate::game::Player::White
-    };
-    let asymmetric_ratio = if asymmetric {
-        1.0 + random_unit(&mut seed) * (cfg.max_asymmetric_ratio.max(1.0) - 1.0)
-    } else {
-        1.0
-    };
     let fork_ply = (random_unit(&mut seed) < cfg.early_fork_game_prob.clamp(0.0, 1.0)
         && cfg.early_fork_max_ply > 0)
         .then(|| random_index(&mut seed, cfg.early_fork_max_ply));
     while board.outcome().is_none() && !stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
         let mut ply_cfg = cfg;
-        if asymmetric && board.to_move() != strong_player {
-            ply_cfg.simulations = ((cfg.simulations as f32 / asymmetric_ratio).round() as usize)
-                .clamp(1, cfg.simulations);
-        }
         ply_cfg.root_noise_seed = seed ^ board.move_count() as u64;
         let result = {
             crate::scope_profile!("selfplay.search");
@@ -165,9 +180,10 @@ pub fn generate_one_detailed_controlled(
         let sum = c.iter().map(|x| x.visits).sum::<u32>().max(1) as f32;
         let policy: Vec<_> = c.iter().map(|x| (x.mv, x.visits as f32 / sum)).collect();
         let mut top = [0.0_f32; 2];
+        let mut policy_entropy = 0.0;
         for &(_, p) in &policy {
             if p > 0.0 {
-                stats.entropy_sum -= p * p.ln();
+                policy_entropy -= p * p.ln();
             }
             if p > top[0] {
                 top[1] = top[0];
@@ -176,6 +192,7 @@ pub fn generate_one_detailed_controlled(
                 top[1] = p;
             }
         }
+        stats.entropy_sum += policy_entropy;
         stats.searches += 1;
         stats.simulations += c.iter().map(|x| x.visits as usize).sum::<usize>();
         stats.visited_actions_sum += c.iter().filter(|x| x.visits > 0).count();
@@ -219,13 +236,22 @@ pub fn generate_one_detailed_controlled(
             .sum::<f32>()
             .max(0.0);
         stats.policy_surprise_sum += policy_surprise;
+        if board.to_move() == crate::game::Player::Black {
+            stats.black_searches += 1;
+            stats.black_entropy_sum += policy_entropy;
+            stats.black_policy_surprise_sum += policy_surprise;
+        } else {
+            stats.white_searches += 1;
+            stats.white_entropy_sum += policy_entropy;
+            stats.white_policy_surprise_sum += policy_surprise;
+        }
         samples.push(Sample {
             board: board.clone(),
             policy,
             value: 0.0,
             value_wdl: None,
             generation: 0,
-            policy_weight: ply_cfg.simulations as f32 / cfg.simulations.max(1) as f32,
+            policy_weight: 1.0,
             value_weight: 1.0,
             policy_surprise,
             value_surprise: 0.0,
@@ -262,6 +288,11 @@ pub fn generate_one_detailed_controlled(
         };
         s.value_surprise = (s.value - s.predicted_value).abs();
         stats.value_surprise_sum += s.value_surprise;
+        if s.board.to_move() == crate::game::Player::Black {
+            stats.black_value_surprise_sum += s.value_surprise;
+        } else {
+            stats.white_value_surprise_sum += s.value_surprise;
+        }
     }
     GeneratedGame { samples, stats }
 }
@@ -316,14 +347,20 @@ fn sample_policy_opening_plies(existing_plies: usize, avg_plies: usize, seed: &m
 #[derive(Default)]
 struct BalancedOpening {
     plies: usize,
+    policy_plies: usize,
     attempts: usize,
-    abs_value: f32,
+    initial_abs_value: f32,
+    final_abs_value: f32,
+    within_target: bool,
 }
 
 fn apply_balanced_opening(
     board: &mut Board,
     model: &PolicyValueModel,
     probability: f32,
+    policy_probability: f32,
+    policy_avg_plies: usize,
+    policy_temperature: f32,
     seed: &mut u64,
     stop: Option<&AtomicBool>,
 ) -> BalancedOpening {
@@ -334,14 +371,15 @@ fn apply_balanced_opening(
         return BalancedOpening::default();
     }
 
-    let mut attempts = 0;
-    let mut attempts_at_strictness = 0;
-    let mut reject_probability = 0.995;
-    loop {
+    const MAX_ATTEMPTS: usize = 8;
+    const TARGET_ABS_VALUE: f32 = 0.20;
+    let mut best: Option<(Board, usize, usize, f32, f32)> = None;
+    let mut used_attempts = 0;
+    for attempts in 1..=MAX_ATTEMPTS {
+        used_attempts = attempts;
         if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             return BalancedOpening::default();
         }
-        attempts += 1;
         let mut candidate = Board::new();
         let random_plies = sample_weighted_index(&PLY_WEIGHTS, seed);
         let average_distance = -random_unit(seed).max(1e-12).ln() * 0.8;
@@ -358,48 +396,63 @@ fn apply_balanced_opening(
             };
             candidate.play(mv);
         }
-        if candidate.outcome().is_none()
-            && let Some((mv, abs_value)) =
-                select_balancing_move(&candidate, model, reject_probability, seed, stop)
-        {
-            candidate.play(mv);
-            if candidate.outcome().is_none() {
-                *board = candidate;
-                return BalancedOpening {
-                    plies: board.move_count(),
-                    attempts,
-                    abs_value,
-                };
+        let policy_plies = apply_policy_opening(
+            &mut candidate,
+            model,
+            policy_probability,
+            policy_avg_plies,
+            policy_temperature,
+            seed,
+        );
+        if candidate.outcome().is_none() {
+            let initial_abs_value = model.evaluate(&candidate).1.abs();
+            let mut final_abs_value = initial_abs_value;
+            if let Some((mv, child_abs_value)) = select_balancing_move(&candidate, model, stop)
+                && child_abs_value < initial_abs_value
+            {
+                candidate.play(mv);
+                final_abs_value = child_abs_value;
+            }
+            let replace = best
+                .as_ref()
+                .is_none_or(|(_, _, _, _, value)| final_abs_value < *value);
+            if replace {
+                best = Some((
+                    candidate.clone(),
+                    candidate.move_count(),
+                    policy_plies,
+                    initial_abs_value,
+                    final_abs_value,
+                ));
+            }
+            if final_abs_value <= TARGET_ABS_VALUE {
+                break;
             }
         }
-        attempts_at_strictness += 1;
-        if attempts_at_strictness > 20 {
-            attempts_at_strictness = 0;
-            reject_probability = 0.8;
-        }
+    }
+    let Some((candidate, plies, policy_plies, initial_abs_value, final_abs_value)) = best else {
+        return BalancedOpening::default();
+    };
+    *board = candidate;
+    BalancedOpening {
+        plies,
+        policy_plies,
+        attempts: used_attempts,
+        initial_abs_value,
+        final_abs_value,
+        within_target: final_abs_value <= TARGET_ABS_VALUE,
     }
 }
 
 fn select_balancing_move(
     board: &Board,
     model: &PolicyValueModel,
-    reject_probability: f32,
-    seed: &mut u64,
     stop: Option<&AtomicBool>,
 ) -> Option<(Move, f32)> {
     let root_value = model.evaluate(board).1.clamp(-1.0, 1.0);
-    for value in [root_value, -root_value] {
-        if value < 0.0 {
-            let reject_factor = 1.0 - (-3.0 * value * value).exp();
-            if random_unit(seed) < reject_factor && random_unit(seed) < reject_probability {
-                return None;
-            }
-        }
-    }
     let only_nearby = -root_value > 0.0 && board.move_count() > 0;
     let mut moves = Vec::new();
     let mut values = Vec::new();
-    let mut weights = Vec::new();
     for mv in board.rule_legal_moves() {
         if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             return None;
@@ -415,20 +468,13 @@ fn select_balancing_move(
         let value = model.evaluate(&child).1.clamp(-1.0, 1.0);
         moves.push(mv);
         values.push(value);
-        weights.push(balance_weight(value));
     }
-    let max_weight = weights.iter().copied().fold(0.0_f32, f32::max);
-    if weights.is_empty()
-        || (random_unit(seed) < 1.0 - max_weight && random_unit(seed) < reject_probability)
-    {
-        return None;
-    }
-    let selected = sample_weighted_index(&weights, seed);
+    let selected = values
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| a.abs().total_cmp(&b.abs()))?
+        .0;
     Some((moves[selected], values[selected].abs()))
-}
-
-fn balance_weight(value: f32) -> f32 {
-    (1.0 - value.clamp(-1.0, 1.0).powi(2)).max(0.0).powi(4)
 }
 
 fn nearby_move_weights(board: &Board, legal: &[Move], average_distance: f32) -> Vec<f32> {
@@ -870,33 +916,35 @@ mod tests {
     }
 
     #[test]
-    fn balance_weight_strongly_prefers_even_positions() {
-        assert_eq!(balance_weight(0.0), 1.0);
-        assert_eq!(balance_weight(1.0), 0.0);
-        assert_eq!(balance_weight(-1.0), 0.0);
-        assert!(balance_weight(0.2) > balance_weight(0.6));
-    }
-
-    #[test]
     fn balanced_opening_is_deterministic_and_legal() {
         let model = PolicyValueModel::random(8, 9);
         let mut first = Board::new();
         let mut first_seed = 17;
-        let first_result = apply_balanced_opening(&mut first, &model, 1.0, &mut first_seed, None);
-        assert!((1..=10).contains(&first_result.plies));
-        assert!((1..=20).contains(&first_result.attempts));
-        assert!(first_result.abs_value.is_finite());
+        let first_result =
+            apply_balanced_opening(&mut first, &model, 1.0, 1.0, 6, 1.6, &mut first_seed, None);
+        assert!((1..=30).contains(&first_result.plies));
+        assert!((1..=8).contains(&first_result.attempts));
+        assert!(first_result.initial_abs_value.is_finite());
+        assert!(first_result.final_abs_value <= first_result.initial_abs_value);
         assert_eq!(first.move_count(), first_result.plies);
         assert!(first.outcome().is_none());
 
         let mut second = Board::new();
         let mut second_seed = 17;
-        let second_result =
-            apply_balanced_opening(&mut second, &model, 1.0, &mut second_seed, None);
+        let second_result = apply_balanced_opening(
+            &mut second,
+            &model,
+            1.0,
+            1.0,
+            6,
+            1.6,
+            &mut second_seed,
+            None,
+        );
         assert_eq!(first.cells(), second.cells());
         assert_eq!(first_result.plies, second_result.plies);
         assert_eq!(first_result.attempts, second_result.attempts);
-        assert_eq!(first_result.abs_value, second_result.abs_value);
+        assert_eq!(first_result.final_abs_value, second_result.final_abs_value);
     }
 
     #[test]
@@ -932,7 +980,8 @@ mod tests {
         let mut board = Board::new();
         let mut seed = 17;
         let stop = AtomicBool::new(true);
-        let result = apply_balanced_opening(&mut board, &model, 1.0, &mut seed, Some(&stop));
+        let result =
+            apply_balanced_opening(&mut board, &model, 1.0, 1.0, 6, 1.6, &mut seed, Some(&stop));
         assert_eq!(result.plies, 0);
         assert_eq!(result.attempts, 0);
         assert_eq!(board.move_count(), 0);

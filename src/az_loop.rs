@@ -203,8 +203,6 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             early_fork_game_prob: config.early_fork_game_prob,
             early_fork_max_ply: config.early_fork_max_ply,
             early_fork_max_choices: config.early_fork_max_choices,
-            asymmetric_playout_prob: config.asymmetric_playout_prob,
-            max_asymmetric_ratio: config.max_asymmetric_ratio,
             ..Default::default()
         },
         config.seed,
@@ -544,6 +542,12 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             progress.update,
         );
         tb.add_scalar(
+            "selfplay/balanced_opening_target_rate",
+            event.batch.stats.balanced_opening_target_games as f32
+                / event.batch.stats.balanced_opening_games.max(1) as f32,
+            progress.update,
+        );
+        tb.add_scalar(
             "selfplay/balanced_opening_abs_value",
             event.batch.stats.balanced_opening_abs_value_sum
                 / event.batch.stats.balanced_opening_games.max(1) as f32,
@@ -601,6 +605,39 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             event.batch.stats.value_surprise_sum / searches,
             progress.update,
         );
+        for (side, side_searches, entropy, policy_surprise, value_surprise) in [
+            (
+                "black",
+                event.batch.stats.black_searches,
+                event.batch.stats.black_entropy_sum,
+                event.batch.stats.black_policy_surprise_sum,
+                event.batch.stats.black_value_surprise_sum,
+            ),
+            (
+                "white",
+                event.batch.stats.white_searches,
+                event.batch.stats.white_entropy_sum,
+                event.batch.stats.white_policy_surprise_sum,
+                event.batch.stats.white_value_surprise_sum,
+            ),
+        ] {
+            let count = side_searches.max(1) as f32;
+            tb.add_scalar(
+                &format!("search/{side}_policy_entropy"),
+                entropy / count,
+                progress.update,
+            );
+            tb.add_scalar(
+                &format!("search/{side}_policy_surprise"),
+                policy_surprise / count,
+                progress.update,
+            );
+            tb.add_scalar(
+                &format!("search/{side}_value_surprise"),
+                value_surprise / count,
+                progress.update,
+            );
+        }
         tb.add_scalar(
             "search/visited_actions",
             event.batch.stats.visited_actions_sum as f32 / searches,
@@ -682,7 +719,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             println!(
                 "arena    : starting games={} simulations={} workers={}",
                 config.arena_games,
-                config.arena_simulations,
+                config.simulations,
                 rayon::current_num_threads().min(config.arena_games.max(1))
             );
             let arena_started = Instant::now();
@@ -691,7 +728,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 &best,
                 config.arena_games,
                 SearchConfig {
-                    simulations: config.arena_simulations,
+                    simulations: config.simulations,
                     cpuct: config.cpuct,
                     cpuct_log: config.cpuct_log,
                     cpuct_base: config.cpuct_base,
@@ -872,7 +909,7 @@ fn print_event(
         event.batch.stats.plies as f32 / event.batch.games.max(1) as f32
     );
     println!(
-        "opening  : randomized={}/{} rate={:.1}% shape/policy={:.2}/{:.2} balanced={}/{} attempts={:.2} abs_v={:.3}->{:.3}",
+        "opening  : randomized={}/{} rate={:.1}% shape/policy={:.2}/{:.2} balanced={}/{} target={:.1}% attempts={:.2} abs_v={:.3}->{:.3}",
         event.batch.stats.random_opening_games,
         event.batch.games,
         event.batch.stats.random_opening_games as f32 * 100.0 / event.batch.games.max(1) as f32,
@@ -881,12 +918,27 @@ fn print_event(
         event.batch.stats.policy_opening_plies as f32 / event.batch.games.max(1) as f32,
         event.batch.stats.balanced_opening_games,
         event.batch.games,
+        event.batch.stats.balanced_opening_target_games as f32 * 100.0
+            / event.batch.stats.balanced_opening_games.max(1) as f32,
         event.batch.stats.balanced_opening_attempts as f32
             / event.batch.stats.balanced_opening_games.max(1) as f32,
         event.batch.stats.balanced_opening_abs_value_sum
             / event.batch.stats.balanced_opening_games.max(1) as f32,
         event.batch.stats.final_opening_abs_value_sum
             / event.batch.stats.random_opening_games.max(1) as f32
+    );
+    println!(
+        "side     : searches={}/{} entropy={:.3}/{:.3} policy_surprise={:.3}/{:.3} value_surprise={:.3}/{:.3}",
+        event.batch.stats.black_searches,
+        event.batch.stats.white_searches,
+        event.batch.stats.black_entropy_sum / event.batch.stats.black_searches.max(1) as f32,
+        event.batch.stats.white_entropy_sum / event.batch.stats.white_searches.max(1) as f32,
+        event.batch.stats.black_policy_surprise_sum
+            / event.batch.stats.black_searches.max(1) as f32,
+        event.batch.stats.white_policy_surprise_sum
+            / event.batch.stats.white_searches.max(1) as f32,
+        event.batch.stats.black_value_surprise_sum / event.batch.stats.black_searches.max(1) as f32,
+        event.batch.stats.white_value_surprise_sum / event.batch.stats.white_searches.max(1) as f32,
     );
     println!(
         "search   : avg_sims={:.1} entropy={:.3} visited={:.1} surprise={:.3}/{:.3}",

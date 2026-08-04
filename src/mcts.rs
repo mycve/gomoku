@@ -40,8 +40,6 @@ pub struct SearchConfig {
     pub early_fork_game_prob: f32,
     pub early_fork_max_ply: usize,
     pub early_fork_max_choices: usize,
-    pub asymmetric_playout_prob: f32,
-    pub max_asymmetric_ratio: f32,
     pub opening_random_plies: usize,
     pub opening_seed: u64,
 }
@@ -79,8 +77,6 @@ impl Default for SearchConfig {
             early_fork_game_prob: 0.0,
             early_fork_max_ply: 0,
             early_fork_max_choices: 0,
-            asymmetric_playout_prob: 0.0,
-            max_asymmetric_ratio: 1.0,
             opening_random_plies: 0,
             opening_seed: 0,
         }
