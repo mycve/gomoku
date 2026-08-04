@@ -128,13 +128,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         config.root_dirichlet_total_concentration,
         config.root_exploration_fraction
     );
-    println!(
-        "opening  : balanced={:.1}% policy={:.1}% avg_plies={} temperature={:.2} samples_after_opening=true",
-        config.selfplay_balanced_opening_probability * 100.0,
-        config.selfplay_policy_opening_probability * 100.0,
-        config.selfplay_policy_opening_avg_plies,
-        config.selfplay_policy_opening_temperature
-    );
+    println!("opening  : pure_selfplay=true start=empty_board");
     println!(
         "search   : sims={} cpuct={:.2}+{:.2}log/base{:.0} desired={:.1} graph={} lcb={} symmetries={}",
         config.simulations,
@@ -193,13 +187,6 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             temperature_decay_plies: config.temperature_decay_plies,
             temperature_value_cutoff: config.temperature_value_cutoff,
             temperature_visit_offset: config.temperature_visit_offset,
-            balanced_opening_probability: config.selfplay_balanced_opening_probability,
-            policy_opening_probability: config.selfplay_policy_opening_probability,
-            policy_opening_avg_plies: config.selfplay_policy_opening_avg_plies,
-            policy_opening_temperature: config.selfplay_policy_opening_temperature,
-            early_fork_game_prob: config.early_fork_game_prob,
-            early_fork_max_ply: config.early_fork_max_ply,
-            early_fork_max_choices: config.early_fork_max_choices,
             ..Default::default()
         },
         config.seed,
@@ -515,56 +502,6 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         tb.add_scalar(
             "selfplay/average_plies_draw",
             event.batch.stats.draw_plies as f32 / event.batch.stats.draws.max(1) as f32,
-            progress.update,
-        );
-        tb.add_scalar(
-            "selfplay/random_opening_rate",
-            event.batch.stats.random_opening_games as f32 / games,
-            progress.update,
-        );
-        tb.add_scalar(
-            "selfplay/random_opening_plies",
-            event.batch.stats.random_opening_plies as f32,
-            progress.update,
-        );
-        tb.add_scalar(
-            "selfplay/balanced_opening_rate",
-            event.batch.stats.balanced_opening_games as f32 / games,
-            progress.update,
-        );
-        tb.add_scalar(
-            "selfplay/balanced_opening_attempts",
-            event.batch.stats.balanced_opening_attempts as f32
-                / event.batch.stats.balanced_opening_games.max(1) as f32,
-            progress.update,
-        );
-        tb.add_scalar(
-            "selfplay/balanced_opening_target_rate",
-            event.batch.stats.balanced_opening_target_games as f32
-                / event.batch.stats.balanced_opening_games.max(1) as f32,
-            progress.update,
-        );
-        tb.add_scalar(
-            "selfplay/balanced_opening_abs_value",
-            event.batch.stats.balanced_opening_abs_value_sum
-                / event.batch.stats.balanced_opening_games.max(1) as f32,
-            progress.update,
-        );
-        tb.add_scalar(
-            "selfplay/balanced_opening_average_plies",
-            event.batch.stats.balanced_opening_plies as f32
-                / event.batch.stats.balanced_opening_games.max(1) as f32,
-            progress.update,
-        );
-        tb.add_scalar(
-            "selfplay/policy_opening_average_plies",
-            event.batch.stats.policy_opening_plies as f32 / games,
-            progress.update,
-        );
-        tb.add_scalar(
-            "selfplay/final_opening_abs_value",
-            event.batch.stats.final_opening_abs_value_sum
-                / event.batch.stats.random_opening_games.max(1) as f32,
             progress.update,
         );
         tb.add_scalar(
@@ -901,25 +838,6 @@ fn print_event(
         event.batch.stats.white_wins,
         event.batch.stats.draws,
         event.batch.stats.plies as f32 / event.batch.games.max(1) as f32
-    );
-    println!(
-        "opening  : randomized={}/{} rate={:.1}% shape/policy={:.2}/{:.2} balanced={}/{} target={:.1}% attempts={:.2} abs_v={:.3}->{:.3}",
-        event.batch.stats.random_opening_games,
-        event.batch.games,
-        event.batch.stats.random_opening_games as f32 * 100.0 / event.batch.games.max(1) as f32,
-        event.batch.stats.balanced_opening_plies as f32
-            / event.batch.stats.balanced_opening_games.max(1) as f32,
-        event.batch.stats.policy_opening_plies as f32 / event.batch.games.max(1) as f32,
-        event.batch.stats.balanced_opening_games,
-        event.batch.games,
-        event.batch.stats.balanced_opening_target_games as f32 * 100.0
-            / event.batch.stats.balanced_opening_games.max(1) as f32,
-        event.batch.stats.balanced_opening_attempts as f32
-            / event.batch.stats.balanced_opening_games.max(1) as f32,
-        event.batch.stats.balanced_opening_abs_value_sum
-            / event.batch.stats.balanced_opening_games.max(1) as f32,
-        event.batch.stats.final_opening_abs_value_sum
-            / event.batch.stats.random_opening_games.max(1) as f32
     );
     println!(
         "side     : searches={}/{} entropy={:.3}/{:.3} policy_surprise={:.3}/{:.3} value_surprise={:.3}/{:.3}",

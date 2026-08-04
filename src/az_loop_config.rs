@@ -17,10 +17,6 @@ pub struct AzLoopConfig {
     pub selfplay_samples_per_update: usize,
     pub selfplay_workers: usize,
     pub selfplay_queue_capacity: usize,
-    pub selfplay_balanced_opening_probability: f32,
-    pub selfplay_policy_opening_probability: f32,
-    pub selfplay_policy_opening_avg_plies: usize,
-    pub selfplay_policy_opening_temperature: f32,
     pub learning_rate: f32,
     pub learning_rate_min: f32,
     pub learning_rate_warmup_steps: usize,
@@ -46,9 +42,6 @@ pub struct AzLoopConfig {
     pub use_lcb_for_selection: bool,
     pub lcb_stdevs: f32,
     pub min_visit_prop_for_lcb: f32,
-    pub early_fork_game_prob: f32,
-    pub early_fork_max_ply: usize,
-    pub early_fork_max_choices: usize,
     pub ema_decay: f32,
     pub replay_capacity: usize,
     pub replay_warmup_samples: usize,
@@ -71,7 +64,7 @@ pub struct AzLoopConfig {
 impl Default for AzLoopConfig {
     fn default() -> Self {
         Self {
-            format_version: 12,
+            format_version: 13,
             model_path: "model.safetensors".into(),
             ema_model_path: "ema.safetensors".into(),
             best_model_path: "best.safetensors".into(),
@@ -82,10 +75,6 @@ impl Default for AzLoopConfig {
             selfplay_samples_per_update: 50_000,
             selfplay_workers: 196,
             selfplay_queue_capacity: 0,
-            selfplay_balanced_opening_probability: 0.99,
-            selfplay_policy_opening_probability: 1.0,
-            selfplay_policy_opening_avg_plies: 6,
-            selfplay_policy_opening_temperature: 1.6,
             learning_rate: 0.0008,
             learning_rate_min: 0.0001,
             learning_rate_warmup_steps: 200,
@@ -111,9 +100,6 @@ impl Default for AzLoopConfig {
             use_lcb_for_selection: true,
             lcb_stdevs: 3.0,
             min_visit_prop_for_lcb: 0.15,
-            early_fork_game_prob: 0.04,
-            early_fork_max_ply: 8,
-            early_fork_max_choices: 12,
             ema_decay: 0.999,
             replay_capacity: 500_000,
             replay_warmup_samples: 100_000,
@@ -153,18 +139,6 @@ impl AzLoopConfig {
     fn validate(&self) -> io::Result<()> {
         let finite = [
             ("learning_rate", self.learning_rate),
-            (
-                "selfplay_balanced_opening_probability",
-                self.selfplay_balanced_opening_probability,
-            ),
-            (
-                "selfplay_policy_opening_probability",
-                self.selfplay_policy_opening_probability,
-            ),
-            (
-                "selfplay_policy_opening_temperature",
-                self.selfplay_policy_opening_temperature,
-            ),
             ("learning_rate_min", self.learning_rate_min),
             ("cpuct", self.cpuct),
             ("cpuct_log", self.cpuct_log),
@@ -185,7 +159,6 @@ impl AzLoopConfig {
             ("root_policy_temperature", self.root_policy_temperature),
             ("lcb_stdevs", self.lcb_stdevs),
             ("min_visit_prop_for_lcb", self.min_visit_prop_for_lcb),
-            ("early_fork_game_prob", self.early_fork_game_prob),
             ("ema_decay", self.ema_decay),
             ("arena_promotion_rate", self.arena_promotion_rate),
             (
@@ -210,8 +183,8 @@ impl AzLoopConfig {
                 return Err(io::Error::other(format!("配置 `{name}` 必须是有限数值")));
             }
         }
-        if self.format_version != 12 {
-            return Err(io::Error::other("仅支持 format_version = 12"));
+        if self.format_version != 13 {
+            return Err(io::Error::other("仅支持 format_version = 13"));
         }
         if self.simulations == 0
             || self.selfplay_samples_per_update == 0
@@ -237,18 +210,14 @@ impl AzLoopConfig {
             || self.temperature_endgame < 0.0
             || self.temperature_value_cutoff < 0.0
             || self.root_dirichlet_total_concentration < 0.0
-            || self.selfplay_policy_opening_temperature <= 0.0
             || self.root_policy_temperature <= 0.0
             || self.lcb_stdevs < 0.0
             || !(0.0..=1.0).contains(&self.min_visit_prop_for_lcb)
-            || !(0.0..=1.0).contains(&self.early_fork_game_prob)
             || !(0.0..=1.0).contains(&self.root_exploration_fraction)
             || !(0.0..=1.0).contains(&self.ema_decay)
             || !(0.0..=1.0).contains(&self.arena_promotion_rate)
             || self.arena_promotion_confidence_z < 0.0
             || !(0.0..=1.0).contains(&self.replay_recent_sample_fraction)
-            || !(0.0..=1.0).contains(&self.selfplay_policy_opening_probability)
-            || !(0.0..=1.0).contains(&self.selfplay_balanced_opening_probability)
             || !(0.0..=1.0).contains(&self.replay_policy_surprise_fraction)
             || !(0.0..=1.0).contains(&self.replay_value_surprise_fraction)
         {
@@ -262,13 +231,6 @@ impl AzLoopConfig {
         if self.replay_warmup_samples > self.replay_capacity {
             return Err(io::Error::other(
                 "replay_warmup_samples 不能超过 replay_capacity",
-            ));
-        }
-        if self.selfplay_policy_opening_probability > 0.0
-            && self.selfplay_policy_opening_avg_plies == 0
-        {
-            return Err(io::Error::other(
-                "启用策略开局时 selfplay_policy_opening_avg_plies 必须大于 0",
             ));
         }
         if self.replay_policy_surprise_fraction + self.replay_value_surprise_fraction > 1.0 {
@@ -290,7 +252,7 @@ impl AzLoopConfig {
     }
 }
 
-const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 12
+const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 13
 model_path = "model.safetensors"
 ema_model_path = "ema.safetensors"
 best_model_path = "best.safetensors"
@@ -301,10 +263,6 @@ seed = 20260730
 selfplay_samples_per_update = 50000
 selfplay_workers = 196
 selfplay_queue_capacity = 0
-selfplay_balanced_opening_probability = 0.99
-selfplay_policy_opening_probability = 1.0
-selfplay_policy_opening_avg_plies = 6
-selfplay_policy_opening_temperature = 1.6
 learning_rate = 0.0008
 learning_rate_min = 0.0001
 learning_rate_warmup_steps = 200
@@ -330,9 +288,6 @@ graph_search_max_nodes = 65536
 use_lcb_for_selection = true
 lcb_stdevs = 3.0
 min_visit_prop_for_lcb = 0.15
-early_fork_game_prob = 0.04
-early_fork_max_ply = 8
-early_fork_max_choices = 12
 ema_decay = 0.999
 replay_capacity = 500000
 replay_warmup_samples = 100000
@@ -360,12 +315,10 @@ mod tests {
     fn default_text_is_exact_and_valid() {
         let config: AzLoopConfig = toml::from_str(DEFAULT_CONFIG_TEXT).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.format_version, 12);
+        assert_eq!(config.format_version, 13);
         assert_eq!(config.batch_size, 1024);
         assert_eq!(config.selfplay_samples_per_update, 50_000);
         assert_eq!(config.selfplay_workers, 196);
-        assert_eq!(config.selfplay_balanced_opening_probability, 0.99);
-        assert_eq!(config.selfplay_policy_opening_probability, 1.0);
         assert_eq!(config.replay_capacity, 500_000);
         assert_eq!(config.replay_warmup_samples, 100_000);
         assert_eq!(config.train_samples_per_update, 50_000);
