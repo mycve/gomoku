@@ -672,23 +672,23 @@ fn render_interactive_board(
 ) -> io::Result<()> {
     let mut output = io::stdout();
     execute!(output, MoveTo(0, 0), Clear(ClearType::All))?;
-    writeln!(output, "{title}")?;
+    write!(output, "{title}\r\n")?;
     for line in details {
-        writeln!(output, "{line}")?;
+        write!(output, "{line}\r\n")?;
     }
-    writeln!(output, "turn     : {:?}", board.to_move())?;
+    write!(output, "turn     : {:?}\r\n", board.to_move())?;
     write!(output, "          ")?;
     for col in 0..gomoku::game::BOARD_SIZE {
         write!(output, " {} ", (b'a' + col as u8) as char)?;
     }
-    writeln!(output)?;
+    write!(output, "\r\n")?;
     for row in 0..gomoku::game::BOARD_SIZE {
         write!(output, "{:>3}       ", row + 1)?;
         for col in 0..gomoku::game::BOARD_SIZE {
             let stone = match board.cells()[row * gomoku::game::BOARD_SIZE + col] {
-                1 => '●',
-                -1 => '○',
-                _ => '·',
+                1 => 'X',
+                -1 => 'O',
+                _ => '.',
             };
             if cursor == (row, col) {
                 write!(output, "[{stone}]")?;
@@ -696,36 +696,36 @@ fn render_interactive_board(
                 write!(output, " {stone} ")?;
             }
         }
-        writeln!(output)?;
+        write!(output, "\r\n")?;
     }
-    writeln!(output)?;
+    write!(output, "\r\n")?;
     print_candidates(&mut output, candidates)?;
-    writeln!(output)?;
+    write!(output, "\r\n")?;
     if editable {
-        writeln!(
+        write!(
             output,
-            "keys     : 方向键移动 Enter落子 Backspace撤销 R清盘 Q退出"
+            "keys     : 方向键移动 Enter落子 Backspace撤销 R清盘 Q退出\r\n"
         )?;
     } else {
-        writeln!(output, "keys     : 方向键移动 Enter落子 Q退出")?;
+        write!(output, "keys     : 方向键移动 Enter落子 Q退出\r\n")?;
     }
     output.flush()
 }
 
 fn print_candidates(output: &mut impl Write, candidates: &[Candidate]) -> io::Result<()> {
     if candidates.is_empty() {
-        return writeln!(output, "candidates: -");
+        return write!(output, "candidates: -\r\n");
     }
     let total = candidates
         .iter()
         .map(|candidate| candidate.visits)
         .sum::<u32>()
         .max(1) as f32;
-    writeln!(output, "rank move   mcts%  prior%       q visits")?;
+    write!(output, "rank move   mcts%  prior%       q visits\r\n")?;
     for (rank, candidate) in candidates.iter().take(12).enumerate() {
-        writeln!(
+        write!(
             output,
-            "{:>4} {:>4} {:>7.2} {:>7.2} {:+.4} {:>6}",
+            "{:>4} {:>4} {:>7.2} {:>7.2} {:+.4} {:>6}\r\n",
             rank + 1,
             candidate.mv.notation(),
             candidate.visits as f32 * 100.0 / total,
