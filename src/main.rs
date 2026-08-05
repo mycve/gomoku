@@ -1,10 +1,16 @@
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use crossterm::{
+    cursor::MoveTo,
+    event::{self, Event, KeyCode, KeyEventKind},
+    execute,
+    terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode},
+};
 use gomoku::{
     az_loop,
     az_loop_config::{DEFAULT_CONFIG_PATH, load_or_create},
     candle_train, distill,
     game::{Board, Move, Outcome, Player},
-    mcts::{SearchConfig, search},
+    mcts::{Candidate, SearchConfig, search},
     model::PolicyValueModel,
     replay,
     selfplay::arena,
@@ -35,7 +41,7 @@ struct Cli {
 enum Command {
     /// 创建初始策略价值模型。
     AzInit(AzInitArgs),
-    /// 搜索局面并显示候选着。
+    /// 方向键交互摆局并显示候选着概率。
     AzSearch(AzSearchArgs),
     /// 测试固定局面的搜索速度。
     AzBench(AzBenchArgs),
@@ -49,7 +55,7 @@ enum Command {
     AzEvalBest(AzEvalBestArgs),
     /// 自动评估候选模型相对 Best 模型的表现。
     AzArenaBest(AzArenaBestArgs),
-    /// 终端人机对战（玩家执黑）。
+    /// 方向键终端人机对战。
     Play(PlayArgs),
 }
 
@@ -194,15 +200,18 @@ struct AzEvalBestArgs {
     cpuct: f32,
     #[arg(long, value_enum, default_value_t = HumanSide::Black)]
     human_side: HumanSide,
-    /// 禁用 ANSI 清屏，适合不支持终端控制符的日志窗口。
-    #[arg(long)]
-    no_clear: bool,
 }
 
 #[derive(Args)]
 struct PlayArgs {
     #[arg(default_value = "model.safetensors")]
     model: String,
+    #[arg(default_value_t = 3000)]
+    simulations: usize,
+    #[arg(default_value_t = 1.5)]
+    cpuct: f32,
+    #[arg(long, value_enum, default_value_t = HumanSide::Black)]
+    human_side: HumanSide,
 }
 
 fn main() -> io::Result<()> {
@@ -223,9 +232,7 @@ fn main() -> io::Result<()> {
         }
         Some(Command::AzSearch(args)) => {
             let model = load_model(&args.model)?;
-            let board = board_from_moves(&args.moves)?;
-            println!("{board}");
-            print_search(&board, &model, args.simulations, args.cpuct);
+            interactive_search(&model, &args.moves, args.simulations, args.cpuct)?;
         }
         Some(Command::AzBench(args)) => {
             let model = load_model(&args.model)?;
@@ -558,10 +565,15 @@ fn main() -> io::Result<()> {
                 args.simulations,
                 args.cpuct,
                 args.human_side,
-                !args.no_clear,
             )?;
         }
-        Some(Command::Play(args)) => play(&load_model(&args.model)?)?,
+        Some(Command::Play(args)) => human_evaluate_best(
+            &load_model(&args.model)?,
+            &args.model,
+            args.simulations,
+            args.cpuct,
+            args.human_side,
+        )?,
     }
     gomoku::profile::print_report();
     Ok(())
@@ -628,9 +640,146 @@ fn board_from_moves(moves: &[String]) -> io::Result<Board> {
     Ok(board)
 }
 
-fn print_search(board: &Board, model: &PolicyValueModel, simulations: usize, cpuct: f32) {
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enter() -> io::Result<Self> {
+        enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
+enum BoardAction {
+    Place(Move),
+    Undo,
+    Reset,
+    Quit,
+}
+
+fn render_interactive_board(
+    board: &Board,
+    cursor: (usize, usize),
+    title: &str,
+    details: &[String],
+    candidates: &[Candidate],
+    editable: bool,
+) -> io::Result<()> {
+    let mut output = io::stdout();
+    execute!(output, MoveTo(0, 0), Clear(ClearType::All))?;
+    writeln!(output, "{title}")?;
+    for line in details {
+        writeln!(output, "{line}")?;
+    }
+    writeln!(output, "turn     : {:?}", board.to_move())?;
+    write!(output, "          ")?;
+    for col in 0..gomoku::game::BOARD_SIZE {
+        write!(output, " {} ", (b'a' + col as u8) as char)?;
+    }
+    writeln!(output)?;
+    for row in 0..gomoku::game::BOARD_SIZE {
+        write!(output, "{:>3}       ", row + 1)?;
+        for col in 0..gomoku::game::BOARD_SIZE {
+            let stone = match board.cells()[row * gomoku::game::BOARD_SIZE + col] {
+                1 => '●',
+                -1 => '○',
+                _ => '·',
+            };
+            if cursor == (row, col) {
+                write!(output, "[{stone}]")?;
+            } else {
+                write!(output, " {stone} ")?;
+            }
+        }
+        writeln!(output)?;
+    }
+    writeln!(output)?;
+    print_candidates(&mut output, candidates)?;
+    writeln!(output)?;
+    if editable {
+        writeln!(
+            output,
+            "keys     : 方向键移动 Enter落子 Backspace撤销 R清盘 Q退出"
+        )?;
+    } else {
+        writeln!(output, "keys     : 方向键移动 Enter落子 Q退出")?;
+    }
+    output.flush()
+}
+
+fn print_candidates(output: &mut impl Write, candidates: &[Candidate]) -> io::Result<()> {
+    if candidates.is_empty() {
+        return writeln!(output, "candidates: -");
+    }
+    let total = candidates
+        .iter()
+        .map(|candidate| candidate.visits)
+        .sum::<u32>()
+        .max(1) as f32;
+    writeln!(output, "rank move   mcts%  prior%       q visits")?;
+    for (rank, candidate) in candidates.iter().take(12).enumerate() {
+        writeln!(
+            output,
+            "{:>4} {:>4} {:>7.2} {:>7.2} {:+.4} {:>6}",
+            rank + 1,
+            candidate.mv.notation(),
+            candidate.visits as f32 * 100.0 / total,
+            candidate.prior * 100.0,
+            candidate.q,
+            candidate.visits,
+        )?;
+    }
+    Ok(())
+}
+
+fn read_board_action(
+    board: &Board,
+    cursor: &mut (usize, usize),
+    title: &str,
+    details: &[String],
+    candidates: &[Candidate],
+    editable: bool,
+) -> io::Result<BoardAction> {
+    loop {
+        render_interactive_board(board, *cursor, title, details, candidates, editable)?;
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        match key.code {
+            KeyCode::Up => cursor.0 = cursor.0.saturating_sub(1),
+            KeyCode::Down => cursor.0 = (cursor.0 + 1).min(gomoku::game::BOARD_SIZE - 1),
+            KeyCode::Left => cursor.1 = cursor.1.saturating_sub(1),
+            KeyCode::Right => cursor.1 = (cursor.1 + 1).min(gomoku::game::BOARD_SIZE - 1),
+            KeyCode::Enter => {
+                let mv = Move::new(cursor.0, cursor.1).expect("光标始终位于棋盘内");
+                if board.is_legal(mv) {
+                    return Ok(BoardAction::Place(mv));
+                }
+            }
+            KeyCode::Backspace if editable => return Ok(BoardAction::Undo),
+            KeyCode::Char('r' | 'R') if editable => return Ok(BoardAction::Reset),
+            KeyCode::Char('q' | 'Q') | KeyCode::Esc => return Ok(BoardAction::Quit),
+            _ => {}
+        }
+    }
+}
+
+fn run_search(
+    board: &Board,
+    model: &PolicyValueModel,
+    simulations: usize,
+    cpuct: f32,
+) -> (Vec<Candidate>, f32) {
     let started = Instant::now();
-    let result = search(
+    let candidates = search(
         board,
         model,
         SearchConfig {
@@ -639,47 +788,65 @@ fn print_search(board: &Board, model: &PolicyValueModel, simulations: usize, cpu
             ..Default::default()
         },
     );
-    println!(
-        "search   : simulations={} elapsed={:.3}s",
-        simulations,
-        started.elapsed().as_secs_f32()
-    );
-    for c in result.into_iter().take(10) {
-        println!(
-            "candidate: {} visits={} q={:.3} prior={:.3}",
-            c.mv.notation(),
-            c.visits,
-            c.q,
-            c.prior
-        );
+    (candidates, started.elapsed().as_secs_f32())
+}
+
+fn interactive_search(
+    model: &PolicyValueModel,
+    initial_moves: &[String],
+    simulations: usize,
+    cpuct: f32,
+) -> io::Result<()> {
+    let mut history = initial_moves
+        .iter()
+        .map(|text| Move::parse(text).ok_or_else(|| io::Error::other(format!("无效坐标 `{text}`"))))
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut board = board_from_move_values(&history)?;
+    let mut cursor = (7, 7);
+    let _raw = RawModeGuard::enter()?;
+    loop {
+        let (candidates, seconds) = if board.outcome().is_none() {
+            run_search(&board, model, simulations, cpuct)
+        } else {
+            (Vec::new(), 0.0)
+        };
+        let details = vec![
+            format!("search   : simulations={simulations} cpuct={cpuct:.2} time={seconds:.3}s"),
+            format!("result   : {:?}", board.outcome()),
+        ];
+        match read_board_action(
+            &board,
+            &mut cursor,
+            "GomokuAI — 交互式局面搜索",
+            &details,
+            &candidates,
+            true,
+        )? {
+            BoardAction::Place(mv) => {
+                history.push(mv);
+                board.play(mv);
+            }
+            BoardAction::Undo => {
+                history.pop();
+                board = board_from_move_values(&history)?;
+            }
+            BoardAction::Reset => {
+                history.clear();
+                board = Board::new();
+            }
+            BoardAction::Quit => return Ok(()),
+        }
     }
 }
 
-fn play(model: &PolicyValueModel) -> io::Result<()> {
+fn board_from_move_values(moves: &[Move]) -> io::Result<Board> {
     let mut board = Board::new();
-    loop {
-        println!("{board}");
-        if let Some(outcome) = board.outcome() {
-            println!("result   : {outcome:?}");
-            return Ok(());
-        }
-        if board.to_move() == Player::Black {
-            print!("你的落子（如 h8）：");
-            io::stdout().flush()?;
-            let mut line = String::new();
-            io::stdin().read_line(&mut line)?;
-            if !Move::parse(&line).is_some_and(|mv| board.play(mv)) {
-                println!("非法落子");
-            }
-        } else {
-            let result = search(&board, model, SearchConfig::default());
-            let Some(best) = result.first() else {
-                return Ok(());
-            };
-            println!("AI 落子：{}", best.mv.notation());
-            board.play(best.mv);
+    for &mv in moves {
+        if !board.play(mv) {
+            return Err(io::Error::other(format!("非法落子 `{}`", mv.notation())));
         }
     }
+    Ok(board)
 }
 
 fn human_evaluate_best(
@@ -688,101 +855,64 @@ fn human_evaluate_best(
     simulations: usize,
     cpuct: f32,
     human_side: HumanSide,
-    clear_screen: bool,
 ) -> io::Result<()> {
     let human = match human_side {
         HumanSide::Black => Player::Black,
         HumanSide::White => Player::White,
     };
     let mut board = Board::new();
-    let mut last_search: Option<(Move, u32, f32, f32, Vec<gomoku::mcts::Candidate>)> = None;
+    let mut cursor = (7, 7);
+    let mut last_search = Vec::new();
+    let mut last_seconds = 0.0;
+    let _raw = RawModeGuard::enter()?;
     loop {
-        if clear_screen {
-            print!("\x1b[2J\x1b[H");
-        }
-        println!("GomokuAI — 人工评估 Best");
-        println!("model    : {model_path}");
-        println!("players  : human={human:?}  best={:?}", human.other());
-        println!("search   : simulations={simulations}  cpuct={cpuct}");
-        if let Some((mv, visits, q, seconds, _)) = &last_search {
-            println!(
-                "lastmove : {}  visits={}  q={:.3}  time={:.3}s",
-                mv.notation(),
-                visits,
-                q,
-                seconds
-            );
-        } else {
-            println!("lastmove : -");
-        }
-        println!();
-        println!("{board}");
         if let Some(outcome) = board.outcome() {
-            match outcome {
-                Outcome::Draw => println!("evaluation: DRAW"),
-                Outcome::Win(player) if player == human => println!("evaluation: HUMAN WIN"),
-                Outcome::Win(_) => println!("evaluation: BEST WIN"),
-            }
+            let result = match outcome {
+                Outcome::Draw => "DRAW",
+                Outcome::Win(player) if player == human => "HUMAN WIN",
+                Outcome::Win(_) => "MODEL WIN",
+            };
+            render_interactive_board(
+                &board,
+                cursor,
+                "GomokuAI — 方向键人机对弈",
+                &[format!("result   : {result}")],
+                &last_search,
+                false,
+            )?;
             return Ok(());
         }
         if board.to_move() == human {
-            loop {
-                print!("move> ");
-                io::stdout().flush()?;
-                let mut line = String::new();
-                io::stdin().read_line(&mut line)?;
-                let command = line.trim();
-                if command.eq_ignore_ascii_case("quit") {
-                    println!("evaluation: ABORTED");
-                    return Ok(());
+            let details = vec![
+                format!("model    : {model_path}"),
+                format!("players  : human={human:?} model={:?}", human.other()),
+                format!(
+                    "search   : simulations={simulations} cpuct={cpuct:.2} last={last_seconds:.3}s"
+                ),
+            ];
+            match read_board_action(
+                &board,
+                &mut cursor,
+                "GomokuAI — 方向键人机对弈",
+                &details,
+                &last_search,
+                false,
+            )? {
+                BoardAction::Place(mv) => {
+                    board.play(mv);
                 }
-                if command.eq_ignore_ascii_case("help") {
-                    println!("commands : <坐标> 落子 | info 候选详情 | quit 退出");
-                    continue;
-                }
-                if command.eq_ignore_ascii_case("info") {
-                    if let Some((_, _, _, _, candidates)) = &last_search {
-                        println!("rank move visits      q   prior");
-                        for (rank, candidate) in candidates.iter().take(10).enumerate() {
-                            println!(
-                                "{:>4} {:>4} {:>6} {:+.3}  {:.4}",
-                                rank + 1,
-                                candidate.mv.notation(),
-                                candidate.visits,
-                                candidate.q,
-                                candidate.prior
-                            );
-                        }
-                    } else {
-                        println!("info     : Best 尚未搜索");
-                    }
-                    continue;
-                }
-                if Move::parse(command).is_some_and(|mv| board.play(mv)) {
-                    break;
-                }
-                println!("error    : 非法输入；输入 help 查看命令");
+                BoardAction::Quit => return Ok(()),
+                BoardAction::Undo | BoardAction::Reset => unreachable!(),
             }
             continue;
         }
-        println!("best     : thinking...");
-        io::stdout().flush()?;
-        let started = Instant::now();
-        let result = search(
-            &board,
-            model,
-            SearchConfig {
-                simulations,
-                cpuct,
-                ..Default::default()
-            },
-        );
+        let (result, seconds) = run_search(&board, model, simulations, cpuct);
         let Some(best) = result.first() else {
-            println!("evaluation: DRAW");
             return Ok(());
         };
-        let elapsed = started.elapsed().as_secs_f32();
-        last_search = Some((best.mv, best.visits, best.q, elapsed, result.clone()));
-        board.play(best.mv);
+        let mv = best.mv;
+        last_seconds = seconds;
+        last_search = result;
+        board.play(mv);
     }
 }
