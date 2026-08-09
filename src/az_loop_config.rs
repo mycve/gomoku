@@ -73,7 +73,7 @@ impl Default for AzLoopConfig {
             simulations: 400,
             seed: 20260730,
             selfplay_samples_per_update: 50_000,
-            selfplay_workers: 196,
+            selfplay_workers: 128,
             selfplay_queue_capacity: 0,
             learning_rate: 0.0008,
             learning_rate_min: 0.0001,
@@ -109,7 +109,7 @@ impl Default for AzLoopConfig {
             checkpoint_dir: "checkpoints".into(),
             max_checkpoints: 20,
             arena_interval: 10,
-            arena_games: 100,
+            arena_games: 200,
             arena_opening_plies: 2,
             arena_promotion_rate: 0.55,
             arena_promotion_confidence_z: 1.28,
@@ -255,7 +255,7 @@ progress_path = "data/azloop-progress.json"
 simulations = 400
 seed = 20260730
 selfplay_samples_per_update = 50000
-selfplay_workers = 196
+selfplay_workers = 128
 selfplay_queue_capacity = 0
 learning_rate = 0.0008
 learning_rate_min = 0.0001
@@ -291,7 +291,7 @@ checkpoint_interval = 20
 checkpoint_dir = "checkpoints"
 max_checkpoints = 20
 arena_interval = 10
-arena_games = 100
+arena_games = 200
 arena_opening_plies = 2
 arena_promotion_rate = 0.550000011920929
 arena_promotion_confidence_z = 1.2799999713897705
@@ -312,7 +312,8 @@ mod tests {
         assert_eq!(config.format_version, 15);
         assert_eq!(config.batch_size, 1024);
         assert_eq!(config.selfplay_samples_per_update, 50_000);
-        assert_eq!(config.selfplay_workers, 196);
+        assert_eq!(config.selfplay_workers, 128);
+        assert_eq!(config.arena_games, 200);
         assert_eq!(config.replay_capacity, 500_000);
         assert_eq!(config.replay_warmup_samples, 100_000);
         assert_eq!(config.train_samples_per_update, 50_000);

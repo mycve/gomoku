@@ -400,6 +400,9 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         progress.total_samples += event.batch.samples.len();
         progress.optimizer_steps += event.train_stats.optimizer_steps;
         progress.learning_rate = event.learning_rate;
+        // generation 表示数据产生的训练 update，用于 replay 的近期窗口；
+        // published 模型仍然只在 Arena 晋升时替换。
+        version.store(progress.update as u64, Ordering::Release);
         event.online_model.save(&config.model_path)?;
         event.model.save(&config.ema_model_path)?;
         save_progress(&config.progress_path, &progress)?;
@@ -814,7 +817,6 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 best = event.model.clone();
                 best.save(&config.best_model_path)?;
                 *published.write().unwrap_or_else(|e| e.into_inner()) = best.clone();
-                version.fetch_add(1, Ordering::Release);
                 progress.consecutive_rejections = 0;
                 println!(
                     "promote  : best={} model_version={}",
