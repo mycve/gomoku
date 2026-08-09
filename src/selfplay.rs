@@ -1,5 +1,5 @@
 use crate::{
-    game::{BOARD_SIZE, Board, Move, Outcome},
+    game::{BOARD_SIZE, Board, Move, Outcome, Player},
     mcts::{SearchConfig, search, search_with_info},
     model::PolicyValueModel,
     replay::Sample,
@@ -30,6 +30,8 @@ pub struct SelfplayStats {
     pub draw_plies: usize,
     pub searches: usize,
     pub simulations: usize,
+    pub black_simulations: usize,
+    pub white_simulations: usize,
     pub entropy_sum: f32,
     pub visited_actions_sum: usize,
     pub policy_top1_sum: f32,
@@ -47,6 +49,9 @@ pub struct SelfplayStats {
     pub white_policy_surprise_sum: f32,
     pub black_value_surprise_sum: f32,
     pub white_value_surprise_sum: f32,
+    pub current_selfplay_games: usize,
+    pub current_white_history_games: usize,
+    pub paired_history_games: usize,
 }
 
 impl SelfplayStats {
@@ -61,6 +66,8 @@ impl SelfplayStats {
         self.draw_plies += other.draw_plies;
         self.searches += other.searches;
         self.simulations += other.simulations;
+        self.black_simulations += other.black_simulations;
+        self.white_simulations += other.white_simulations;
         self.entropy_sum += other.entropy_sum;
         self.visited_actions_sum += other.visited_actions_sum;
         self.policy_top1_sum += other.policy_top1_sum;
@@ -78,6 +85,9 @@ impl SelfplayStats {
         self.white_policy_surprise_sum += other.white_policy_surprise_sum;
         self.black_value_surprise_sum += other.black_value_surprise_sum;
         self.white_value_surprise_sum += other.white_value_surprise_sum;
+        self.current_selfplay_games += other.current_selfplay_games;
+        self.current_white_history_games += other.current_white_history_games;
+        self.paired_history_games += other.paired_history_games;
     }
 }
 
@@ -97,6 +107,20 @@ pub fn generate_one_detailed(
 pub fn generate_one_detailed_controlled(
     model: &PolicyValueModel,
     cfg: SearchConfig,
+    seed: u64,
+    stop: Option<&AtomicBool>,
+) -> GeneratedGame {
+    generate_one_detailed_match_controlled(model, model, cfg, cfg, true, true, seed, stop)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn generate_one_detailed_match_controlled(
+    black_model: &PolicyValueModel,
+    white_model: &PolicyValueModel,
+    black_cfg: SearchConfig,
+    white_cfg: SearchConfig,
+    record_black: bool,
+    record_white: bool,
     mut seed: u64,
     stop: Option<&AtomicBool>,
 ) -> GeneratedGame {
@@ -108,7 +132,10 @@ pub fn generate_one_detailed_controlled(
         ..Default::default()
     };
     while board.outcome().is_none() && !stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-        let mut ply_cfg = cfg;
+        let (model, mut ply_cfg, record_sample) = match board.to_move() {
+            Player::Black => (black_model, black_cfg, record_black),
+            Player::White => (white_model, white_cfg, record_white),
+        };
         ply_cfg.root_noise_seed = seed ^ board.move_count() as u64;
         let result = {
             crate::scope_profile!("selfplay.search");
@@ -135,11 +162,12 @@ pub fn generate_one_detailed_controlled(
         }
         stats.entropy_sum += policy_entropy;
         stats.searches += 1;
-        stats.simulations += c.iter().map(|x| x.visits as usize).sum::<usize>();
+        let search_simulations = c.iter().map(|x| x.visits as usize).sum::<usize>();
+        stats.simulations += search_simulations;
         stats.visited_actions_sum += c.iter().filter(|x| x.visits > 0).count();
         stats.policy_top1_sum += top[0];
         stats.policy_top2_sum += top[0] + top[1];
-        let temperature = temperature_for_ply(cfg, board.move_count());
+        let temperature = temperature_for_ply(ply_cfg, board.move_count());
         let mv = sample_with_temperature(&c, temperature, &mut seed);
         if temperature > 1e-6 {
             stats.sampled_moves += 1;
@@ -167,10 +195,12 @@ pub fn generate_one_detailed_controlled(
         stats.policy_surprise_sum += policy_surprise;
         if board.to_move() == crate::game::Player::Black {
             stats.black_searches += 1;
+            stats.black_simulations += search_simulations;
             stats.black_entropy_sum += policy_entropy;
             stats.black_policy_surprise_sum += policy_surprise;
         } else {
             stats.white_searches += 1;
+            stats.white_simulations += search_simulations;
             stats.white_entropy_sum += policy_entropy;
             stats.white_policy_surprise_sum += policy_surprise;
         }
@@ -180,8 +210,8 @@ pub fn generate_one_detailed_controlled(
             value: 0.0,
             value_wdl: None,
             generation: 0,
-            policy_weight: 1.0,
-            value_weight: 1.0,
+            policy_weight: f32::from(record_sample),
+            value_weight: f32::from(record_sample),
             policy_surprise,
             value_surprise: 0.0,
             predicted_value: result.root_value,
@@ -223,6 +253,7 @@ pub fn generate_one_detailed_controlled(
             stats.white_value_surprise_sum += s.value_surprise;
         }
     }
+    samples.retain(|sample| sample.policy_weight > 0.0 || sample.value_weight > 0.0);
     GeneratedGame { samples, stats }
 }
 
@@ -361,6 +392,18 @@ impl ArenaReport {
     }
     pub fn promotes_with_lower_bound(self, threshold: f32, z: f32) -> bool {
         self.score_rate_lower_bound(z) >= threshold.clamp(0.0, 1.0)
+    }
+    pub fn score_as_black(self) -> f32 {
+        let games = self.wins_as_black + self.losses_as_black + self.draws_as_black;
+        (self.wins_as_black as f32 + self.draws_as_black as f32 * 0.5) / games.max(1) as f32
+    }
+    pub fn score_as_white(self) -> f32 {
+        let games = self.wins_as_white + self.losses_as_white + self.draws_as_white;
+        (self.wins_as_white as f32 + self.draws_as_white as f32 * 0.5) / games.max(1) as f32
+    }
+    pub fn passes_color_floor(self, floor: f32) -> bool {
+        let floor = floor.clamp(0.0, 1.0);
+        self.score_as_black() >= floor && self.score_as_white() >= floor
     }
     pub fn elo_diff(self) -> f32 {
         let score = self.score_rate();
@@ -526,6 +569,47 @@ mod tests {
         assert!((report.score_rate_standard_error() - expected).abs() < 1.0e-6);
         assert!(!report.promotes_with_lower_bound(0.50, 1.28));
         assert!(report.promotes_with_lower_bound(0.40, 0.0));
+    }
+
+    #[test]
+    fn arena_color_floor_rejects_one_sided_candidate() {
+        let report = ArenaReport {
+            wins: 111,
+            losses: 89,
+            wins_as_black: 75,
+            losses_as_black: 25,
+            wins_as_white: 36,
+            losses_as_white: 64,
+            ..Default::default()
+        };
+        assert!(report.score_rate() > 0.5);
+        assert!(!report.passes_color_floor(0.45));
+        assert_eq!(report.score_as_black(), 0.75);
+        assert_eq!(report.score_as_white(), 0.36);
+    }
+
+    #[test]
+    fn mixed_game_records_only_current_white_and_uses_more_white_search() {
+        let model = PolicyValueModel::random(8, 91);
+        let black_cfg = SearchConfig {
+            simulations: 2,
+            ..Default::default()
+        };
+        let white_cfg = SearchConfig {
+            simulations: 4,
+            ..black_cfg
+        };
+        let game = generate_one_detailed_match_controlled(
+            &model, &model, black_cfg, white_cfg, false, true, 17, None,
+        );
+        assert!(!game.samples.is_empty());
+        assert!(
+            game.samples
+                .iter()
+                .all(|sample| sample.board.to_move() == Player::White)
+        );
+        assert_eq!(game.stats.black_simulations, game.stats.black_searches * 2);
+        assert_eq!(game.stats.white_simulations, game.stats.white_searches * 4);
     }
 
     #[test]

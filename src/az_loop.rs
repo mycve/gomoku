@@ -1,5 +1,5 @@
 use crate::{
-    async_selfplay::{AsyncSelfplay, SelfplayGame},
+    async_selfplay::{AsyncSelfplay, SelfplayGame, SelfplayLeagueConfig},
     az_loop_config::AzLoopConfig,
     candle_train,
     mcts::SearchConfig,
@@ -129,14 +129,22 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     );
     println!("opening  : pure_selfplay=true start=empty_board");
     println!(
-        "search   : sims={} cpuct={:.2}+{:.2}log/base{:.0} graph={} lcb={} symmetries={}",
+        "search   : black_sims={} white_sims={} cpuct={:.2}+{:.2}log/base{:.0} graph={} lcb={} symmetries={}",
         config.simulations,
+        config.selfplay_white_simulations,
         config.cpuct,
         config.cpuct_log,
         config.cpuct_base,
         config.use_graph_search,
         config.use_lcb_for_selection,
         config.root_num_symmetries_to_sample
+    );
+    println!(
+        "league   : current={:.0}% current_white_vs_history={:.0}% paired_history={:.0}% histories={}",
+        config.selfplay_current_fraction * 100.0,
+        config.selfplay_current_white_history_fraction * 100.0,
+        config.selfplay_paired_history_fraction * 100.0,
+        champion_history.len(),
     );
     println!("targets  : policy=mcts_visits value=terminal_wdl model=online");
     println!(
@@ -148,9 +156,13 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         progress.optimizer_steps
     );
     let published = Arc::new(RwLock::new(best.clone()));
+    let published_history = Arc::new(RwLock::new(
+        champion_history.iter().cloned().collect::<Vec<_>>(),
+    ));
     let version = Arc::new(AtomicU64::new(progress.update as u64));
     let mut actors = AsyncSelfplay::start(
         Arc::clone(&published),
+        Arc::clone(&published_history),
         Arc::clone(&version),
         Arc::clone(&stop),
         workers,
@@ -174,6 +186,12 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             temperature_decay_delay_plies: config.temperature_decay_delay_plies,
             temperature_decay_plies: config.temperature_decay_plies,
             ..Default::default()
+        },
+        SelfplayLeagueConfig {
+            white_simulations: config.selfplay_white_simulations,
+            current_selfplay_fraction: config.selfplay_current_fraction,
+            current_white_history_fraction: config.selfplay_current_white_history_fraction,
+            paired_history_fraction: config.selfplay_paired_history_fraction,
         },
         config.seed,
     );
@@ -335,12 +353,13 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     let train_device = candle_train::training_device_name()?;
     let end = target_update.unwrap_or(usize::MAX);
     println!(
-        "loop     : mode=batch-async actors={} actor_queue={}(nonblocking-drop) collector_queue=1(nonblocking-drop) trainer_queue=rendezvous warmup={} samples/update>={} sims={} train_device={} batch={} arena_opening_plies={}",
+        "loop     : mode=batch-async actors={} actor_queue={}(nonblocking-drop) collector_queue=1(nonblocking-drop) trainer_queue=rendezvous warmup={} samples/update>={} sims={}/{} train_device={} batch={} arena_opening_plies={}",
         workers,
         queue_capacity,
         config.replay_warmup_samples,
         config.selfplay_samples_per_update,
         config.simulations,
+        config.selfplay_white_simulations,
         train_device,
         config.batch_size,
         config.arena_opening_plies
@@ -483,6 +502,21 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         );
         tb.add_scalar("selfplay/games", event.batch.games as f32, progress.update);
         tb.add_scalar(
+            "selfplay/current_selfplay_rate",
+            event.batch.stats.current_selfplay_games as f32 / games,
+            progress.update,
+        );
+        tb.add_scalar(
+            "selfplay/current_white_history_rate",
+            event.batch.stats.current_white_history_games as f32 / games,
+            progress.update,
+        );
+        tb.add_scalar(
+            "selfplay/paired_history_rate",
+            event.batch.stats.paired_history_games as f32 / games,
+            progress.update,
+        );
+        tb.add_scalar(
             "selfplay/samples",
             event.batch.samples.len() as f32,
             progress.update,
@@ -525,6 +559,18 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         tb.add_scalar(
             "search/average_simulations",
             event.batch.stats.simulations as f32 / searches,
+            progress.update,
+        );
+        tb.add_scalar(
+            "search/black_average_simulations",
+            event.batch.stats.black_simulations as f32
+                / event.batch.stats.black_searches.max(1) as f32,
+            progress.update,
+        );
+        tb.add_scalar(
+            "search/white_average_simulations",
+            event.batch.stats.white_simulations as f32
+                / event.batch.stats.white_searches.max(1) as f32,
             progress.update,
         );
         tb.add_scalar(
@@ -716,36 +762,33 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             }
             let arena_seconds = arena_started.elapsed().as_secs_f32();
             let lower_bound = report.score_rate_lower_bound(config.arena_promotion_confidence_z);
-            let current_passed = report.promotes_with_lower_bound(
+            let overall_passed = report.promotes_with_lower_bound(
                 config.arena_promotion_rate,
                 config.arena_promotion_confidence_z,
             );
-            let promoted = current_passed && history_passed;
-            let black_games =
-                (report.wins_as_black + report.losses_as_black + report.draws_as_black).max(1)
-                    as f32;
-            let white_games =
-                (report.wins_as_white + report.losses_as_white + report.draws_as_white).max(1)
-                    as f32;
-            let score_as_black =
-                (report.wins_as_black as f32 + report.draws_as_black as f32 * 0.5) / black_games;
-            let score_as_white =
-                (report.wins_as_white as f32 + report.draws_as_white as f32 * 0.5) / white_games;
+            let score_as_black = report.score_as_black();
+            let score_as_white = report.score_as_white();
+            let color_passed = report.passes_color_floor(config.arena_color_score_floor);
+            let promoted = overall_passed && color_passed && history_passed;
             println!(
-                "arena    : W/L/D={}/{}/{} score={:.2}% lower={:.2}% elo={:+.1} promoted={}",
+                "arena    : W/L/D={}/{}/{} score={:.2}% lower={:.2}% target={:.2}% overall_passed={} elo={:+.1} promoted={}",
                 report.wins,
                 report.losses,
                 report.draws,
                 report.score_rate() * 100.0,
                 lower_bound * 100.0,
+                config.arena_promotion_rate * 100.0,
+                overall_passed,
                 report.elo_diff(),
                 promoted
             );
             println!(
-                "arena    : paired_openings={} candidate_black={:.2}% candidate_white={:.2}% avg_plies={:.1}",
+                "arena    : paired_openings={} candidate_black={:.2}% candidate_white={:.2}% color_floor={:.2}% color_passed={} avg_plies={:.1}",
                 report.paired_openings,
                 score_as_black * 100.0,
                 score_as_white * 100.0,
+                config.arena_color_score_floor * 100.0,
+                color_passed,
                 report.plies as f32 / report.games().max(1) as f32
             );
             let arena_games = report.games().max(1) as f32;
@@ -799,6 +842,16 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 progress.update,
             );
             tb.add_scalar("arena/promoted", f32::from(promoted), progress.update);
+            tb.add_scalar(
+                "arena/overall_passed",
+                f32::from(overall_passed),
+                progress.update,
+            );
+            tb.add_scalar(
+                "arena/color_passed",
+                f32::from(color_passed),
+                progress.update,
+            );
             tb.add_scalar("arena/score_as_black", score_as_black, progress.update);
             tb.add_scalar("arena/score_as_white", score_as_white, progress.update);
             if promoted {
@@ -806,6 +859,8 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 best = event.model.clone();
                 best.save(&config.best_model_path)?;
                 *published.write().unwrap_or_else(|e| e.into_inner()) = best.clone();
+                *published_history.write().unwrap_or_else(|e| e.into_inner()) =
+                    champion_history.iter().cloned().collect();
                 progress.consecutive_rejections = 0;
                 println!(
                     "promote  : best={} model_version={}",
@@ -856,12 +911,13 @@ fn merge_game(p: &mut PendingBatch, mut game: SelfplayGame) {
     p.oldest_version = p.oldest_version.min(game.model_version);
     p.newest_version = p.newest_version.max(game.model_version);
     p.workers.insert(game.worker);
+    let games = game.stats.games;
     p.stats.add_assign(&game.stats);
     for sample in &mut game.samples {
         sample.generation = game.model_version;
     }
     p.samples.extend(game.samples);
-    p.games += 1;
+    p.games += games;
 }
 
 fn print_event(
@@ -891,9 +947,18 @@ fn print_event(
         event.batch.stats.plies as f32 / event.batch.games.max(1) as f32
     );
     println!(
-        "side     : searches={}/{} entropy={:.3}/{:.3} policy_surprise={:.3}/{:.3} value_surprise={:.3}/{:.3}",
+        "league   : current={:.1}% current_white_history={:.1}% paired_history={:.1}%",
+        event.batch.stats.current_selfplay_games as f32 * 100.0 / event.batch.games.max(1) as f32,
+        event.batch.stats.current_white_history_games as f32 * 100.0
+            / event.batch.games.max(1) as f32,
+        event.batch.stats.paired_history_games as f32 * 100.0 / event.batch.games.max(1) as f32,
+    );
+    println!(
+        "side     : searches={}/{} avg_sims={:.1}/{:.1} entropy={:.3}/{:.3} policy_surprise={:.3}/{:.3} value_surprise={:.3}/{:.3}",
         event.batch.stats.black_searches,
         event.batch.stats.white_searches,
+        event.batch.stats.black_simulations as f32 / event.batch.stats.black_searches.max(1) as f32,
+        event.batch.stats.white_simulations as f32 / event.batch.stats.white_searches.max(1) as f32,
         event.batch.stats.black_entropy_sum / event.batch.stats.black_searches.max(1) as f32,
         event.batch.stats.white_entropy_sum / event.batch.stats.white_searches.max(1) as f32,
         event.batch.stats.black_policy_surprise_sum

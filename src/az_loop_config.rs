@@ -12,10 +12,14 @@ pub struct AzLoopConfig {
     pub replay_path: String,
     pub progress_path: String,
     pub simulations: usize,
+    pub selfplay_white_simulations: usize,
     pub seed: u64,
     pub selfplay_samples_per_update: usize,
     pub selfplay_workers: usize,
     pub selfplay_queue_capacity: usize,
+    pub selfplay_current_fraction: f32,
+    pub selfplay_current_white_history_fraction: f32,
+    pub selfplay_paired_history_fraction: f32,
     pub learning_rate: f32,
     pub learning_rate_min: f32,
     pub learning_rate_warmup_steps: usize,
@@ -53,6 +57,7 @@ pub struct AzLoopConfig {
     pub arena_opening_plies: usize,
     pub arena_promotion_rate: f32,
     pub arena_promotion_confidence_z: f32,
+    pub arena_color_score_floor: f32,
     pub arena_history_size: usize,
     pub arena_history_score_floor: f32,
     pub arena_rejection_reset: usize,
@@ -62,16 +67,20 @@ pub struct AzLoopConfig {
 impl Default for AzLoopConfig {
     fn default() -> Self {
         Self {
-            format_version: 17,
+            format_version: 18,
             model_path: "model.safetensors".into(),
             best_model_path: "best.safetensors".into(),
             replay_path: "data/replay.jsonl".into(),
             progress_path: "data/azloop-progress.json".into(),
             simulations: 400,
+            selfplay_white_simulations: 800,
             seed: 20260730,
             selfplay_samples_per_update: 50_000,
             selfplay_workers: 192,
             selfplay_queue_capacity: 0,
+            selfplay_current_fraction: 0.70,
+            selfplay_current_white_history_fraction: 0.20,
+            selfplay_paired_history_fraction: 0.10,
             learning_rate: 0.0008,
             learning_rate_min: 0.0001,
             learning_rate_warmup_steps: 200,
@@ -107,8 +116,9 @@ impl Default for AzLoopConfig {
             arena_interval: 10,
             arena_games: 200,
             arena_opening_plies: 2,
-            arena_promotion_rate: 0.55,
+            arena_promotion_rate: 0.50,
             arena_promotion_confidence_z: 1.28,
+            arena_color_score_floor: 0.45,
             arena_history_size: 2,
             arena_history_score_floor: 0.45,
             arena_rejection_reset: 3,
@@ -154,6 +164,16 @@ impl AzLoopConfig {
                 "arena_promotion_confidence_z",
                 self.arena_promotion_confidence_z,
             ),
+            ("arena_color_score_floor", self.arena_color_score_floor),
+            ("selfplay_current_fraction", self.selfplay_current_fraction),
+            (
+                "selfplay_current_white_history_fraction",
+                self.selfplay_current_white_history_fraction,
+            ),
+            (
+                "selfplay_paired_history_fraction",
+                self.selfplay_paired_history_fraction,
+            ),
             ("arena_history_score_floor", self.arena_history_score_floor),
             (
                 "replay_recent_sample_fraction",
@@ -173,12 +193,13 @@ impl AzLoopConfig {
                 return Err(io::Error::other(format!("配置 `{name}` 必须是有限数值")));
             }
         }
-        if self.format_version != 17 {
+        if self.format_version != 18 {
             return Err(io::Error::other(
-                "仅支持 format_version = 17；新模型结构不兼容旧实验，请重新生成配置",
+                "仅支持 format_version = 18；请升级配置后继续，v25 模型、Replay 和进度无需清理",
             ));
         }
         if self.simulations == 0
+            || self.selfplay_white_simulations == 0
             || self.selfplay_samples_per_update == 0
             || self.replay_warmup_samples == 0
             || self.batch_epochs == 0
@@ -205,6 +226,7 @@ impl AzLoopConfig {
             || !(0.0..=1.0).contains(&self.min_visit_prop_for_lcb)
             || !(0.0..=1.0).contains(&self.root_exploration_fraction)
             || !(0.0..=1.0).contains(&self.arena_promotion_rate)
+            || !(0.0..=1.0).contains(&self.arena_color_score_floor)
             || self.arena_promotion_confidence_z < 0.0
             || !(0.0..=1.0).contains(&self.arena_history_score_floor)
             || !(0.0..=1.0).contains(&self.replay_recent_sample_fraction)
@@ -213,6 +235,18 @@ impl AzLoopConfig {
         {
             return Err(io::Error::other(
                 "配置中的学习率、搜索或比例参数超出合法范围",
+            ));
+        }
+        let league_fraction = self.selfplay_current_fraction
+            + self.selfplay_current_white_history_fraction
+            + self.selfplay_paired_history_fraction;
+        if self.selfplay_current_fraction < 0.0
+            || self.selfplay_current_white_history_fraction < 0.0
+            || self.selfplay_paired_history_fraction < 0.0
+            || (league_fraction - 1.0).abs() > 1.0e-5
+        {
+            return Err(io::Error::other(
+                "三项 selfplay 联赛比例必须非负且总和等于 1",
             ));
         }
         if self.arena_interval > 0 && self.arena_games == 0 {
@@ -242,16 +276,20 @@ impl AzLoopConfig {
     }
 }
 
-const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 17
+const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 18
 model_path = "model.safetensors"
 best_model_path = "best.safetensors"
 replay_path = "data/replay.jsonl"
 progress_path = "data/azloop-progress.json"
 simulations = 400
+selfplay_white_simulations = 800
 seed = 20260730
 selfplay_samples_per_update = 50000
 selfplay_workers = 192
 selfplay_queue_capacity = 0
+selfplay_current_fraction = 0.699999988079071
+selfplay_current_white_history_fraction = 0.20000000298023224
+selfplay_paired_history_fraction = 0.10000000149011612
 learning_rate = 0.0008
 learning_rate_min = 0.0001
 learning_rate_warmup_steps = 200
@@ -287,8 +325,9 @@ max_checkpoints = 20
 arena_interval = 10
 arena_games = 200
 arena_opening_plies = 2
-arena_promotion_rate = 0.550000011920929
+arena_promotion_rate = 0.5
 arena_promotion_confidence_z = 1.2799999713897705
+arena_color_score_floor = 0.45
 arena_history_size = 2
 arena_history_score_floor = 0.45
 arena_rejection_reset = 3
@@ -303,16 +342,18 @@ mod tests {
     fn default_text_is_exact_and_valid() {
         let config: AzLoopConfig = toml::from_str(DEFAULT_CONFIG_TEXT).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.format_version, 17);
+        assert_eq!(config.format_version, 18);
         assert_eq!(config.batch_size, 1024);
         assert_eq!(config.selfplay_samples_per_update, 50_000);
         assert_eq!(config.selfplay_workers, 192);
+        assert_eq!(config.selfplay_white_simulations, 800);
         assert_eq!(config.arena_games, 200);
         assert_eq!(config.replay_capacity, 500_000);
         assert_eq!(config.replay_warmup_samples, 100_000);
         assert_eq!(config.train_samples_per_update, 50_000);
         assert!(DEFAULT_CONFIG_TEXT.contains("learning_rate = 0.0008\n"));
-        assert!(DEFAULT_CONFIG_TEXT.contains("arena_promotion_rate = 0.550000011920929\n"));
+        assert!(DEFAULT_CONFIG_TEXT.contains("arena_promotion_rate = 0.5\n"));
+        assert_eq!(config.arena_color_score_floor, 0.45);
         assert_eq!(config.arena_promotion_confidence_z, 1.28);
     }
 }
