@@ -5,7 +5,7 @@ use std::{fs, io, path::Path};
 
 pub const INPUT_SIZE: usize = CELL_COUNT * 2 + 1;
 pub const DEFAULT_HIDDEN_SIZE: usize = 192;
-pub const VALUE_HEAD_SIZE: usize = 96;
+pub const VALUE_HEAD_SIZE: usize = 64;
 pub const WDL_SIZE: usize = 3;
 pub const STONE_TYPES: usize = 2;
 pub const AXIS_FEATURES: usize = STONE_TYPES * 15;
@@ -14,11 +14,12 @@ pub const LOCAL_AXES: usize = 4;
 pub const LOCAL_RADIUS: usize = 4;
 pub const LOCAL_RAY_PATTERNS: usize = 4usize.pow(LOCAL_RADIUS as u32);
 pub const LOCAL_AXIS_PATTERNS: usize = LOCAL_RAY_PATTERNS * (LOCAL_RAY_PATTERNS + 1) / 2;
-pub const LOCAL_AXIS_FEATURE_SIZE: usize = 32;
+pub const LOCAL_AXIS_FEATURE_SIZE: usize = 8;
 pub const LOCAL_CANDIDATE_SIZE: usize = LOCAL_AXIS_FEATURE_SIZE * 2;
 pub const VALUE_LOCAL_SIZE: usize = LOCAL_CANDIDATE_SIZE * 2;
-pub const POLICY_HEAD_SIZE: usize = 64;
-const FORMAT_VERSION: f32 = 21.0;
+/// Policy 只保留一个很窄的上下文投影；大容量主干专供可增量更新的 value。
+pub const POLICY_HEAD_SIZE: usize = 16;
+const FORMAT_VERSION: f32 = 22.0;
 const LOCAL_BOUNDARY: u8 = u8::MAX;
 const LOCAL_NEIGHBORS: [u8; CELL_COUNT * LOCAL_AXES * 2 * LOCAL_RADIUS] = build_local_neighbors();
 
@@ -220,17 +221,25 @@ impl PolicyValueModel {
         policy_temperature: f32,
         scratch: &mut EvalScratch,
     ) -> (Vec<(Move, f32)>, f32) {
-        crate::scope_profile!("model.evaluate_incremental");
         debug_assert_eq!(accumulator.move_count, board.move_count());
+        let preactivation = match board.to_move() {
+            Player::Black => &accumulator.black,
+            Player::White => &accumulator.white,
+        };
+        self.evaluate_preactivation_with_scratch(board, preactivation, policy_temperature, scratch)
+    }
+
+    fn evaluate_preactivation_with_scratch(
+        &self,
+        board: &Board,
+        preactivation: &[f32],
+        policy_temperature: f32,
+        scratch: &mut EvalScratch,
+    ) -> (Vec<(Move, f32)>, f32) {
+        crate::scope_profile!("model.evaluate_incremental");
         {
             crate::scope_profile!("model.activate_norm");
-            self.activate_hidden_into(
-                match board.to_move() {
-                    Player::Black => &accumulator.black,
-                    Player::White => &accumulator.white,
-                },
-                &mut scratch.hidden,
-            );
+            self.activate_hidden_into(preactivation, &mut scratch.hidden);
         }
         let moves = board.search_candidates();
         if moves.is_empty() {
@@ -380,24 +389,66 @@ impl PolicyValueModel {
         accumulator
     }
 
-    pub(crate) fn accumulator_after_move(
+    /// MCTS 使用连续 arena 保存累加器，避免每个节点为两个 Vec 单独分配内存。
+    pub(crate) fn accumulator_into_arena(&self, board: &Board, arena: &mut Vec<f32>) -> usize {
+        let accumulator = self.accumulator(board);
+        let offset = arena.len();
+        arena.extend_from_slice(&accumulator.black);
+        arena.extend_from_slice(&accumulator.white);
+        offset
+    }
+
+    pub(crate) fn accumulator_after_move_into_arena(
         &self,
-        parent: &EvalAccumulator,
+        arena: &mut Vec<f32>,
+        parent_offset: usize,
         mv: Move,
         player: Player,
-    ) -> EvalAccumulator {
-        crate::scope_profile!("model.accumulator_update");
-        let mut child = parent.clone();
-        self.add_stone(&mut child, mv, player);
-        self.set_move_count(&mut child, parent.move_count + 1);
-        child
+    ) -> usize {
+        let width = self.hidden_size * 2;
+        debug_assert!(parent_offset + width <= arena.len());
+        let offset = arena.len();
+        arena.extend_from_within(parent_offset..parent_offset + width);
+        let (black, white) = arena[offset..offset + width].split_at_mut(self.hidden_size);
+        self.add_stone_to_slices(black, white, mv, player);
+        let rule_offset = (INPUT_SIZE - 1) * self.hidden_size;
+        let delta = 1.0 / CELL_COUNT as f32;
+        for h in 0..self.hidden_size {
+            let change = self.input_hidden[rule_offset + h] * delta;
+            black[h] += change;
+            white[h] += change;
+        }
+        offset
+    }
+
+    pub(crate) fn evaluate_arena_with_scratch(
+        &self,
+        board: &Board,
+        arena: &[f32],
+        offset: usize,
+        policy_temperature: f32,
+        scratch: &mut EvalScratch,
+    ) -> (Vec<(Move, f32)>, f32) {
+        let width = self.hidden_size * 2;
+        let side_offset = match board.to_move() {
+            Player::Black => offset,
+            Player::White => offset + self.hidden_size,
+        };
+        debug_assert!(offset + width <= arena.len());
+        self.evaluate_preactivation_with_scratch(
+            board,
+            &arena[side_offset..side_offset + self.hidden_size],
+            policy_temperature,
+            scratch,
+        )
     }
 
     fn add_stone(&self, accumulator: &mut EvalAccumulator, mv: Move, player: Player) {
-        for (perspective, hidden) in [
-            (Player::Black, &mut accumulator.black),
-            (Player::White, &mut accumulator.white),
-        ] {
+        self.add_stone_to_slices(&mut accumulator.black, &mut accumulator.white, mv, player);
+    }
+
+    fn add_stone_to_slices(&self, black: &mut [f32], white: &mut [f32], mv: Move, player: Player) {
+        for (perspective, hidden) in [(Player::Black, black), (Player::White, white)] {
             let side = usize::from(player != perspective);
             let exact = (side * CELL_COUNT + mv.0) * self.hidden_size;
             let rank = (side * 15 + mv.row()) * self.hidden_size;
@@ -1121,6 +1172,26 @@ mod tests {
         let forward = local_ray_codes(&board, candidate, 0, 1);
         let backward = local_ray_codes(&board, candidate, 0, -1);
         assert_eq!(forward, backward);
+    }
+
+    #[test]
+    fn arena_accumulator_matches_full_rebuild_after_move() {
+        let model = PolicyValueModel::random(12, 19);
+        let mut board = Board::new();
+        assert!(board.play(Move::parse("h8").unwrap()));
+        let mut arena = Vec::new();
+        let root = model.accumulator_into_arena(&board, &mut arena);
+        let mv = Move::parse("h9").unwrap();
+        let player = board.to_move();
+        let child = model.accumulator_after_move_into_arena(&mut arena, root, mv, player);
+        assert!(board.play(mv));
+        let rebuilt = model.accumulator(&board);
+        for (incremental, rebuilt) in arena[child..child + model.hidden_size * 2]
+            .iter()
+            .zip(rebuilt.black.iter().chain(&rebuilt.white))
+        {
+            assert!((incremental - rebuilt).abs() < 1.0e-6);
+        }
     }
 
     #[test]

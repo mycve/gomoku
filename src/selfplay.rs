@@ -359,6 +359,9 @@ impl ArenaReport {
     pub fn score_rate_lower_bound(self, z: f32) -> f32 {
         self.score_rate() - z.max(0.0) * self.score_rate_standard_error()
     }
+    pub fn promotes_with_lower_bound(self, threshold: f32, z: f32) -> bool {
+        self.score_rate_lower_bound(z) >= threshold.clamp(0.0, 1.0)
+    }
     pub fn elo_diff(self) -> f32 {
         let score = self.score_rate();
         if score <= 0.0 {
@@ -521,6 +524,8 @@ mod tests {
         };
         let expected = (0.25_f32 / 3.0).sqrt();
         assert!((report.score_rate_standard_error() - expected).abs() < 1.0e-6);
+        assert!(!report.promotes_with_lower_bound(0.50, 1.28));
+        assert!(report.promotes_with_lower_bound(0.40, 0.0));
     }
 
     #[test]

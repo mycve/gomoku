@@ -1,6 +1,6 @@
 use crate::{
     game::{Board, CELL_COUNT, Move, Outcome, transform_index},
-    model::{EvalAccumulator, EvalScratch, PolicyValueModel},
+    model::{EvalScratch, PolicyValueModel},
 };
 use std::{
     collections::HashMap,
@@ -72,7 +72,7 @@ pub struct SearchOutput {
 }
 struct Node {
     board: Board,
-    accumulator: EvalAccumulator,
+    accumulator_offset: usize,
     children: Vec<Edge>,
     expanded: bool,
     initial_value: f32,
@@ -116,21 +116,33 @@ fn search_until(
 ) -> SearchOutput {
     crate::scope_profile!("mcts.search");
     let mut scratch = EvalScratch::new(model.hidden_size);
+    let mut accumulator_arena = Vec::with_capacity(
+        cfg.graph_search_max_nodes.min(cfg.simulations + 1) * model.hidden_size * 2,
+    );
+    let root_accumulator = model.accumulator_into_arena(board, &mut accumulator_arena);
     let mut nodes = vec![Node {
         board: board.clone(),
-        accumulator: model.accumulator(board),
+        accumulator_offset: root_accumulator,
         children: vec![],
         expanded: false,
         initial_value: 0.0,
     }];
     let mut transpositions = HashMap::new();
     transpositions.insert(board_hash(board), vec![0]);
-    expand(&mut nodes, 0, model, cfg, &mut scratch);
+    expand(&mut nodes, &accumulator_arena, 0, model, cfg, &mut scratch);
     for simulation in 0..cfg.simulations {
         if simulation > 0 && deadline.is_some_and(|limit| Instant::now() >= limit) {
             break;
         }
-        simulate(&mut nodes, &mut transpositions, 0, model, cfg, &mut scratch);
+        simulate(
+            &mut nodes,
+            &mut accumulator_arena,
+            &mut transpositions,
+            0,
+            model,
+            cfg,
+            &mut scratch,
+        );
     }
     let mut out: Vec<_> = nodes[0]
         .children
@@ -164,6 +176,7 @@ fn search_until(
 }
 fn expand(
     nodes: &mut Vec<Node>,
+    accumulator_arena: &[f32],
     idx: usize,
     model: &PolicyValueModel,
     cfg: SearchConfig,
@@ -188,9 +201,10 @@ fn expand(
         if idx == 0 && cfg.root_num_symmetries_to_sample > 1 {
             evaluate_root_symmetries(&nodes[idx].board, model, cfg)
         } else {
-            model.evaluate_accumulator_with_scratch(
+            model.evaluate_arena_with_scratch(
                 &nodes[idx].board,
-                &nodes[idx].accumulator,
+                accumulator_arena,
+                nodes[idx].accumulator_offset,
                 1.0,
                 scratch,
             )
@@ -290,6 +304,7 @@ fn expand(
 }
 fn simulate(
     nodes: &mut Vec<Node>,
+    accumulator_arena: &mut Vec<f32>,
     transpositions: &mut HashMap<u64, Vec<usize>>,
     idx: usize,
     model: &PolicyValueModel,
@@ -309,7 +324,7 @@ fn simulate(
         };
     }
     if !nodes[idx].expanded {
-        return expand(nodes, idx, model, cfg, scratch);
+        return expand(nodes, accumulator_arena, idx, model, cfg, scratch);
     }
     let best = {
         crate::scope_profile!("mcts.select_child");
@@ -346,7 +361,12 @@ fn simulate(
         let mut b = nodes[idx].board.clone();
         let mv = nodes[idx].children[best].mv;
         let player = b.to_move();
-        let accumulator = model.accumulator_after_move(&nodes[idx].accumulator, mv, player);
+        let accumulator_offset = model.accumulator_after_move_into_arena(
+            accumulator_arena,
+            nodes[idx].accumulator_offset,
+            mv,
+            player,
+        );
         b.play(mv);
         let key = board_hash(&b);
         let c = if cfg.use_graph_search {
@@ -363,7 +383,7 @@ fn simulate(
             let c = nodes.len();
             nodes.push(Node {
                 board: b,
-                accumulator,
+                accumulator_offset,
                 children: vec![],
                 expanded: false,
                 initial_value: 0.0,
@@ -376,7 +396,15 @@ fn simulate(
         nodes[idx].children[best].child = Some(c);
         c
     };
-    let value = -simulate(nodes, transpositions, child, model, cfg, scratch);
+    let value = -simulate(
+        nodes,
+        accumulator_arena,
+        transpositions,
+        child,
+        model,
+        cfg,
+        scratch,
+    );
     let e = &mut nodes[idx].children[best];
     e.visits += 1;
     e.value_sum += value;

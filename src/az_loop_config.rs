@@ -55,13 +55,16 @@ pub struct AzLoopConfig {
     pub arena_opening_plies: usize,
     pub arena_promotion_rate: f32,
     pub arena_promotion_confidence_z: f32,
+    pub arena_history_size: usize,
+    pub arena_history_score_floor: f32,
+    pub arena_rejection_reset: usize,
     pub tensorboard_logdir: String,
 }
 
 impl Default for AzLoopConfig {
     fn default() -> Self {
         Self {
-            format_version: 14,
+            format_version: 15,
             model_path: "model.safetensors".into(),
             ema_model_path: "ema.safetensors".into(),
             best_model_path: "best.safetensors".into(),
@@ -110,6 +113,9 @@ impl Default for AzLoopConfig {
             arena_opening_plies: 2,
             arena_promotion_rate: 0.55,
             arena_promotion_confidence_z: 1.28,
+            arena_history_size: 2,
+            arena_history_score_floor: 0.45,
+            arena_rejection_reset: 3,
             tensorboard_logdir: "runs/gomoku".into(),
         }
     }
@@ -153,6 +159,7 @@ impl AzLoopConfig {
                 "arena_promotion_confidence_z",
                 self.arena_promotion_confidence_z,
             ),
+            ("arena_history_score_floor", self.arena_history_score_floor),
             (
                 "replay_recent_sample_fraction",
                 self.replay_recent_sample_fraction,
@@ -171,8 +178,8 @@ impl AzLoopConfig {
                 return Err(io::Error::other(format!("配置 `{name}` 必须是有限数值")));
             }
         }
-        if self.format_version != 14 {
-            return Err(io::Error::other("仅支持 format_version = 14"));
+        if self.format_version != 15 {
+            return Err(io::Error::other("仅支持 format_version = 15"));
         }
         if self.simulations == 0
             || self.selfplay_samples_per_update == 0
@@ -203,6 +210,7 @@ impl AzLoopConfig {
             || !(0.0..=1.0).contains(&self.ema_decay)
             || !(0.0..=1.0).contains(&self.arena_promotion_rate)
             || self.arena_promotion_confidence_z < 0.0
+            || !(0.0..=1.0).contains(&self.arena_history_score_floor)
             || !(0.0..=1.0).contains(&self.replay_recent_sample_fraction)
             || !(0.0..=1.0).contains(&self.replay_policy_surprise_fraction)
             || !(0.0..=1.0).contains(&self.replay_value_surprise_fraction)
@@ -238,7 +246,7 @@ impl AzLoopConfig {
     }
 }
 
-const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 14
+const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 15
 model_path = "model.safetensors"
 ema_model_path = "ema.safetensors"
 best_model_path = "best.safetensors"
@@ -287,6 +295,9 @@ arena_games = 100
 arena_opening_plies = 2
 arena_promotion_rate = 0.550000011920929
 arena_promotion_confidence_z = 1.2799999713897705
+arena_history_size = 2
+arena_history_score_floor = 0.45
+arena_rejection_reset = 3
 tensorboard_logdir = "runs/gomoku"
 "#;
 
@@ -298,7 +309,7 @@ mod tests {
     fn default_text_is_exact_and_valid() {
         let config: AzLoopConfig = toml::from_str(DEFAULT_CONFIG_TEXT).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.format_version, 14);
+        assert_eq!(config.format_version, 15);
         assert_eq!(config.batch_size, 1024);
         assert_eq!(config.selfplay_samples_per_update, 50_000);
         assert_eq!(config.selfplay_workers, 196);

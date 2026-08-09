@@ -9,6 +9,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::VecDeque,
     fs, io,
     path::{Path, PathBuf},
     sync::{
@@ -28,6 +29,7 @@ struct Progress {
     total_samples: usize,
     optimizer_steps: usize,
     learning_rate: f32,
+    consecutive_rejections: usize,
 }
 
 #[derive(Default)]
@@ -55,6 +57,11 @@ struct TrainerEvent {
     actual_recent_rate: f32,
 }
 
+enum TrainerCommand {
+    Continue,
+    Reset(PolicyValueModel),
+}
+
 pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let interrupted = Arc::new(AtomicBool::new(false));
@@ -79,6 +86,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         initial_ema.save(&config.best_model_path)?;
         initial_ema.clone()
     };
+    let mut champion_history = load_champion_history(&config, &best)?;
     let initial_pool = if Path::new(&config.replay_path).exists() {
         let pool = replay::load(&config.replay_path)?;
         fs::remove_file(&config.replay_path)?;
@@ -155,7 +163,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         config.learning_rate,
         progress.optimizer_steps
     );
-    let published = Arc::new(RwLock::new(initial_ema.clone()));
+    let published = Arc::new(RwLock::new(best.clone()));
     let version = Arc::new(AtomicU64::new(progress.update as u64));
     let mut actors = AsyncSelfplay::start(
         Arc::clone(&published),
@@ -236,7 +244,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     });
     let (event_tx, event_rx) = mpsc::sync_channel::<TrainerEvent>(0);
     let (trainer_error_tx, trainer_error_rx) = mpsc::sync_channel::<String>(1);
-    let (trainer_ack_tx, trainer_ack_rx) = mpsc::sync_channel::<()>(0);
+    let (trainer_ack_tx, trainer_ack_rx) = mpsc::sync_channel::<TrainerCommand>(0);
     let trainer_stop = Arc::clone(&stop);
     let trainer_interrupted = Arc::clone(&interrupted);
     let trainer_version = Arc::clone(&version);
@@ -323,8 +331,19 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                     break;
                 }
                 index += 1;
-                if trainer_ack_rx.recv().is_err() {
-                    break;
+                match trainer_ack_rx.recv() {
+                    Ok(TrainerCommand::Continue) => {}
+                    Ok(TrainerCommand::Reset(champion)) => {
+                        model = champion.clone();
+                        ema_model = champion;
+                        ema_initialized = true;
+                        training = candle_train::TrainingSession::new(
+                            &model,
+                            Some(&ema_model),
+                            current_lr(&trainer_config, optimizer_steps),
+                        )?;
+                    }
+                    Err(_) => break,
                 }
             }
             if trainer_interrupted.load(Ordering::SeqCst) {
@@ -381,8 +400,6 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         progress.total_samples += event.batch.samples.len();
         progress.optimizer_steps += event.train_stats.optimizer_steps;
         progress.learning_rate = event.learning_rate;
-        *published.write().unwrap_or_else(|e| e.into_inner()) = event.model.clone();
-        version.store(progress.update as u64, Ordering::Release);
         event.online_model.save(&config.model_path)?;
         event.model.save(&config.ema_model_path)?;
         save_progress(&config.progress_path, &progress)?;
@@ -643,6 +660,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             progress.total_samples as f32,
             progress.update,
         );
+        let mut trainer_command = TrainerCommand::Continue;
         if config.arena_interval > 0 && progress.update % config.arena_interval == 0 {
             println!(
                 "arena    : starting games={} simulations={} workers={}",
@@ -651,31 +669,66 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 rayon::current_num_threads().min(config.arena_games.max(1))
             );
             let arena_started = Instant::now();
-            let report = arena_controlled(
-                &event.model,
-                &best,
-                config.arena_games,
-                SearchConfig {
-                    simulations: config.simulations,
-                    cpuct: config.cpuct,
-                    cpuct_log: config.cpuct_log,
-                    cpuct_base: config.cpuct_base,
-                    root_policy_temperature: 1.0,
-                    root_num_symmetries_to_sample: config.root_num_symmetries_to_sample,
-                    use_graph_search: config.use_graph_search,
-                    graph_search_max_nodes: config.graph_search_max_nodes,
-                    use_lcb_for_selection: config.use_lcb_for_selection,
-                    lcb_stdevs: config.lcb_stdevs,
-                    min_visit_prop_for_lcb: config.min_visit_prop_for_lcb,
-                    opening_random_plies: config.arena_opening_plies,
-                    opening_seed: config.seed ^ progress.update as u64,
-                    ..Default::default()
-                },
-                Some(&stop),
-            );
+            let current_games = if champion_history.is_empty() {
+                config.arena_games
+            } else {
+                config.arena_games.div_ceil(2)
+            };
+            let history_games = config
+                .arena_games
+                .saturating_sub(current_games)
+                .div_ceil(champion_history.len().max(1))
+                .max(2);
+            let arena_cfg = SearchConfig {
+                simulations: config.simulations,
+                cpuct: config.cpuct,
+                cpuct_log: config.cpuct_log,
+                cpuct_base: config.cpuct_base,
+                root_policy_temperature: 1.0,
+                root_num_symmetries_to_sample: config.root_num_symmetries_to_sample,
+                use_graph_search: config.use_graph_search,
+                graph_search_max_nodes: config.graph_search_max_nodes,
+                use_lcb_for_selection: config.use_lcb_for_selection,
+                lcb_stdevs: config.lcb_stdevs,
+                min_visit_prop_for_lcb: config.min_visit_prop_for_lcb,
+                opening_random_plies: config.arena_opening_plies,
+                opening_seed: config.seed ^ progress.update as u64,
+                ..Default::default()
+            };
+            let report =
+                arena_controlled(&event.model, &best, current_games, arena_cfg, Some(&stop));
+            let mut history_passed = true;
+            for (index, champion) in champion_history.iter().enumerate() {
+                let history_report = arena_controlled(
+                    &event.model,
+                    champion,
+                    history_games,
+                    SearchConfig {
+                        opening_seed: arena_cfg.opening_seed ^ ((index as u64 + 1) << 48),
+                        ..arena_cfg
+                    },
+                    Some(&stop),
+                );
+                let passed = history_report.score_rate() >= config.arena_history_score_floor;
+                history_passed &= passed;
+                println!(
+                    "arena-history {}: W/L/D={}/{}/{} rate={:.2}% floor={:.2}% passed={}",
+                    index + 1,
+                    history_report.wins,
+                    history_report.losses,
+                    history_report.draws,
+                    history_report.score_rate() * 100.0,
+                    config.arena_history_score_floor * 100.0,
+                    passed,
+                );
+            }
             let arena_seconds = arena_started.elapsed().as_secs_f32();
             let lower_bound = report.score_rate_lower_bound(config.arena_promotion_confidence_z);
-            let promoted = report.score_rate() >= config.arena_promotion_rate && lower_bound > 0.5;
+            let current_passed = report.promotes_with_lower_bound(
+                config.arena_promotion_rate,
+                config.arena_promotion_confidence_z,
+            );
+            let promoted = current_passed && history_passed;
             let black_games =
                 (report.wins_as_black + report.losses_as_black + report.draws_as_black).max(1)
                     as f32;
@@ -757,20 +810,34 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             tb.add_scalar("arena/score_as_black", score_as_black, progress.update);
             tb.add_scalar("arena/score_as_white", score_as_white, progress.update);
             if promoted {
+                push_champion_history(&config, &mut champion_history, &best)?;
                 best = event.model.clone();
                 best.save(&config.best_model_path)?;
+                *published.write().unwrap_or_else(|e| e.into_inner()) = best.clone();
+                version.fetch_add(1, Ordering::Release);
+                progress.consecutive_rejections = 0;
                 println!(
                     "promote  : best={} model_version={}",
                     config.best_model_path, progress.update
                 );
+            } else {
+                progress.consecutive_rejections += 1;
+                if config.arena_rejection_reset > 0
+                    && progress.consecutive_rejections >= config.arena_rejection_reset
+                {
+                    trainer_command = TrainerCommand::Reset(best.clone());
+                    progress.consecutive_rejections = 0;
+                    println!("rollback : trainer/EMA reset to current champion");
+                }
             }
+            save_progress(&config.progress_path, &progress)?;
         }
         tb.flush();
         if progress.update >= end {
             stop.store(true, Ordering::SeqCst);
         }
         trainer_ack_tx
-            .send(())
+            .send(trainer_command)
             .map_err(|_| io::Error::other("Trainer 确认通道提前关闭"))?;
     }
     stop.store(true, Ordering::SeqCst);
@@ -968,6 +1035,43 @@ fn prune_checkpoints(c: &AzLoopConfig) -> io::Result<()> {
     let remove = files.len().saturating_sub(c.max_checkpoints);
     for path in files.into_iter().take(remove) {
         fs::remove_file(path)?
+    }
+    Ok(())
+}
+
+fn champion_history_path(config: &AzLoopConfig, index: usize) -> PathBuf {
+    Path::new(&config.checkpoint_dir).join(format!("champion-history-{}.safetensors", index + 1))
+}
+
+fn load_champion_history(
+    config: &AzLoopConfig,
+    _current: &PolicyValueModel,
+) -> io::Result<VecDeque<PolicyValueModel>> {
+    let mut history = VecDeque::new();
+    for index in 0..config.arena_history_size {
+        let path = champion_history_path(config, index);
+        if !path.exists() {
+            break;
+        }
+        history.push_back(PolicyValueModel::load(path)?);
+    }
+    Ok(history)
+}
+
+fn push_champion_history(
+    config: &AzLoopConfig,
+    history: &mut VecDeque<PolicyValueModel>,
+    champion: &PolicyValueModel,
+) -> io::Result<()> {
+    if config.arena_history_size == 0 {
+        history.clear();
+        return Ok(());
+    }
+    history.push_front(champion.clone());
+    history.truncate(config.arena_history_size);
+    fs::create_dir_all(&config.checkpoint_dir)?;
+    for (index, model) in history.iter().enumerate() {
+        model.save(champion_history_path(config, index))?;
     }
     Ok(())
 }
