@@ -11,7 +11,10 @@ use gomoku::{
     candle_train, distill,
     game::{Board, Move, Outcome, Player},
     mcts::{Candidate, SearchConfig, search},
-    model::PolicyValueModel,
+    model::{
+        INPUT_SIZE, LOCAL_AXIS_FEATURE_SIZE, POLICY_HEAD_SIZE, PolicyValueModel,
+        REGION_FEATURE_SIZE, ROLE_ADAPTER_RANK, VALUE_HEAD_SIZE,
+    },
     replay,
     selfplay::arena,
 };
@@ -224,9 +227,15 @@ fn main() -> io::Result<()> {
             PolicyValueModel::random(args.hidden, args.seed).save(&args.output)?;
             println!("model    : initialized {}", args.output);
             println!(
-                "arch     : input=451 hidden={} rmsnorm local=4axesx8cells-pattern{} policy=global+local-gate->relu64->225 value=96x96xWDL3",
+                "arch     : input={} hidden={} rmsnorm role=rank{} region=3x3x{} local=4axesx8cells-pattern{} policy=dynamic{} value={}x{}xWDL3",
+                INPUT_SIZE,
                 args.hidden,
-                gomoku::model::LOCAL_AXIS_FEATURE_SIZE,
+                ROLE_ADAPTER_RANK,
+                REGION_FEATURE_SIZE,
+                LOCAL_AXIS_FEATURE_SIZE,
+                POLICY_HEAD_SIZE,
+                VALUE_HEAD_SIZE,
+                VALUE_HEAD_SIZE,
             );
             println!("board    : 15x15 freestyle gomoku");
         }

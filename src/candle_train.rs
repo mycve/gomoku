@@ -2,8 +2,10 @@ use crate::{
     game::CELL_COUNT,
     model::{
         AXIS_FEATURES, DIAGONAL_FEATURES, INPUT_SIZE, LOCAL_AXES, LOCAL_AXIS_FEATURE_SIZE,
-        LOCAL_AXIS_PATTERNS, LOCAL_CANDIDATE_SIZE, POLICY_HEAD_SIZE, PolicyValueModel, STONE_TYPES,
-        VALUE_HEAD_SIZE, VALUE_LOCAL_SIZE, WDL_SIZE, local_ray_codes,
+        LOCAL_AXIS_PATTERNS, LOCAL_CANDIDATE_SIZE, MOVE_COUNT_INPUT, POLICY_HEAD_SIZE,
+        PolicyValueModel, REGION_COUNT, REGION_FEATURE_SIZE, REGION_TOTAL_SIZE, ROLE_ADAPTER_RANK,
+        ROLE_COUNT, ROLE_INPUT_START, STONE_TYPES, VALUE_HEAD_SIZE, VALUE_LOCAL_SIZE, WDL_SIZE,
+        local_ray_codes,
     },
     replay::Sample,
     selfplay::TrainStats,
@@ -412,10 +414,12 @@ struct Replica {
     diagonal_hidden: Var,
     anti_diagonal_hidden: Var,
     hidden_bias: Var,
+    role_adapter_down: Var,
+    role_adapter_up: Var,
+    region_embedding: Var,
     policy_global: Var,
     policy_global_bias: Var,
-    policy_gate: Var,
-    policy_gate_bias: Var,
+    policy_dynamic: Var,
     policy_output: Var,
     policy_bias: Var,
     local_axis_embedding: Var,
@@ -423,6 +427,7 @@ struct Replica {
     local_axis_bias: Var,
     policy_local: Var,
     value_head_hidden: Var,
+    value_region_hidden: Var,
     value_local_output: Var,
     value_head_bias: Var,
     value_head_hidden2: Var,
@@ -441,10 +446,28 @@ impl Replica {
             diagonal_hidden: var(&model.diagonal_hidden, (DIAGONAL_FEATURES, h), device)?,
             anti_diagonal_hidden: var(&model.anti_diagonal_hidden, (DIAGONAL_FEATURES, h), device)?,
             hidden_bias: var(&model.hidden_bias, (h,), device)?,
+            role_adapter_down: var(
+                &model.role_adapter_down,
+                (ROLE_COUNT * ROLE_ADAPTER_RANK, h),
+                device,
+            )?,
+            role_adapter_up: var(
+                &model.role_adapter_up,
+                (ROLE_COUNT * h, ROLE_ADAPTER_RANK),
+                device,
+            )?,
+            region_embedding: var(
+                &model.region_embedding,
+                (REGION_COUNT, STONE_TYPES, REGION_FEATURE_SIZE),
+                device,
+            )?,
             policy_global: var(&model.policy_global, (POLICY_HEAD_SIZE, h), device)?,
             policy_global_bias: var(&model.policy_global_bias, (POLICY_HEAD_SIZE,), device)?,
-            policy_gate: var(&model.policy_gate, (POLICY_HEAD_SIZE,), device)?,
-            policy_gate_bias: var(&model.policy_gate_bias, (1,), device)?,
+            policy_dynamic: var(
+                &model.policy_dynamic,
+                (LOCAL_CANDIDATE_SIZE, POLICY_HEAD_SIZE),
+                device,
+            )?,
             policy_output: var(&model.policy_output, (CELL_COUNT, POLICY_HEAD_SIZE), device)?,
             policy_bias: var(&model.policy_bias, (CELL_COUNT,), device)?,
             local_axis_embedding: var(
@@ -460,6 +483,11 @@ impl Replica {
             local_axis_bias: var(&model.local_axis_bias, (2, LOCAL_AXIS_FEATURE_SIZE), device)?,
             policy_local: var(&model.policy_local, (LOCAL_CANDIDATE_SIZE,), device)?,
             value_head_hidden: var(&model.value_head_hidden, (VALUE_HEAD_SIZE, h), device)?,
+            value_region_hidden: var(
+                &model.value_region_hidden,
+                (VALUE_HEAD_SIZE, REGION_TOTAL_SIZE),
+                device,
+            )?,
             value_local_output: var(
                 &model.value_local_output,
                 (WDL_SIZE, VALUE_LOCAL_SIZE),
@@ -488,10 +516,12 @@ impl Replica {
             self.diagonal_hidden.clone(),
             self.anti_diagonal_hidden.clone(),
             self.hidden_bias.clone(),
+            self.role_adapter_down.clone(),
+            self.role_adapter_up.clone(),
+            self.region_embedding.clone(),
             self.policy_global.clone(),
             self.policy_global_bias.clone(),
-            self.policy_gate.clone(),
-            self.policy_gate_bias.clone(),
+            self.policy_dynamic.clone(),
             self.policy_output.clone(),
             self.policy_bias.clone(),
             self.local_axis_embedding.clone(),
@@ -499,6 +529,7 @@ impl Replica {
             self.local_axis_bias.clone(),
             self.policy_local.clone(),
             self.value_head_hidden.clone(),
+            self.value_region_hidden.clone(),
             self.value_local_output.clone(),
             self.value_head_bias.clone(),
             self.value_head_hidden2.clone(),
@@ -517,6 +548,7 @@ impl Replica {
             pack(samples)
         };
         let b = samples.len();
+        let h = self.hidden_bias.dim(0).map_err(err)?;
         crate::scope_profile!("train.tensor_h2d");
         let inputs = Tensor::from_vec(packed.inputs, (b, INPUT_SIZE), &self.device).map_err(err)?;
         let stone_counts =
@@ -531,6 +563,13 @@ impl Replica {
         let anti_diagonal_counts = Tensor::from_vec(
             packed.anti_diagonal_counts,
             (b, DIAGONAL_FEATURES),
+            &self.device,
+        )
+        .map_err(err)?;
+        let roles = Tensor::from_vec(packed.roles, (b, ROLE_COUNT), &self.device).map_err(err)?;
+        let region_counts = Tensor::from_vec(
+            packed.region_counts,
+            (b, REGION_COUNT, STONE_TYPES, 1),
             &self.device,
         )
         .map_err(err)?;
@@ -573,6 +612,34 @@ impl Replica {
             .and_then(|x| x.sqrt())
             .map_err(err)?;
         let hidden = hidden.broadcast_div(&rms).map_err(err)?;
+        let mut adapted = hidden.clone();
+        for role in 0..ROLE_COUNT {
+            let down = self
+                .role_adapter_down
+                .narrow(0, role * ROLE_ADAPTER_RANK, ROLE_ADAPTER_RANK)
+                .map_err(err)?;
+            let up = self.role_adapter_up.narrow(0, role * h, h).map_err(err)?;
+            let mask = roles.narrow(1, role, 1).map_err(err)?;
+            let residual = hidden
+                .matmul(&down.t().map_err(err)?)
+                .and_then(|x| x.relu())
+                .and_then(|x| x.matmul(&up.t()?))
+                .and_then(|x| x.broadcast_mul(&mask))
+                .map_err(err)?;
+            adapted = adapted.add(&residual).map_err(err)?;
+        }
+        let adapted_rms = adapted
+            .sqr()
+            .and_then(|x| x.mean_keepdim(1))
+            .and_then(|x| x.affine(1.0, 1.0e-6))
+            .and_then(|x| x.sqrt())
+            .map_err(err)?;
+        let hidden = adapted.broadcast_div(&adapted_rms).map_err(err)?;
+        let region_features = region_counts
+            .broadcast_mul(&self.region_embedding.unsqueeze(0).map_err(err)?)
+            .and_then(|x| x.sum(2))
+            .and_then(|x| x.reshape((b, REGION_TOTAL_SIZE)))
+            .map_err(err)?;
         let local_axes = self
             .local_axis_embedding
             .as_tensor()
@@ -640,35 +707,23 @@ impl Replica {
         let local_mean = local_axes.mean(2).map_err(err)?;
         let local_max = local_axes.max(2).map_err(err)?;
         let local_candidates = Tensor::cat(&[&local_mean, &local_max], 2).map_err(err)?;
-        let local_policy_logits = local_candidates
-            .reshape((b * CELL_COUNT, LOCAL_CANDIDATE_SIZE))
-            .and_then(|x| {
-                x.matmul(
-                    &self
-                        .policy_local
-                        .as_tensor()
-                        .reshape((LOCAL_CANDIDATE_SIZE, 1))?,
-                )
-            })
-            .and_then(|x| x.reshape((b, CELL_COUNT)))
-            .map_err(err)?;
         let policy_global = hidden
             .matmul(&self.policy_global.t().map_err(err)?)
             .and_then(|x| x.broadcast_add(&self.policy_global_bias))
             .and_then(|x| x.relu())
             .map_err(err)?;
-        let policy_gate = policy_global
-            .matmul(
-                &self
-                    .policy_gate
-                    .reshape((POLICY_HEAD_SIZE, 1))
-                    .map_err(err)?,
-            )
-            .and_then(|x| x.broadcast_add(&self.policy_gate_bias))
+        let dynamic_weights = policy_global
+            .matmul(&self.policy_dynamic.t().map_err(err)?)
+            .and_then(|x| x.broadcast_add(&self.policy_local))
+            .and_then(|x| x.unsqueeze(1))
+            .map_err(err)?;
+        let local_policy_logits = local_candidates
+            .broadcast_mul(&dynamic_weights)
+            .and_then(|x| x.sum(2))
             .map_err(err)?;
         let logits = policy_global
             .matmul(&self.policy_output.t().map_err(err)?)
-            .and_then(|x| x.add(&local_policy_logits.broadcast_mul(&policy_gate)?))
+            .and_then(|x| x.add(&local_policy_logits))
             .and_then(|x| x.broadcast_add(&self.policy_bias))
             .and_then(|x| x.add(&masks))
             .map_err(err)?;
@@ -695,6 +750,7 @@ impl Replica {
         let local_value = Tensor::cat(&[&local_board_mean, &local_board_max], 1).map_err(err)?;
         let value_features = hidden
             .matmul(&self.value_head_hidden.t().map_err(err)?)
+            .and_then(|x| x.add(&region_features.matmul(&self.value_region_hidden.t()?)?))
             .and_then(|x| x.broadcast_add(&self.value_head_bias))
             .and_then(|x| x.relu())
             .and_then(|x| x.matmul(&self.value_head_hidden2.t()?))
@@ -755,22 +811,25 @@ impl Replica {
         m.diagonal_hidden = v[4].clone();
         m.anti_diagonal_hidden = v[5].clone();
         m.hidden_bias = v[6].clone();
-        m.policy_global = v[7].clone();
-        m.policy_global_bias = v[8].clone();
-        m.policy_gate = v[9].clone();
-        m.policy_gate_bias = v[10].clone();
-        m.policy_output = v[11].clone();
-        m.policy_bias = v[12].clone();
-        m.local_axis_embedding = v[13].clone();
-        m.local_axis_scale = v[14].clone();
-        m.local_axis_bias = v[15].clone();
-        m.policy_local = v[16].clone();
-        m.value_head_hidden = v[17].clone();
-        m.value_local_output = v[18].clone();
-        m.value_head_bias = v[19].clone();
-        m.value_head_hidden2 = v[20].clone();
-        m.value_head_bias2 = v[21].clone();
-        m.value_head_output = v[22].clone();
+        m.role_adapter_down = v[7].clone();
+        m.role_adapter_up = v[8].clone();
+        m.region_embedding = v[9].clone();
+        m.policy_global = v[10].clone();
+        m.policy_global_bias = v[11].clone();
+        m.policy_dynamic = v[12].clone();
+        m.policy_output = v[13].clone();
+        m.policy_bias = v[14].clone();
+        m.local_axis_embedding = v[15].clone();
+        m.local_axis_scale = v[16].clone();
+        m.local_axis_bias = v[17].clone();
+        m.policy_local = v[18].clone();
+        m.value_head_hidden = v[19].clone();
+        m.value_region_hidden = v[20].clone();
+        m.value_local_output = v[21].clone();
+        m.value_head_bias = v[22].clone();
+        m.value_head_hidden2 = v[23].clone();
+        m.value_head_bias2 = v[24].clone();
+        m.value_head_output = v[25].clone();
         m.refresh_local_axis_features();
         Ok(())
     }
@@ -933,6 +992,8 @@ fn make_device(requested: usize) -> io::Result<(Device, String)> {
 
 struct Packed {
     inputs: Vec<f32>,
+    roles: Vec<f32>,
+    region_counts: Vec<f32>,
     stone_counts: Vec<f32>,
     rank_counts: Vec<f32>,
     file_counts: Vec<f32>,
@@ -950,6 +1011,8 @@ struct Packed {
 }
 fn pack(samples: &[Sample]) -> Packed {
     let mut inputs = vec![0.0; samples.len() * INPUT_SIZE];
+    let mut roles = vec![0.0; samples.len() * ROLE_COUNT];
+    let mut region_counts = vec![0.0; samples.len() * REGION_COUNT * STONE_TYPES];
     let mut stone_counts = vec![0.0; samples.len() * STONE_TYPES];
     let mut rank_counts = vec![0.0; samples.len() * AXIS_FEATURES];
     let mut file_counts = vec![0.0; samples.len() * AXIS_FEATURES];
@@ -976,6 +1039,8 @@ fn pack(samples: &[Sample]) -> Packed {
                 file_counts[row * AXIS_FEATURES + sq % 15] += 1.0;
                 diagonal_counts[row * DIAGONAL_FEATURES + sq / 15 + 14 - sq % 15] += 1.0;
                 anti_diagonal_counts[row * DIAGONAL_FEATURES + sq / 15 + sq % 15] += 1.0;
+                let region = (sq / 15 / 5) * 3 + (sq % 15) / 5;
+                region_counts[(row * REGION_COUNT + region) * STONE_TYPES] += 1.0;
             } else if stone == -us {
                 inputs[row * INPUT_SIZE + CELL_COUNT + sq] = 1.0;
                 stone_counts[row * STONE_TYPES + 1] += 1.0;
@@ -983,9 +1048,15 @@ fn pack(samples: &[Sample]) -> Packed {
                 file_counts[row * AXIS_FEATURES + 15 + sq % 15] += 1.0;
                 diagonal_counts[row * DIAGONAL_FEATURES + 29 + sq / 15 + 14 - sq % 15] += 1.0;
                 anti_diagonal_counts[row * DIAGONAL_FEATURES + 29 + sq / 15 + sq % 15] += 1.0;
+                let region = (sq / 15 / 5) * 3 + (sq % 15) / 5;
+                region_counts[(row * REGION_COUNT + region) * STONE_TYPES + 1] += 1.0;
             }
         }
-        inputs[row * INPUT_SIZE + INPUT_SIZE - 1] = s.board.move_count() as f32 / CELL_COUNT as f32;
+        inputs[row * INPUT_SIZE + MOVE_COUNT_INPUT] =
+            s.board.move_count() as f32 / CELL_COUNT as f32;
+        let role = usize::from(s.board.to_move() == crate::game::Player::White);
+        inputs[row * INPUT_SIZE + ROLE_INPUT_START + role] = 1.0;
+        roles[row * ROLE_COUNT + role] = 1.0;
         for m in s.board.search_candidates() {
             masks[row * CELL_COUNT + m.0] = 0.0;
             local_legal_mask[row * CELL_COUNT + m.0] = 1.0;
@@ -1026,6 +1097,8 @@ fn pack(samples: &[Sample]) -> Packed {
     }
     Packed {
         inputs,
+        roles,
+        region_counts,
         stone_counts,
         rank_counts,
         file_counts,
@@ -1081,6 +1154,34 @@ mod tests {
         assert_eq!(packed.policy_masks[nearby.0], 0.0);
         assert_eq!(packed.local_legal_mask[nearby.0], 1.0);
         assert_eq!(packed.policy_targets[nearby.0], 1.0);
+    }
+
+    #[test]
+    fn packing_has_explicit_absolute_role() {
+        let black = Board::new();
+        let mut white = Board::new();
+        assert!(white.play(Move::new(7, 7).unwrap()));
+        let sample = |board| Sample {
+            board,
+            policy: Vec::new(),
+            value: 0.0,
+            value_wdl: None,
+            generation: 0,
+            policy_weight: 1.0,
+            value_weight: 1.0,
+            policy_surprise: 0.0,
+            value_surprise: 0.0,
+            predicted_value: 0.0,
+        };
+        let packed = pack(&[sample(black), sample(white)]);
+        assert_eq!(&packed.roles, &[1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(packed.inputs[ROLE_INPUT_START], 1.0);
+        assert_eq!(packed.inputs[INPUT_SIZE + ROLE_INPUT_START + 1], 1.0);
+        assert_eq!(packed.inputs[MOVE_COUNT_INPUT], 0.0);
+        assert_eq!(
+            packed.inputs[INPUT_SIZE + MOVE_COUNT_INPUT],
+            1.0 / CELL_COUNT as f32
+        );
     }
 
     #[test]

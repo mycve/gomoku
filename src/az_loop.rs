@@ -404,6 +404,26 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             event.train_stats.value_loss,
             progress.update,
         );
+        tb.add_scalar(
+            "train/policy_target_entropy",
+            event.train_stats.policy_entropy,
+            progress.update,
+        );
+        tb.add_scalar(
+            "train/policy_kl",
+            event.train_stats.policy_kl,
+            progress.update,
+        );
+        tb.add_scalar(
+            "train/value_target_entropy",
+            event.train_stats.value_entropy,
+            progress.update,
+        );
+        tb.add_scalar(
+            "train/value_kl",
+            event.train_stats.value_kl,
+            progress.update,
+        );
         tb.add_scalar("replay/samples", event.pool_samples as f32, progress.update);
         let selfplay_seconds = event.batch.collect_seconds.max(1.0e-6);
         tb.add_scalar(
@@ -634,23 +654,23 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         );
         let mut trainer_command = TrainerCommand::Continue;
         if config.arena_interval > 0 && progress.update % config.arena_interval == 0 {
-            println!(
-                "arena    : starting games={} simulations={} workers={}",
-                config.arena_games,
-                config.simulations,
-                rayon::current_num_threads().min(config.arena_games.max(1))
-            );
             let arena_started = Instant::now();
-            let current_games = if champion_history.is_empty() {
-                config.arena_games
-            } else {
-                config.arena_games.div_ceil(2)
-            };
-            let history_games = config
-                .arena_games
-                .saturating_sub(current_games)
-                .div_ceil(champion_history.len().max(1))
-                .max(2);
+            // arena_games 始终完整用于当前冠军；历史冠军是额外的防遗忘门槛，
+            // 不能稀释主晋升检验的样本量。
+            let (current_games, history_games) =
+                arena_game_budget(config.arena_games, champion_history.len());
+            println!(
+                "arena    : starting current_games={} history_games_each={} histories={} simulations={} workers={}",
+                current_games,
+                if champion_history.is_empty() {
+                    0
+                } else {
+                    history_games
+                },
+                champion_history.len(),
+                config.simulations,
+                rayon::current_num_threads().min(current_games.max(1))
+            );
             let arena_cfg = SearchConfig {
                 simulations: config.simulations,
                 cpuct: config.cpuct,
@@ -926,7 +946,7 @@ fn print_event(
         event.train_samples as f32 / event.batch.samples.len().max(1) as f32
     );
     println!(
-        "train    : device={} samples={} steps={} total_steps={} lr={:.6} loss={:.4} policy={:.4} value={:.4} sample={:.3}s time={:.2}s sps={:.1}",
+        "train    : device={} samples={} steps={} total_steps={} lr={:.6} loss={:.4} policy={:.4}(H={:.4} KL={:.4}) value={:.4}(H={:.4} KL={:.4}) sample={:.3}s time={:.2}s sps={:.1}",
         device,
         event.train_stats.samples,
         event.train_stats.optimizer_steps,
@@ -934,7 +954,11 @@ fn print_event(
         event.learning_rate,
         event.train_stats.loss,
         event.train_stats.policy_loss,
+        event.train_stats.policy_entropy,
+        event.train_stats.policy_kl,
         event.train_stats.value_loss,
+        event.train_stats.value_entropy,
+        event.train_stats.value_kl,
         event.sampling_seconds,
         event.train_seconds,
         event.train_stats.samples as f32 / event.train_seconds.max(1e-6)
@@ -953,6 +977,15 @@ fn current_lr(c: &AzLoopConfig, optimizer_step: usize) -> f32 {
     let progress = decay_step as f32 / c.learning_rate_cosine_steps as f32;
     let cosine = 0.5 * (1.0 + (std::f32::consts::PI * progress).cos());
     c.learning_rate_min + (c.learning_rate - c.learning_rate_min) * cosine
+}
+
+fn arena_game_budget(current_games: usize, histories: usize) -> (usize, usize) {
+    let history_games = if histories == 0 {
+        0
+    } else {
+        current_games.div_ceil(2).div_ceil(histories).max(2)
+    };
+    (current_games, history_games)
 }
 
 fn load_or_init(path: &str) -> io::Result<PolicyValueModel> {
@@ -1056,5 +1089,12 @@ mod tests {
         assert!((current_lr(&config, 5_200) - 0.00045).abs() < 1e-8);
         assert!((current_lr(&config, 10_200) - 0.0001).abs() < 1e-8);
         assert!((current_lr(&config, 20_000) - 0.0001).abs() < 1e-8);
+    }
+
+    #[test]
+    fn arena_history_does_not_reduce_current_champion_games() {
+        assert_eq!(arena_game_budget(200, 0), (200, 0));
+        assert_eq!(arena_game_budget(200, 1), (200, 100));
+        assert_eq!(arena_game_budget(200, 2), (200, 50));
     }
 }

@@ -3,7 +3,10 @@ use candle_core::{DType, Device, Shape, Var};
 use candle_nn::VarMap;
 use std::{fs, io, path::Path};
 
-pub const INPUT_SIZE: usize = CELL_COUNT * 2 + 1;
+pub const MOVE_COUNT_INPUT: usize = CELL_COUNT * 2;
+pub const ROLE_INPUT_START: usize = MOVE_COUNT_INPUT + 1;
+pub const ROLE_COUNT: usize = 2;
+pub const INPUT_SIZE: usize = ROLE_INPUT_START + ROLE_COUNT;
 pub const DEFAULT_HIDDEN_SIZE: usize = 192;
 pub const VALUE_HEAD_SIZE: usize = 64;
 pub const WDL_SIZE: usize = 3;
@@ -19,7 +22,11 @@ pub const LOCAL_CANDIDATE_SIZE: usize = LOCAL_AXIS_FEATURE_SIZE * 2;
 pub const VALUE_LOCAL_SIZE: usize = LOCAL_CANDIDATE_SIZE * 2;
 /// Policy 只保留一个很窄的上下文投影；大容量主干专供可增量更新的 value。
 pub const POLICY_HEAD_SIZE: usize = 16;
-const FORMAT_VERSION: f32 = 22.0;
+pub const ROLE_ADAPTER_RANK: usize = 8;
+pub const REGION_COUNT: usize = 9;
+pub const REGION_FEATURE_SIZE: usize = 8;
+pub const REGION_TOTAL_SIZE: usize = REGION_COUNT * REGION_FEATURE_SIZE;
+const FORMAT_VERSION: f32 = 25.0;
 const LOCAL_BOUNDARY: u8 = u8::MAX;
 const LOCAL_NEIGHBORS: [u8; CELL_COUNT * LOCAL_AXES * 2 * LOCAL_RADIUS] = build_local_neighbors();
 
@@ -69,10 +76,12 @@ pub struct PolicyValueModel {
     pub(crate) diagonal_hidden: Vec<f32>,
     pub(crate) anti_diagonal_hidden: Vec<f32>,
     pub(crate) hidden_bias: Vec<f32>,
+    pub(crate) role_adapter_down: Vec<f32>,
+    pub(crate) role_adapter_up: Vec<f32>,
+    pub(crate) region_embedding: Vec<f32>,
     pub(crate) policy_global: Vec<f32>,
     pub(crate) policy_global_bias: Vec<f32>,
-    pub(crate) policy_gate: Vec<f32>,
-    pub(crate) policy_gate_bias: Vec<f32>,
+    pub(crate) policy_dynamic: Vec<f32>,
     pub(crate) policy_output: Vec<f32>,
     pub(crate) policy_bias: Vec<f32>,
     pub(crate) local_axis_embedding: Vec<f32>,
@@ -81,6 +90,7 @@ pub struct PolicyValueModel {
     local_axis_features: Vec<f32>,
     pub(crate) policy_local: Vec<f32>,
     pub(crate) value_head_hidden: Vec<f32>,
+    pub(crate) value_region_hidden: Vec<f32>,
     pub(crate) value_local_output: Vec<f32>,
     pub(crate) value_head_bias: Vec<f32>,
     pub(crate) value_head_hidden2: Vec<f32>,
@@ -92,6 +102,8 @@ pub struct PolicyValueModel {
 pub(crate) struct EvalAccumulator {
     black: Vec<f32>,
     white: Vec<f32>,
+    black_regions: Vec<f32>,
+    white_regions: Vec<f32>,
     move_count: usize,
 }
 
@@ -103,6 +115,8 @@ pub(crate) struct EvalScratch {
     value1: Vec<f32>,
     value2: Vec<f32>,
     policy_global: Vec<f32>,
+    policy_dynamic: Vec<f32>,
+    role_adapter: Vec<f32>,
     local_states: Vec<u8>,
     winning_us: Vec<bool>,
     winning_them: Vec<bool>,
@@ -118,6 +132,8 @@ impl EvalScratch {
             value1: Vec::with_capacity(VALUE_HEAD_SIZE),
             value2: Vec::with_capacity(VALUE_HEAD_SIZE),
             policy_global: Vec::with_capacity(POLICY_HEAD_SIZE),
+            policy_dynamic: vec![0.0; LOCAL_CANDIDATE_SIZE],
+            role_adapter: vec![0.0; ROLE_ADAPTER_RANK],
             local_states: vec![0; CELL_COUNT],
             winning_us: vec![false; CELL_COUNT],
             winning_them: vec![false; CELL_COUNT],
@@ -161,10 +177,17 @@ impl PolicyValueModel {
             diagonal_hidden: vec![0.0; DIAGONAL_FEATURES * hidden_size],
             anti_diagonal_hidden: vec![0.0; DIAGONAL_FEATURES * hidden_size],
             hidden_bias: vec![0.0; hidden_size],
+            role_adapter_down: (0..ROLE_COUNT * ROLE_ADAPTER_RANK * hidden_size)
+                .map(|_| rng.weight((2.0 / hidden_size as f32).sqrt()))
+                .collect(),
+            // Zero-up initialization preserves the original trunk at migration/startup.
+            role_adapter_up: vec![0.0; ROLE_COUNT * hidden_size * ROLE_ADAPTER_RANK],
+            region_embedding: (0..STONE_TYPES * REGION_COUNT * REGION_FEATURE_SIZE)
+                .map(|_| rng.weight((2.0 / REGION_FEATURE_SIZE as f32).sqrt() * 0.25))
+                .collect(),
             policy_global,
             policy_global_bias: vec![0.0; POLICY_HEAD_SIZE],
-            policy_gate: vec![0.0; POLICY_HEAD_SIZE],
-            policy_gate_bias: vec![1.0],
+            policy_dynamic: vec![0.0; LOCAL_CANDIDATE_SIZE * POLICY_HEAD_SIZE],
             policy_output: (0..CELL_COUNT * POLICY_HEAD_SIZE)
                 .map(|_| rng.weight((2.0 / POLICY_HEAD_SIZE as f32).sqrt() * 0.25))
                 .collect(),
@@ -179,6 +202,7 @@ impl PolicyValueModel {
             value_head_hidden: (0..hidden_size * VALUE_HEAD_SIZE)
                 .map(|_| rng.weight((2.0 / hidden_size as f32).sqrt() * 0.5))
                 .collect(),
+            value_region_hidden: vec![0.0; REGION_TOTAL_SIZE * VALUE_HEAD_SIZE],
             value_local_output: vec![0.0; WDL_SIZE * VALUE_LOCAL_SIZE],
             value_head_bias: vec![0.0; VALUE_HEAD_SIZE],
             value_head_hidden2: (0..VALUE_HEAD_SIZE * VALUE_HEAD_SIZE)
@@ -226,13 +250,26 @@ impl PolicyValueModel {
             Player::Black => &accumulator.black,
             Player::White => &accumulator.white,
         };
-        self.evaluate_preactivation_with_scratch(board, preactivation, policy_temperature, scratch)
+        let regions = match board.to_move() {
+            Player::Black => &accumulator.black_regions,
+            Player::White => &accumulator.white_regions,
+        };
+        self.evaluate_preactivation_with_scratch(
+            board,
+            preactivation,
+            regions,
+            board.to_move(),
+            policy_temperature,
+            scratch,
+        )
     }
 
     fn evaluate_preactivation_with_scratch(
         &self,
         board: &Board,
         preactivation: &[f32],
+        regions: &[f32],
+        role: Player,
         policy_temperature: f32,
         scratch: &mut EvalScratch,
     ) -> (Vec<(Move, f32)>, f32) {
@@ -240,6 +277,7 @@ impl PolicyValueModel {
         {
             crate::scope_profile!("model.activate_norm");
             self.activate_hidden_into(preactivation, &mut scratch.hidden);
+            self.apply_role_adapter(role, &mut scratch.hidden, &mut scratch.role_adapter);
         }
         let moves = board.search_candidates();
         if moves.is_empty() {
@@ -260,6 +298,14 @@ impl PolicyValueModel {
             }
             for value in &mut scratch.policy_global {
                 *value = value.max(0.0);
+            }
+            scratch.policy_dynamic.copy_from_slice(&self.policy_local);
+            for (local, weight) in scratch.policy_dynamic.iter_mut().enumerate() {
+                let start = local * POLICY_HEAD_SIZE;
+                *weight += dot(
+                    &scratch.policy_global,
+                    &self.policy_dynamic[start..start + POLICY_HEAD_SIZE],
+                );
             }
             scratch.logits.clear();
             scratch.local_value.fill(0.0);
@@ -284,6 +330,7 @@ impl PolicyValueModel {
                 scratch.winning_them[mv.0] = winning_them;
                 scratch.logits.push(self.policy_logit(
                     &scratch.policy_global,
+                    &scratch.policy_dynamic,
                     &scratch.local_candidate,
                     mv,
                 ));
@@ -328,6 +375,10 @@ impl PolicyValueModel {
             *value += dot(
                 &scratch.hidden,
                 &self.value_head_hidden[start..start + self.hidden_size],
+            ) + dot(
+                regions,
+                &self.value_region_hidden
+                    [output * REGION_TOTAL_SIZE..(output + 1) * REGION_TOTAL_SIZE],
             );
         }
         for x in &mut scratch.value1 {
@@ -369,8 +420,11 @@ impl PolicyValueModel {
         let mut accumulator = EvalAccumulator {
             black: self.hidden_bias.clone(),
             white: self.hidden_bias.clone(),
+            black_regions: vec![0.0; REGION_TOTAL_SIZE],
+            white_regions: vec![0.0; REGION_TOTAL_SIZE],
             move_count: 0,
         };
+        self.add_role_to_slices(&mut accumulator.black, &mut accumulator.white);
         for (sq, &stone) in board.cells().iter().enumerate() {
             if stone == 0 {
                 continue;
@@ -395,6 +449,8 @@ impl PolicyValueModel {
         let offset = arena.len();
         arena.extend_from_slice(&accumulator.black);
         arena.extend_from_slice(&accumulator.white);
+        arena.extend_from_slice(&accumulator.black_regions);
+        arena.extend_from_slice(&accumulator.white_regions);
         offset
     }
 
@@ -405,13 +461,16 @@ impl PolicyValueModel {
         mv: Move,
         player: Player,
     ) -> usize {
-        let width = self.hidden_size * 2;
+        let width = self.accumulator_width();
         debug_assert!(parent_offset + width <= arena.len());
         let offset = arena.len();
         arena.extend_from_within(parent_offset..parent_offset + width);
-        let (black, white) = arena[offset..offset + width].split_at_mut(self.hidden_size);
+        let (black, rest) = arena[offset..offset + width].split_at_mut(self.hidden_size);
+        let (white, rest) = rest.split_at_mut(self.hidden_size);
+        let (black_regions, white_regions) = rest.split_at_mut(REGION_TOTAL_SIZE);
         self.add_stone_to_slices(black, white, mv, player);
-        let rule_offset = (INPUT_SIZE - 1) * self.hidden_size;
+        self.add_region_to_slices(black_regions, white_regions, mv, player);
+        let rule_offset = MOVE_COUNT_INPUT * self.hidden_size;
         let delta = 1.0 / CELL_COUNT as f32;
         for h in 0..self.hidden_size {
             let change = self.input_hidden[rule_offset + h] * delta;
@@ -429,15 +488,21 @@ impl PolicyValueModel {
         policy_temperature: f32,
         scratch: &mut EvalScratch,
     ) -> (Vec<(Move, f32)>, f32) {
-        let width = self.hidden_size * 2;
+        let width = self.accumulator_width();
         let side_offset = match board.to_move() {
             Player::Black => offset,
             Player::White => offset + self.hidden_size,
+        };
+        let region_offset = match board.to_move() {
+            Player::Black => offset + self.hidden_size * 2,
+            Player::White => offset + self.hidden_size * 2 + REGION_TOTAL_SIZE,
         };
         debug_assert!(offset + width <= arena.len());
         self.evaluate_preactivation_with_scratch(
             board,
             &arena[side_offset..side_offset + self.hidden_size],
+            &arena[region_offset..region_offset + REGION_TOTAL_SIZE],
+            board.to_move(),
             policy_temperature,
             scratch,
         )
@@ -445,6 +510,37 @@ impl PolicyValueModel {
 
     fn add_stone(&self, accumulator: &mut EvalAccumulator, mv: Move, player: Player) {
         self.add_stone_to_slices(&mut accumulator.black, &mut accumulator.white, mv, player);
+        self.add_region_to_slices(
+            &mut accumulator.black_regions,
+            &mut accumulator.white_regions,
+            mv,
+            player,
+        );
+    }
+
+    pub(crate) fn accumulator_width(&self) -> usize {
+        2 * (self.hidden_size + REGION_TOTAL_SIZE)
+    }
+
+    fn add_region_to_slices(&self, black: &mut [f32], white: &mut [f32], mv: Move, player: Player) {
+        let region = (mv.row() / 5) * 3 + mv.col() / 5;
+        for (perspective, values) in [(Player::Black, black), (Player::White, white)] {
+            let side = usize::from(player != perspective);
+            let source = (region * STONE_TYPES + side) * REGION_FEATURE_SIZE;
+            let target = region * REGION_FEATURE_SIZE;
+            for i in 0..REGION_FEATURE_SIZE {
+                values[target + i] += self.region_embedding[source + i];
+            }
+        }
+    }
+
+    fn add_role_to_slices(&self, black: &mut [f32], white: &mut [f32]) {
+        for (role, hidden) in [(Player::Black, black), (Player::White, white)] {
+            let offset = (ROLE_INPUT_START + role_index(role)) * self.hidden_size;
+            for (h, value) in hidden.iter_mut().enumerate() {
+                *value += self.input_hidden[offset + h];
+            }
+        }
     }
 
     fn add_stone_to_slices(&self, black: &mut [f32], white: &mut [f32], mv: Move, player: Player) {
@@ -471,7 +567,7 @@ impl PolicyValueModel {
 
     fn set_move_count(&self, accumulator: &mut EvalAccumulator, move_count: usize) {
         let delta = (move_count as f32 - accumulator.move_count as f32) / CELL_COUNT as f32;
-        let rule_offset = (INPUT_SIZE - 1) * self.hidden_size;
+        let rule_offset = MOVE_COUNT_INPUT * self.hidden_size;
         for h in 0..self.hidden_size {
             let change = self.input_hidden[rule_offset + h] * delta;
             accumulator.black[h] += change;
@@ -490,6 +586,32 @@ impl PolicyValueModel {
             .sqrt();
         for x in hidden.iter_mut() {
             *x /= rms;
+        }
+    }
+
+    fn apply_role_adapter(&self, role: Player, hidden: &mut [f32], adapter: &mut [f32]) {
+        let role = role_index(role);
+        let down = role * ROLE_ADAPTER_RANK * self.hidden_size;
+        for (rank, value) in adapter.iter_mut().enumerate() {
+            let start = down + rank * self.hidden_size;
+            *value = dot(
+                hidden,
+                &self.role_adapter_down[start..start + self.hidden_size],
+            )
+            .max(0.0);
+        }
+        let up = role * self.hidden_size * ROLE_ADAPTER_RANK;
+        for (output, value) in hidden.iter_mut().enumerate() {
+            let start = up + output * ROLE_ADAPTER_RANK;
+            *value += dot(
+                adapter,
+                &self.role_adapter_up[start..start + ROLE_ADAPTER_RANK],
+            );
+        }
+        let rms = (hidden.iter().map(|x| x * x).sum::<f32>() / hidden.len().max(1) as f32 + 1.0e-6)
+            .sqrt();
+        for value in hidden {
+            *value /= rms;
         }
     }
 
@@ -529,11 +651,9 @@ impl PolicyValueModel {
         }
     }
 
-    fn policy_logit(&self, global: &[f32], local: &[f32], mv: Move) -> f32 {
-        let local_signal = dot(local, &self.policy_local);
+    fn policy_logit(&self, global: &[f32], dynamic: &[f32], local: &[f32], mv: Move) -> f32 {
         let weights = &self.policy_output[mv.0 * POLICY_HEAD_SIZE..(mv.0 + 1) * POLICY_HEAD_SIZE];
-        let gate = dot(global, &self.policy_gate) + self.policy_gate_bias[0];
-        dot(global, weights) + gate * local_signal + self.policy_bias[mv.0]
+        dot(global, weights) + dot(local, dynamic) + self.policy_bias[mv.0]
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
@@ -581,6 +701,24 @@ impl PolicyValueModel {
         insert(&vars, "hidden_bias", &self.hidden_bias, (self.hidden_size,))?;
         insert(
             &vars,
+            "role_adapter_down",
+            &self.role_adapter_down,
+            (ROLE_COUNT, ROLE_ADAPTER_RANK, self.hidden_size),
+        )?;
+        insert(
+            &vars,
+            "role_adapter_up",
+            &self.role_adapter_up,
+            (ROLE_COUNT, self.hidden_size, ROLE_ADAPTER_RANK),
+        )?;
+        insert(
+            &vars,
+            "region_embedding",
+            &self.region_embedding,
+            (REGION_COUNT, STONE_TYPES, REGION_FEATURE_SIZE),
+        )?;
+        insert(
+            &vars,
             "policy_global",
             &self.policy_global,
             (POLICY_HEAD_SIZE, self.hidden_size),
@@ -591,8 +729,12 @@ impl PolicyValueModel {
             &self.policy_global_bias,
             (POLICY_HEAD_SIZE,),
         )?;
-        insert(&vars, "policy_gate", &self.policy_gate, (POLICY_HEAD_SIZE,))?;
-        insert(&vars, "policy_gate_bias", &self.policy_gate_bias, (1,))?;
+        insert(
+            &vars,
+            "policy_dynamic",
+            &self.policy_dynamic,
+            (LOCAL_CANDIDATE_SIZE, POLICY_HEAD_SIZE),
+        )?;
         insert(
             &vars,
             "policy_output",
@@ -629,6 +771,12 @@ impl PolicyValueModel {
             "value_head_hidden",
             &self.value_head_hidden,
             (VALUE_HEAD_SIZE, self.hidden_size),
+        )?;
+        insert(
+            &vars,
+            "value_region_hidden",
+            &self.value_region_hidden,
+            (VALUE_HEAD_SIZE, REGION_TOTAL_SIZE),
         )?;
         insert(
             &vars,
@@ -692,10 +840,12 @@ impl PolicyValueModel {
             diagonal_hidden: load(&tensors, "diagonal_hidden")?,
             anti_diagonal_hidden: load(&tensors, "anti_diagonal_hidden")?,
             hidden_bias,
+            role_adapter_down: load(&tensors, "role_adapter_down")?,
+            role_adapter_up: load(&tensors, "role_adapter_up")?,
+            region_embedding: load(&tensors, "region_embedding")?,
             policy_global: load(&tensors, "policy_global")?,
             policy_global_bias: load(&tensors, "policy_global_bias")?,
-            policy_gate: load(&tensors, "policy_gate")?,
-            policy_gate_bias: load(&tensors, "policy_gate_bias")?,
+            policy_dynamic: load(&tensors, "policy_dynamic")?,
             policy_output: load(&tensors, "policy_output")?,
             policy_bias: load(&tensors, "policy_bias")?,
             local_axis_embedding: load(&tensors, "local_axis_embedding")?,
@@ -704,6 +854,7 @@ impl PolicyValueModel {
             local_axis_features: Vec::new(),
             policy_local: load(&tensors, "policy_local")?,
             value_head_hidden: load(&tensors, "value_head_hidden")?,
+            value_region_hidden: load(&tensors, "value_region_hidden")?,
             value_local_output: load(&tensors, "value_local_output")?,
             value_head_bias: load(&tensors, "value_head_bias")?,
             value_head_hidden2: load(&tensors, "value_head_hidden2")?,
@@ -716,10 +867,12 @@ impl PolicyValueModel {
             || model.file_hidden.len() != AXIS_FEATURES * hidden_size
             || model.diagonal_hidden.len() != DIAGONAL_FEATURES * hidden_size
             || model.anti_diagonal_hidden.len() != DIAGONAL_FEATURES * hidden_size
+            || model.role_adapter_down.len() != ROLE_COUNT * ROLE_ADAPTER_RANK * hidden_size
+            || model.role_adapter_up.len() != ROLE_COUNT * hidden_size * ROLE_ADAPTER_RANK
+            || model.region_embedding.len() != STONE_TYPES * REGION_COUNT * REGION_FEATURE_SIZE
             || model.policy_global.len() != POLICY_HEAD_SIZE * hidden_size
             || model.policy_global_bias.len() != POLICY_HEAD_SIZE
-            || model.policy_gate.len() != POLICY_HEAD_SIZE
-            || model.policy_gate_bias.len() != 1
+            || model.policy_dynamic.len() != LOCAL_CANDIDATE_SIZE * POLICY_HEAD_SIZE
             || model.policy_output.len() != CELL_COUNT * POLICY_HEAD_SIZE
             || model.policy_bias.len() != CELL_COUNT
             || model.local_axis_embedding.len() != LOCAL_AXIS_PATTERNS * LOCAL_AXIS_FEATURE_SIZE
@@ -727,6 +880,7 @@ impl PolicyValueModel {
             || model.local_axis_bias.len() != 2 * LOCAL_AXIS_FEATURE_SIZE
             || model.policy_local.len() != LOCAL_CANDIDATE_SIZE
             || model.value_head_hidden.len() != hidden_size * VALUE_HEAD_SIZE
+            || model.value_region_hidden.len() != VALUE_HEAD_SIZE * REGION_TOTAL_SIZE
             || model.value_local_output.len() != WDL_SIZE * VALUE_LOCAL_SIZE
             || model.value_head_bias.len() != VALUE_HEAD_SIZE
             || model.value_head_hidden2.len() != VALUE_HEAD_SIZE * VALUE_HEAD_SIZE
@@ -741,6 +895,13 @@ impl PolicyValueModel {
         let mut model = model;
         model.refresh_local_axis_features();
         Ok(model)
+    }
+}
+
+fn role_index(player: Player) -> usize {
+    match player {
+        Player::Black => 0,
+        Player::White => 1,
     }
 }
 
@@ -1108,8 +1269,7 @@ mod tests {
     fn local_outputs_start_without_manual_bias() {
         let model = PolicyValueModel::random(8, 5);
         assert!(model.policy_local.iter().all(|&weight| weight == 0.0));
-        assert!(model.policy_gate.iter().all(|&weight| weight == 0.0));
-        assert_eq!(model.policy_gate_bias, vec![1.0]);
+        assert!(model.policy_dynamic.iter().all(|&weight| weight == 0.0));
         assert!(model.value_local_output.iter().all(|&weight| weight == 0.0));
     }
 
@@ -1137,10 +1297,14 @@ mod tests {
         let child = model.accumulator_after_move_into_arena(&mut arena, root, mv, player);
         assert!(board.play(mv));
         let rebuilt = model.accumulator(&board);
-        for (incremental, rebuilt) in arena[child..child + model.hidden_size * 2]
-            .iter()
-            .zip(rebuilt.black.iter().chain(&rebuilt.white))
-        {
+        for (incremental, rebuilt) in arena[child..child + model.accumulator_width()].iter().zip(
+            rebuilt
+                .black
+                .iter()
+                .chain(&rebuilt.white)
+                .chain(&rebuilt.black_regions)
+                .chain(&rebuilt.white_regions),
+        ) {
             assert!((incremental - rebuilt).abs() < 1.0e-6);
         }
     }
@@ -1160,8 +1324,64 @@ mod tests {
         assert_eq!(restored.local_axis_scale, model.local_axis_scale);
         assert_eq!(restored.local_axis_bias, model.local_axis_bias);
         assert_eq!(restored.policy_local, model.policy_local);
-        assert_eq!(restored.policy_gate, model.policy_gate);
-        assert_eq!(restored.policy_gate_bias, model.policy_gate_bias);
+        assert_eq!(restored.policy_dynamic, model.policy_dynamic);
         assert_eq!(restored.value_local_output, model.value_local_output);
+        assert_eq!(restored.role_adapter_down, model.role_adapter_down);
+        assert_eq!(restored.role_adapter_up, model.role_adapter_up);
+        assert_eq!(restored.region_embedding, model.region_embedding);
+        assert_eq!(restored.value_region_hidden, model.value_region_hidden);
+    }
+
+    #[test]
+    fn accumulator_contains_role_and_matches_relative_inputs() {
+        let model = PolicyValueModel::random(12, 29);
+        let mut board = Board::new();
+        assert!(board.play(Move::parse("h8").unwrap()));
+        assert!(board.play(Move::parse("h9").unwrap()));
+        assert!(board.play(Move::parse("i8").unwrap()));
+        let accumulator = model.accumulator(&board);
+        for (role, actual) in [
+            (Player::Black, &accumulator.black),
+            (Player::White, &accumulator.white),
+        ] {
+            let mut expected = model.hidden_bias.clone();
+            let role_offset = (ROLE_INPUT_START + role_index(role)) * model.hidden_size;
+            for h in 0..model.hidden_size {
+                expected[h] += model.input_hidden[role_offset + h];
+            }
+            for (sq, &stone) in board.cells().iter().enumerate() {
+                if stone == 0 {
+                    continue;
+                }
+                let player = if stone == Player::Black.stone() {
+                    Player::Black
+                } else {
+                    Player::White
+                };
+                let side = usize::from(player != role);
+                let mv = Move(sq);
+                let offsets = [
+                    (side * CELL_COUNT + sq) * model.hidden_size,
+                    (side * 15 + mv.row()) * model.hidden_size,
+                    (side * 15 + mv.col()) * model.hidden_size,
+                    (side * 29 + mv.row() + 14 - mv.col()) * model.hidden_size,
+                    (side * 29 + mv.row() + mv.col()) * model.hidden_size,
+                    side * model.hidden_size,
+                ];
+                for h in 0..model.hidden_size {
+                    expected[h] += model.input_hidden[offsets[0] + h]
+                        + model.rank_hidden[offsets[1] + h]
+                        + model.file_hidden[offsets[2] + h]
+                        + model.diagonal_hidden[offsets[3] + h]
+                        + model.anti_diagonal_hidden[offsets[4] + h]
+                        + model.stone_hidden[offsets[5] + h];
+                }
+            }
+            let phase = board.move_count() as f32 / CELL_COUNT as f32;
+            for h in 0..model.hidden_size {
+                expected[h] += model.input_hidden[MOVE_COUNT_INPUT * model.hidden_size + h] * phase;
+                assert!((expected[h] - actual[h]).abs() < 1.0e-6);
+            }
+        }
     }
 }

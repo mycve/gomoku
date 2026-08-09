@@ -62,7 +62,7 @@ pub struct AzLoopConfig {
 impl Default for AzLoopConfig {
     fn default() -> Self {
         Self {
-            format_version: 16,
+            format_version: 17,
             model_path: "model.safetensors".into(),
             best_model_path: "best.safetensors".into(),
             replay_path: "data/replay.jsonl".into(),
@@ -70,7 +70,7 @@ impl Default for AzLoopConfig {
             simulations: 400,
             seed: 20260730,
             selfplay_samples_per_update: 50_000,
-            selfplay_workers: 128,
+            selfplay_workers: 192,
             selfplay_queue_capacity: 0,
             learning_rate: 0.0008,
             learning_rate_min: 0.0001,
@@ -173,8 +173,10 @@ impl AzLoopConfig {
                 return Err(io::Error::other(format!("配置 `{name}` 必须是有限数值")));
             }
         }
-        if self.format_version != 16 {
-            return Err(io::Error::other("仅支持 format_version = 16"));
+        if self.format_version != 17 {
+            return Err(io::Error::other(
+                "仅支持 format_version = 17；新模型结构不兼容旧实验，请重新生成配置",
+            ));
         }
         if self.simulations == 0
             || self.selfplay_samples_per_update == 0
@@ -240,7 +242,7 @@ impl AzLoopConfig {
     }
 }
 
-const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 16
+const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 17
 model_path = "model.safetensors"
 best_model_path = "best.safetensors"
 replay_path = "data/replay.jsonl"
@@ -248,7 +250,7 @@ progress_path = "data/azloop-progress.json"
 simulations = 400
 seed = 20260730
 selfplay_samples_per_update = 50000
-selfplay_workers = 128
+selfplay_workers = 192
 selfplay_queue_capacity = 0
 learning_rate = 0.0008
 learning_rate_min = 0.0001
@@ -301,10 +303,10 @@ mod tests {
     fn default_text_is_exact_and_valid() {
         let config: AzLoopConfig = toml::from_str(DEFAULT_CONFIG_TEXT).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.format_version, 16);
+        assert_eq!(config.format_version, 17);
         assert_eq!(config.batch_size, 1024);
         assert_eq!(config.selfplay_samples_per_update, 50_000);
-        assert_eq!(config.selfplay_workers, 128);
+        assert_eq!(config.selfplay_workers, 192);
         assert_eq!(config.arena_games, 200);
         assert_eq!(config.replay_capacity, 500_000);
         assert_eq!(config.replay_warmup_samples, 100_000);

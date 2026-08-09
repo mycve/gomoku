@@ -117,7 +117,7 @@ fn search_until(
     crate::scope_profile!("mcts.search");
     let mut scratch = EvalScratch::new(model.hidden_size);
     let mut accumulator_arena = Vec::with_capacity(
-        cfg.graph_search_max_nodes.min(cfg.simulations + 1) * model.hidden_size * 2,
+        cfg.graph_search_max_nodes.min(cfg.simulations + 1) * model.accumulator_width(),
     );
     let root_accumulator = model.accumulator_into_arena(board, &mut accumulator_arena);
     let mut nodes = vec![Node {
