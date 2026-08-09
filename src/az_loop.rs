@@ -45,7 +45,6 @@ struct PendingBatch {
 
 struct TrainerEvent {
     model: PolicyValueModel,
-    online_model: PolicyValueModel,
     batch: PendingBatch,
     train_stats: crate::selfplay::TrainStats,
     sampling_seconds: f32,
@@ -74,17 +73,11 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     .map_err(io::Error::other)?;
     let mut progress = load_progress(&config.progress_path)?;
     let initial_model = load_or_init(&config.model_path)?;
-    let ema_checkpoint_exists = Path::new(&config.ema_model_path).exists();
-    let initial_ema = if ema_checkpoint_exists {
-        PolicyValueModel::load(&config.ema_model_path)?
-    } else {
-        initial_model.clone()
-    };
     let mut best = if Path::new(&config.best_model_path).exists() {
         PolicyValueModel::load(&config.best_model_path)?
     } else {
-        initial_ema.save(&config.best_model_path)?;
-        initial_ema.clone()
+        initial_model.save(&config.best_model_path)?;
+        initial_model.clone()
     };
     let mut champion_history = load_champion_history(&config, &best)?;
     let initial_pool = if Path::new(&config.replay_path).exists() {
@@ -145,16 +138,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         config.use_lcb_for_selection,
         config.root_num_symmetries_to_sample
     );
-    println!(
-        "targets  : policy=mcts_visits value=terminal_wdl ema_decay={:.6} ema_model={} ema_state={}",
-        config.ema_decay,
-        config.ema_model_path,
-        if ema_checkpoint_exists {
-            "restored"
-        } else {
-            "copy_first_update"
-        }
-    );
+    println!("targets  : policy=mcts_visits value=terminal_wdl model=online");
     println!(
         "lr       : warmup={} cosine={} min={:.6} peak={:.6} resumed_steps={}",
         config.learning_rate_warmup_steps,
@@ -254,11 +238,8 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     let trainer = thread::spawn(move || -> io::Result<()> {
         let result = (|| -> io::Result<()> {
             let mut model = initial_model;
-            let mut ema_model = initial_ema;
-            let mut ema_initialized = ema_checkpoint_exists;
             let mut training = candle_train::TrainingSession::new(
                 &model,
-                Some(&ema_model),
                 current_lr(&trainer_config, start_optimizer_steps),
             )?;
             let mut pool = initial_pool;
@@ -291,31 +272,23 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 let train_samples = sampled.samples.len();
                 let recent_quota_rate = sampled.recent_quota as f32 / train_samples.max(1) as f32;
                 let actual_recent_rate = sampled.actual_recent as f32 / train_samples.max(1) as f32;
-                let effective_ema_decay =
-                    ema_decay_for_update(trainer_config.ema_decay, ema_initialized);
                 let train_started = Instant::now();
                 let train_stats = training.train_controlled(
                     &mut model,
-                    Some(&mut ema_model),
                     &sampled.samples,
                     trainer_config.batch_epochs,
                     lr,
                     trainer_config.batch_size,
-                    effective_ema_decay,
                     Some(&trainer_stop),
                 )?;
                 if trainer_stop.load(Ordering::SeqCst) {
                     break;
                 }
-                if train_stats.optimizer_steps > 0 {
-                    ema_initialized = true;
-                }
                 optimizer_steps += train_stats.optimizer_steps;
                 let train_seconds = train_started.elapsed().as_secs_f32();
                 if event_tx
                     .send(TrainerEvent {
-                        model: ema_model.clone(),
-                        online_model: model.clone(),
+                        model: model.clone(),
                         batch,
                         train_stats,
                         sampling_seconds,
@@ -334,12 +307,9 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 match trainer_ack_rx.recv() {
                     Ok(TrainerCommand::Continue) => {}
                     Ok(TrainerCommand::Reset(champion)) => {
-                        model = champion.clone();
-                        ema_model = champion;
-                        ema_initialized = true;
+                        model = champion;
                         training = candle_train::TrainingSession::new(
                             &model,
-                            Some(&ema_model),
                             current_lr(&trainer_config, optimizer_steps),
                         )?;
                     }
@@ -403,8 +373,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         // generation 表示数据产生的训练 update，用于 replay 的近期窗口；
         // published 模型仍然只在 Arena 晋升时替换。
         version.store(progress.update as u64, Ordering::Release);
-        event.online_model.save(&config.model_path)?;
-        event.model.save(&config.ema_model_path)?;
+        event.model.save(&config.model_path)?;
         save_progress(&config.progress_path, &progress)?;
         let checkpoint = if config.checkpoint_interval > 0
             && progress.update % config.checkpoint_interval == 0
@@ -829,7 +798,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 {
                     trainer_command = TrainerCommand::Reset(best.clone());
                     progress.consecutive_rejections = 0;
-                    println!("rollback : trainer/EMA reset to current champion");
+                    println!("rollback : trainer reset to current champion");
                 }
             }
             save_progress(&config.progress_path, &progress)?;
@@ -986,10 +955,6 @@ fn current_lr(c: &AzLoopConfig, optimizer_step: usize) -> f32 {
     c.learning_rate_min + (c.learning_rate - c.learning_rate_min) * cosine
 }
 
-fn ema_decay_for_update(configured_decay: f32, initialized: bool) -> f32 {
-    if initialized { configured_decay } else { 0.0 }
-}
-
 fn load_or_init(path: &str) -> io::Result<PolicyValueModel> {
     if Path::new(path).exists() {
         PolicyValueModel::load(path)
@@ -1091,11 +1056,5 @@ mod tests {
         assert!((current_lr(&config, 5_200) - 0.00045).abs() < 1e-8);
         assert!((current_lr(&config, 10_200) - 0.0001).abs() < 1e-8);
         assert!((current_lr(&config, 20_000) - 0.0001).abs() < 1e-8);
-    }
-
-    #[test]
-    fn ema_first_update_copies_online_model() {
-        assert_eq!(ema_decay_for_update(0.999, false), 0.0);
-        assert_eq!(ema_decay_for_update(0.999, true), 0.999);
     }
 }

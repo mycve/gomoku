@@ -45,22 +45,12 @@ pub fn train(
     learning_rate: f32,
     batch_size: usize,
 ) -> io::Result<TrainStats> {
-    let mut session = TrainingSession::new(model, None, learning_rate)?;
-    session.train_controlled(
-        model,
-        None,
-        samples,
-        epochs,
-        learning_rate,
-        batch_size,
-        1.0,
-        None,
-    )
+    let mut session = TrainingSession::new(model, learning_rate)?;
+    session.train_controlled(model, samples, epochs, learning_rate, batch_size, None)
 }
 
 pub struct TrainingSession {
     replicas: Vec<Replica>,
-    ema: Option<Replica>,
     optimizer: AdamW,
     #[cfg(any(
         feature = "nccl-train",
@@ -89,11 +79,7 @@ unsafe impl Send for NcclAllReduce {}
 unsafe impl Sync for NcclAllReduce {}
 
 impl TrainingSession {
-    pub fn new(
-        model: &PolicyValueModel,
-        ema_model: Option<&PolicyValueModel>,
-        learning_rate: f32,
-    ) -> io::Result<Self> {
+    pub fn new(model: &PolicyValueModel, learning_rate: f32) -> io::Result<Self> {
         let unique = training_device_indices();
         #[cfg(not(any(
             feature = "nccl-train",
@@ -118,9 +104,6 @@ impl TrainingSession {
                 unique
             );
         }
-        let ema = ema_model
-            .map(|model| Replica::new(model, &devices[0]))
-            .transpose()?;
         let optimizer = AdamW::new(
             replicas[0].vars(),
             ParamsAdamW {
@@ -139,7 +122,6 @@ impl TrainingSession {
         let nccl = init_nccl_all_reduce(&replicas)?;
         Ok(Self {
             replicas,
-            ema,
             optimizer,
             #[cfg(any(
                 feature = "nccl-train",
@@ -153,12 +135,10 @@ impl TrainingSession {
     pub fn train_controlled(
         &mut self,
         model: &mut PolicyValueModel,
-        ema_model: Option<&mut PolicyValueModel>,
         samples: &[Sample],
         epochs: usize,
         learning_rate: f32,
         batch_size: usize,
-        ema_decay: f32,
         stop: Option<&AtomicBool>,
     ) -> io::Result<TrainStats> {
         if samples.is_empty() || epochs == 0 || learning_rate <= 0.0 {
@@ -169,7 +149,7 @@ impl TrainingSession {
         for _ in 0..epochs {
             for batch in samples.chunks(batch_size.max(1)) {
                 if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-                    self.copy_models(model, ema_model)?;
+                    self.copy_model(model)?;
                     return Ok(finalize_stats(stats));
                 }
                 let output = self.train_batch(batch)?;
@@ -179,12 +159,9 @@ impl TrainingSession {
                 stats.policy_entropy += output.policy_entropy_sum;
                 stats.value_entropy += output.value_entropy_sum;
                 stats.optimizer_steps += 1;
-                if let Some(ema) = &self.ema {
-                    ema.update_ema_from(&self.replicas[0], ema_decay)?;
-                }
             }
         }
-        self.copy_models(model, ema_model)?;
+        self.copy_model(model)?;
         Ok(finalize_stats(stats))
     }
 
@@ -205,15 +182,8 @@ impl TrainingSession {
         Ok(finalize_stats(stats))
     }
 
-    fn copy_models(
-        &self,
-        model: &mut PolicyValueModel,
-        ema_model: Option<&mut PolicyValueModel>,
-    ) -> io::Result<()> {
+    fn copy_model(&self, model: &mut PolicyValueModel) -> io::Result<()> {
         self.replicas[0].copy_to(model)?;
-        if let (Some(ema), Some(ema_model)) = (&self.ema, ema_model) {
-            ema.copy_to(ema_model)?;
-        }
         Ok(())
     }
 
@@ -775,18 +745,6 @@ impl Replica {
                     .map_err(err)
             })
             .collect()
-    }
-    fn update_ema_from(&self, source: &Self, decay: f32) -> io::Result<()> {
-        let decay = decay.clamp(0.0, 1.0) as f64;
-        for (ema, online) in self.vars().iter().zip(source.vars()) {
-            let blended = ema
-                .as_tensor()
-                .affine(decay, 0.0)
-                .and_then(|x| x.add(&online.as_tensor().affine(1.0 - decay, 0.0)?))
-                .map_err(err)?;
-            ema.set(&blended).map_err(err)?;
-        }
-        Ok(())
     }
     fn copy_to(&self, m: &mut PolicyValueModel) -> io::Result<()> {
         let v = self.cpu_values()?;

@@ -349,7 +349,7 @@ fn main() -> io::Result<()> {
                 )));
             }
             let device = candle_train::training_device_name()?;
-            let mut session = candle_train::TrainingSession::new(&model, None, args.learning_rate)?;
+            let mut session = candle_train::TrainingSession::new(&model, args.learning_rate)?;
             println!(
                 "distill  : files={} skip={} total={} device={} output={}",
                 files.len(),
@@ -385,7 +385,7 @@ fn main() -> io::Result<()> {
                 if skip_files > 0 && Path::new(&args.best_output).exists() {
                     let best_model = PolicyValueModel::load(&args.best_output)?;
                     let best_session =
-                        candle_train::TrainingSession::new(&best_model, None, args.learning_rate)?;
+                        candle_train::TrainingSession::new(&best_model, args.learning_rate)?;
                     let best_stats = best_session.evaluate(&validation, args.batch_size)?;
                     best_validation_loss = best_stats.loss;
                     println!(
@@ -435,12 +435,10 @@ fn main() -> io::Result<()> {
                     args.min_learning_rate + (args.learning_rate - args.min_learning_rate) * cosine;
                 let stats = session.train_controlled(
                     &mut model,
-                    None,
                     &samples,
                     args.epochs,
                     learning_rate,
                     args.batch_size,
-                    1.0,
                     Some(&stop),
                 )?;
                 total_samples += samples.len();

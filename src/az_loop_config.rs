@@ -8,7 +8,6 @@ pub const DEFAULT_CONFIG_PATH: &str = "gomoku.azloop.toml";
 pub struct AzLoopConfig {
     pub format_version: u32,
     pub model_path: String,
-    pub ema_model_path: String,
     pub best_model_path: String,
     pub replay_path: String,
     pub progress_path: String,
@@ -39,7 +38,6 @@ pub struct AzLoopConfig {
     pub use_lcb_for_selection: bool,
     pub lcb_stdevs: f32,
     pub min_visit_prop_for_lcb: f32,
-    pub ema_decay: f32,
     pub replay_capacity: usize,
     pub replay_warmup_samples: usize,
     pub train_samples_per_update: usize,
@@ -64,9 +62,8 @@ pub struct AzLoopConfig {
 impl Default for AzLoopConfig {
     fn default() -> Self {
         Self {
-            format_version: 15,
+            format_version: 16,
             model_path: "model.safetensors".into(),
-            ema_model_path: "ema.safetensors".into(),
             best_model_path: "best.safetensors".into(),
             replay_path: "data/replay.jsonl".into(),
             progress_path: "data/azloop-progress.json".into(),
@@ -97,7 +94,6 @@ impl Default for AzLoopConfig {
             use_lcb_for_selection: true,
             lcb_stdevs: 3.0,
             min_visit_prop_for_lcb: 0.15,
-            ema_decay: 0.999,
             replay_capacity: 500_000,
             replay_warmup_samples: 100_000,
             train_samples_per_update: 50_000,
@@ -153,7 +149,6 @@ impl AzLoopConfig {
             ("root_policy_temperature", self.root_policy_temperature),
             ("lcb_stdevs", self.lcb_stdevs),
             ("min_visit_prop_for_lcb", self.min_visit_prop_for_lcb),
-            ("ema_decay", self.ema_decay),
             ("arena_promotion_rate", self.arena_promotion_rate),
             (
                 "arena_promotion_confidence_z",
@@ -178,8 +173,8 @@ impl AzLoopConfig {
                 return Err(io::Error::other(format!("配置 `{name}` 必须是有限数值")));
             }
         }
-        if self.format_version != 15 {
-            return Err(io::Error::other("仅支持 format_version = 15"));
+        if self.format_version != 16 {
+            return Err(io::Error::other("仅支持 format_version = 16"));
         }
         if self.simulations == 0
             || self.selfplay_samples_per_update == 0
@@ -207,7 +202,6 @@ impl AzLoopConfig {
             || self.lcb_stdevs < 0.0
             || !(0.0..=1.0).contains(&self.min_visit_prop_for_lcb)
             || !(0.0..=1.0).contains(&self.root_exploration_fraction)
-            || !(0.0..=1.0).contains(&self.ema_decay)
             || !(0.0..=1.0).contains(&self.arena_promotion_rate)
             || self.arena_promotion_confidence_z < 0.0
             || !(0.0..=1.0).contains(&self.arena_history_score_floor)
@@ -246,9 +240,8 @@ impl AzLoopConfig {
     }
 }
 
-const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 15
+const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 16
 model_path = "model.safetensors"
-ema_model_path = "ema.safetensors"
 best_model_path = "best.safetensors"
 replay_path = "data/replay.jsonl"
 progress_path = "data/azloop-progress.json"
@@ -279,7 +272,6 @@ graph_search_max_nodes = 65536
 use_lcb_for_selection = true
 lcb_stdevs = 3.0
 min_visit_prop_for_lcb = 0.15
-ema_decay = 0.999
 replay_capacity = 500000
 replay_warmup_samples = 100000
 train_samples_per_update = 50000
@@ -309,7 +301,7 @@ mod tests {
     fn default_text_is_exact_and_valid() {
         let config: AzLoopConfig = toml::from_str(DEFAULT_CONFIG_TEXT).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.format_version, 15);
+        assert_eq!(config.format_version, 16);
         assert_eq!(config.batch_size, 1024);
         assert_eq!(config.selfplay_samples_per_update, 50_000);
         assert_eq!(config.selfplay_workers, 128);

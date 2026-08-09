@@ -742,42 +742,6 @@ impl PolicyValueModel {
         model.refresh_local_axis_features();
         Ok(model)
     }
-
-    pub fn update_ema(&mut self, online: &Self, decay: f32) {
-        let decay = decay.clamp(0.0, 1.0);
-        let keep = 1.0 - decay;
-        macro_rules! blend {
-            ($field:ident) => {
-                for (ema, current) in self.$field.iter_mut().zip(&online.$field) {
-                    *ema = decay * *ema + keep * *current;
-                }
-            };
-        }
-        blend!(input_hidden);
-        blend!(stone_hidden);
-        blend!(rank_hidden);
-        blend!(file_hidden);
-        blend!(diagonal_hidden);
-        blend!(anti_diagonal_hidden);
-        blend!(hidden_bias);
-        blend!(policy_global);
-        blend!(policy_global_bias);
-        blend!(policy_gate);
-        blend!(policy_gate_bias);
-        blend!(policy_output);
-        blend!(policy_bias);
-        blend!(local_axis_embedding);
-        blend!(local_axis_scale);
-        blend!(local_axis_bias);
-        blend!(policy_local);
-        blend!(value_head_hidden);
-        blend!(value_local_output);
-        blend!(value_head_bias);
-        blend!(value_head_hidden2);
-        blend!(value_head_bias2);
-        blend!(value_head_output);
-        self.refresh_local_axis_features();
-    }
 }
 
 pub(crate) fn local_ray_codes(board: &Board, mv: Move, dr: i32, dc: i32) -> (usize, usize) {
@@ -1138,19 +1102,6 @@ mod tests {
             assert!((mean[i] - expected_mean).abs() < 1.0e-6);
             assert_eq!(max[i], expected_max);
         }
-    }
-
-    #[test]
-    fn ema_blends_every_parameter_group() {
-        let mut online = PolicyValueModel::random(8, 2);
-        let mut ema = PolicyValueModel::random(8, 1);
-        assert!(ema.policy_bias.iter().all(|&bias| bias == 0.0));
-        online.policy_bias[0] = 1.0;
-        let before = ema.policy_bias[0];
-        ema.update_ema(&online, 0.75);
-        let expected = before * 0.75 + online.policy_bias[0] * 0.25;
-        assert!((ema.policy_bias[0] - expected).abs() < 1e-6);
-        assert_eq!(ema.policy_bias.len(), CELL_COUNT);
     }
 
     #[test]

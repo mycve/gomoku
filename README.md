@@ -123,19 +123,17 @@ AlphaZero 训练循环首次执行 `az-loop` 时会自动生成
 配置的更新间隔到达后保存轮转检查点，并让候选模型与当前最佳模型交换先后手进行
 竞技场比赛；候选得分达到晋级线且按成对开局计算的置信下界超过 50% 时，才覆盖
 `best.safetensors`。按 Ctrl+C 会在安全边界保存并退出。
-周期性 Arena 默认先生成 2 ply 随机开局，再由候选 EMA 与 Best 接管；相邻两盘复用
-同一开局并交换黑白。自博弈 Actor 始终持续获取最新 EMA 网络；Arena 只维护评估
-基准，候选得分率达到 `arena_promotion_rate` 且置信下界通过门槛时才覆盖
-`best.safetensors`，不会阻塞
-最新训练网络发布。
+周期性 Arena 默认先生成 2 ply 随机开局，再由在线候选与 Best 接管；相邻两盘复用
+同一开局并交换黑白。自博弈 Actor 始终使用当前冠军；在线候选得分率的置信下界达到
+`arena_promotion_rate` 并通过历史冠军门槛时才覆盖 `best.safetensors` 并发布给 Actor。
 训练损失、学习率、自博弈速度、回放池大小和竞技场得分会写入 `runs/gomoku`，
 可用 `tensorboard --logdir runs/gomoku` 查看。训练使用 Candle 自动微分和 AdamW，
-优化器动量在同一次运行的各次 update 之间持续保留，EMA 在每个 optimizer step 后于
+优化器动量在同一次运行的各次 update 之间持续保留。
 训练默认探测并使用所有可见 CUDA GPU；多卡时每个全局 batch 会按卡数分片，各卡
 并行前向/反向，经 NCCL AllReduce 汇总梯度，由主卡执行 AdamW，再通过 NCCL 广播
 参数。Linux 默认使用全部可见 CUDA GPU，可用 `CUDA_VISIBLE_DEVICES` 限制可见范围；
 macOS 使用 Metal，Windows 使用单 CUDA 设备（无 CUDA 时回退 CPU）。在线模型在每张
-训练卡上各有副本；AdamW 状态和 EMA 只保留在主卡。配置中的 `batch_size` 是多卡共同
+训练卡上各有副本；AdamW 状态只保留在主卡。配置中的 `batch_size` 是多卡共同
 处理的全局 batch。旧配置中的 `gpu_device` 字段应删除。
 
 ### Windows CUDA 训练
@@ -205,12 +203,10 @@ update 都主动刷新日志，便于实时查看。
 - `bin/gomoku-engine.rs`：不含训练命令入口的独立交付引擎
 
 当前模型采用面向高速增量推理的 AZ-NNUE 结构：默认 192 宽共享隐藏层、ReLU 后
-RMSNorm，以及 `96 → 96 → WDL(3)` 价值头。MCTS 标量价值由
+RMSNorm，以及 `64 → 64 → WDL(3)` 价值头。MCTS 标量价值由
 `P(win) - P(loss)` 得到；初始 WDL 输出层为零，避免随机模型产生虚假胜率。
-在线模型执行梯度更新，EMA 模型默认按每个优化器 step 折算 `ema_decay = 0.999`，
-并专门提供给自博弈 Actor、检查点和 Arena；Best 仍只由 Arena 晋级替换。
-新训练没有 EMA 检查点时，第一次完整更新会先把在线模型完整复制到 EMA，后续才启用
-指数平滑；恢复已有 `ema.safetensors` 时直接延续历史 EMA，不会重新覆盖。
+在线模型执行梯度更新并直接作为 Arena 候选；Best 只由 Arena 晋级替换，晋级后发布给
+自博弈 Actor。候选连续拒绝达到配置次数时，在线模型与优化器重置到当前冠军。
 输入侧将精确棋子格点嵌入与己/彼棋子类型、15 行、15 列及两个方向各 29 条对角线
 结构嵌入相加；CPU 推理使用一次稀疏棋盘遍历完成全部累加，训练侧使用等价的
 Candle 批量矩阵运算。经验池抽样时会随机应用正方形的 8 种旋转/镜像对称变换，
@@ -247,7 +243,7 @@ Policy 和 Value 损失具有独立样本权重。价值塔采用适合 NEON/AVX
 随后用 10000 steps 余弦下降至 `1e-4`，累计 step 会随 progress 持久化：
 
 ```bash
-rm -f model.safetensors ema.safetensors best.safetensors
+rm -f model.safetensors best.safetensors
 rm -f data/azloop-progress.json data/replay.jsonl data/replay.jsonl.tmp
 rm -f gomoku.azloop.toml
 rm -rf checkpoints runs/gomoku
