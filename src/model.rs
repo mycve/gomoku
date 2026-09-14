@@ -12,8 +12,6 @@ pub const INPUT_SIZE: usize = GO_INPUT_START + crate::features::GO_FEATURE_SIZE;
 /// 与 chineseai 默认主干宽度一致；围棋实验沿用盘面与局部方向特征。
 pub const DEFAULT_HIDDEN_SIZE: usize = 128;
 pub const VALUE_HEAD_SIZE: usize = 96;
-pub const WDL_SIZE: usize = 3;
-pub const SHORT_VALUE_HEADS: usize = 3;
 pub const STONE_TYPES: usize = 2;
 pub const AXIS_FEATURES: usize = STONE_TYPES * BOARD_SIZE;
 pub const DIAGONAL_FEATURES: usize = STONE_TYPES * (BOARD_SIZE * 2 - 1);
@@ -34,7 +32,7 @@ pub const ROLE_ADAPTER_RANK: usize = 8;
 pub const REGION_COUNT: usize = 9;
 pub const REGION_FEATURE_SIZE: usize = 8;
 pub const REGION_TOTAL_SIZE: usize = REGION_COUNT * REGION_FEATURE_SIZE;
-const FORMAT_VERSION: f32 = 30.0;
+const FORMAT_VERSION: f32 = 31.0;
 const LOCAL_BOUNDARY: u8 = u8::MAX;
 const LOCAL_NEIGHBORS: [u8; ACTION_COUNT * LOCAL_AXES * 2 * LOCAL_RADIUS] = build_local_neighbors();
 
@@ -135,9 +133,6 @@ pub struct PolicyValueModel {
     pub(crate) value_head_hidden2: Vec<f32>,
     pub(crate) value_head_bias2: Vec<f32>,
     pub(crate) value_head_output: Vec<f32>,
-    /// 训练专用的 4/12/32 ply 短期价值头，推理不读取。
-    pub(crate) short_value_head_output: Vec<f32>,
-    pub(crate) short_value_head_bias: Vec<f32>,
 }
 
 #[derive(Clone)]
@@ -243,15 +238,13 @@ impl PolicyValueModel {
                 .map(|_| rng.weight((2.0 / hidden_size as f32).sqrt() * 0.5))
                 .collect(),
             value_region_hidden: vec![0.0; REGION_TOTAL_SIZE * VALUE_HEAD_SIZE],
-            value_local_output: vec![0.0; WDL_SIZE * VALUE_LOCAL_SIZE],
+            value_local_output: vec![0.0; VALUE_LOCAL_SIZE],
             value_head_bias: vec![0.0; VALUE_HEAD_SIZE],
             value_head_hidden2: (0..VALUE_HEAD_SIZE * VALUE_HEAD_SIZE)
                 .map(|_| rng.weight((2.0 / VALUE_HEAD_SIZE as f32).sqrt() * 0.5))
                 .collect(),
             value_head_bias2: vec![0.0; VALUE_HEAD_SIZE],
-            value_head_output: vec![0.0; VALUE_HEAD_SIZE * WDL_SIZE],
-            short_value_head_output: vec![0.0; SHORT_VALUE_HEADS * WDL_SIZE * VALUE_HEAD_SIZE],
-            short_value_head_bias: vec![0.0; SHORT_VALUE_HEADS * WDL_SIZE],
+            value_head_output: vec![0.0; VALUE_HEAD_SIZE],
         };
         model.refresh_local_axis_features();
         model
@@ -437,22 +430,10 @@ impl PolicyValueModel {
         for x in &mut scratch.value2 {
             *x = x.max(0.0);
         }
-        let mut wdl = [0.0_f32; WDL_SIZE];
-        for (output, logit) in wdl.iter_mut().enumerate() {
-            let start = output * VALUE_HEAD_SIZE;
-            *logit = dot(
-                &scratch.value2,
-                &self.value_head_output[start..start + VALUE_HEAD_SIZE],
-            ) + dot(
-                &scratch.local_value,
-                &self.value_local_output
-                    [output * VALUE_LOCAL_SIZE..(output + 1) * VALUE_LOCAL_SIZE],
-            );
-        }
-        let wdl_max = wdl.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let wdl_sum: f32 = wdl.iter().map(|x| (x - wdl_max).exp()).sum();
-        let wdl = wdl.map(|x| (x - wdl_max).exp() / wdl_sum);
-        let value = wdl[0] - wdl[2];
+        let logit = dot(&scratch.value2, &self.value_head_output)
+            + dot(&scratch.local_value, &self.value_local_output);
+        // 2 * sigmoid(logit) - 1，稳定地映射为当前行棋方的期望胜负。
+        let value = (0.5 * logit).tanh();
         (policy, value)
     }
 
@@ -823,7 +804,7 @@ impl PolicyValueModel {
             &vars,
             "value_local_output",
             &self.value_local_output,
-            (WDL_SIZE, VALUE_LOCAL_SIZE),
+            (1, VALUE_LOCAL_SIZE),
         )?;
         insert(
             &vars,
@@ -841,19 +822,7 @@ impl PolicyValueModel {
             &vars,
             "value_head_output",
             &self.value_head_output,
-            (WDL_SIZE, VALUE_HEAD_SIZE),
-        )?;
-        insert(
-            &vars,
-            "short_value_head_output",
-            &self.short_value_head_output,
-            (SHORT_VALUE_HEADS, WDL_SIZE, VALUE_HEAD_SIZE),
-        )?;
-        insert(
-            &vars,
-            "short_value_head_bias",
-            &self.short_value_head_bias,
-            (SHORT_VALUE_HEADS, WDL_SIZE),
+            (1, VALUE_HEAD_SIZE),
         )?;
         vars.save(path).map_err(candle_error)
     }
@@ -867,7 +836,7 @@ impl PolicyValueModel {
         if version != FORMAT_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "不支持的9×9围棋模型版本",
+                "需要 v31 纯 MC 单胜率模型；旧 WDL 模型不能直接载入",
             ));
         }
         let hidden_bias = load(&tensors, "hidden_bias")?;
@@ -908,8 +877,6 @@ impl PolicyValueModel {
             value_head_hidden2: load(&tensors, "value_head_hidden2")?,
             value_head_bias2: load(&tensors, "value_head_bias2")?,
             value_head_output: load(&tensors, "value_head_output")?,
-            short_value_head_output: load(&tensors, "short_value_head_output")?,
-            short_value_head_bias: load(&tensors, "short_value_head_bias")?,
         };
         if model.input_hidden.len() != INPUT_SIZE * hidden_size
             || model.stone_hidden.len() != STONE_TYPES * hidden_size
@@ -932,13 +899,11 @@ impl PolicyValueModel {
             || model.policy_local.len() != LOCAL_CANDIDATE_SIZE
             || model.value_head_hidden.len() != hidden_size * VALUE_HEAD_SIZE
             || model.value_region_hidden.len() != VALUE_HEAD_SIZE * REGION_TOTAL_SIZE
-            || model.value_local_output.len() != WDL_SIZE * VALUE_LOCAL_SIZE
+            || model.value_local_output.len() != VALUE_LOCAL_SIZE
             || model.value_head_bias.len() != VALUE_HEAD_SIZE
             || model.value_head_hidden2.len() != VALUE_HEAD_SIZE * VALUE_HEAD_SIZE
             || model.value_head_bias2.len() != VALUE_HEAD_SIZE
-            || model.value_head_output.len() != VALUE_HEAD_SIZE * WDL_SIZE
-            || model.short_value_head_output.len() != SHORT_VALUE_HEADS * WDL_SIZE * VALUE_HEAD_SIZE
-            || model.short_value_head_bias.len() != SHORT_VALUE_HEADS * WDL_SIZE
+            || model.value_head_output.len() != VALUE_HEAD_SIZE
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1293,6 +1258,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn old_wdl_model_is_rejected() {
+        let path =
+            std::env::temp_dir().join(format!("go9-old-format-{}.safetensors", std::process::id()));
+        let vars = VarMap::new();
+        insert(&vars, "format_version", &[30.0], (1,)).unwrap();
+        vars.save(&path).unwrap();
+        let result = PolicyValueModel::load(&path);
+        std::fs::remove_file(path).unwrap();
+        assert!(result.err().unwrap().to_string().contains("v31"));
+    }
+
+    #[test]
     fn simd_axis_aggregation_matches_scalar_formula() {
         let features = (0..LOCAL_AXES * LOCAL_AXIS_FEATURE_SIZE)
             .map(|i| ((i * 37 % 101) as f32 - 50.0) / 17.0)
@@ -1325,16 +1302,6 @@ mod tests {
         assert!(model.policy_local.iter().all(|&weight| weight == 0.0));
         assert!(model.policy_dynamic.iter().all(|&weight| weight == 0.0));
         assert!(model.value_local_output.iter().all(|&weight| weight == 0.0));
-    }
-
-    #[test]
-    fn short_value_heads_do_not_affect_inference() {
-        let model = PolicyValueModel::random(8, 7);
-        let mut changed = model.clone();
-        changed.short_value_head_output.fill(123.0);
-        changed.short_value_head_bias.fill(-45.0);
-        let board = Board::new();
-        assert_eq!(model.evaluate(&board), changed.evaluate(&board));
     }
 
     #[test]

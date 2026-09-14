@@ -135,7 +135,9 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         config.simulations, config.cpuct, config.cpuct_log, config.cpuct_base
     );
     println!("selfplay : latest learner is published to actors after every update");
-    println!("targets  : policy=mcts_visits value=td_lambda(0.95) short_value=4/12/32ply");
+    println!(
+        "targets  : policy=mcts_visits value=monte_carlo win_probability=binary_cross_entropy"
+    );
     println!(
         "lr       : warmup={} cosine={} min={:.6} peak={:.6} resumed_steps={}",
         config.learning_rate_warmup_steps,
@@ -386,11 +388,6 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         tb.add_scalar(
             "train/value_loss",
             event.train_stats.value_loss,
-            progress.update,
-        );
-        tb.add_scalar(
-            "train/short_value_loss",
-            event.train_stats.short_value_loss,
             progress.update,
         );
         tb.add_scalar(
@@ -916,7 +913,7 @@ fn print_event(
         event.train_samples as f32 / event.batch.samples.len().max(1) as f32
     );
     println!(
-        "train    : device={} samples={} steps={} total_steps={} lr={:.6} loss={:.4} policy={:.4}(H={:.4} KL={:.4}) value={:.4}(H={:.4} KL={:.4}) short={:.4} sample={:.3}s time={:.2}s sps={:.1}",
+        "train    : device={} samples={} steps={} total_steps={} lr={:.6} loss={:.4} policy={:.4}(H={:.4} KL={:.4}) value={:.4}(H={:.4} KL={:.4}) sample={:.3}s time={:.2}s sps={:.1}",
         device,
         event.train_stats.samples,
         event.train_stats.optimizer_steps,
@@ -929,7 +926,6 @@ fn print_event(
         event.train_stats.value_loss,
         event.train_stats.value_entropy,
         event.train_stats.value_kl,
-        event.train_stats.short_value_loss,
         event.sampling_seconds,
         event.train_seconds,
         event.train_stats.samples as f32 / event.train_seconds.max(1e-6)

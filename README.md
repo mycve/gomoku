@@ -3,18 +3,28 @@
 `codex/go` 分支上的 9×9 围棋 AlphaZero 实验；原五子棋版本保留在 `main`。
 支持自博弈、CUDA 训练、Arena 评估、终端对战和 GTP 2。
 
+## v31 价值目标
+
+主价值头只有一个胜率 logit，使用稳定二元交叉熵训练；搜索使用 `v=2p-1`。
+每个样本直接使用最终胜负（当前行棋方胜 +1、负 -1），取消 TD(λ)、WDL 三分类及短期自举辅助头。
+默认 7.5 贴目下没有计分平局。自定义整数贴目若平分，期望结果记为 0（BCE 目标 0.5），不额外设置和棋输出。
+中断对局仍不产生训练标签；终局死活估分的局限仍然存在。
+
+**不兼容旧格式**：v30 模型和旧 TD 回放会被拒绝，既不自动迁移，也不覆盖。
+v31 使用独立模型、回放和进度路径，需要重新开始训练；回放终局结果字段为必填 `mc_value`。
+
 ## 启动训练
 
 ```powershell
 cargo test --profile fast
-cargo run --profile fast -- az-loop   # 首次生成 go9-v30.azloop.toml
+cargo run --profile fast -- az-loop   # 首次生成 go9-v31.azloop.toml
 cargo run --profile fast -- az-loop --target-update 10
 cargo run --profile fast -- play
 ```
 
-默认配置：隐藏宽度 128，每步 64 次模拟，4 个自博弈线程，每次更新训练 2048 样本。
+默认配置：隐藏宽度 128，每步 400 次模拟，128 个自博弈线程，每次收集至少 81920 条样本并训练 81920 条，batch=256，回放容量 500000。
 更新编号是绝对值，运行会读取已有进度。模型、Best、回放、日志分别使用
-`go9-v30-model.safetensors`、`go9-v30-best.safetensors`、`data/go9-v30/`、`runs/go9-v30/`。
+`go9-v31-model.safetensors`、`go9-v31-best.safetensors`、`data/go9-v31/`、`runs/go9-v31/`。
 
 小规模端到端验证：
 
@@ -22,7 +32,8 @@ cargo run --profile fast -- play
 cargo run --profile fast -- az-loop --config go9.smoke.toml --target-update 2
 ```
 
-小配置使用独立的 `data/go9-smoke-v30/` 与 `runs/go9-smoke-v30/`，每次更新进行 4 局 Arena。
+小配置使用独立的 `data/go9-smoke-v31/` 与 `runs/go9-smoke-v31/`，每次更新进行 4 局 Arena。
+v31 已通过 51 项测试及三轮小配置验证（含模型恢复训练）；回放格式通过 LZ4 保存/读取测试。
 少量更新只能验证运行流程，不能证明棋力提升。
 
 ## 围棋规则与自动计分
@@ -68,7 +79,7 @@ cargo run --profile fast -- az-loop --config go9.smoke.toml --target-update 2
 
 ```powershell
 cargo build --profile fast
-.\target\fast\go9.exe gtp --model go9-v30-model.safetensors --simulations 256
+.\target\fast\go9.exe gtp --model go9-v31-model.safetensors --simulations 256
 ```
 
 支持 `protocol_version`、`name`、`version`、`known_command`、`list_commands`、`quit`、
@@ -93,9 +104,9 @@ cargo build --profile fast
 
 ```powershell
 cargo run --profile fast -- az-init
-cargo run --profile fast -- az-search go9-v30-model.safetensors 256 1.5 e5 e6 f5
-cargo run --profile fast -- az-bench go9-v30-model.safetensors 256 5
-cargo run --profile fast -- az-arena-best go9-v30-model.safetensors go9-v30-best.safetensors 100 256
+cargo run --profile fast -- az-search go9-v31-model.safetensors 256 1.5 e5 e6 f5
+cargo run --profile fast -- az-bench go9-v31-model.safetensors 256 5
+cargo run --profile fast -- az-arena-best go9-v31-model.safetensors go9-v31-best.safetensors 100 256
 ```
 
 观察训练 loss、自博弈平均手数和中止数，再与冻结的早期模型在相同预算下交替执黑执白评估。

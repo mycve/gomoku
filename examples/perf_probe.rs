@@ -16,11 +16,11 @@ fn main() -> io::Result<()> {
     let model_path = args
         .get(2)
         .map(String::as_str)
-        .unwrap_or("go9-v30-model.safetensors");
+        .unwrap_or("go9-v31-model.safetensors");
     let replay_path = args
         .get(3)
         .map(String::as_str)
-        .unwrap_or("data/go9-v30/replay.jsonl");
+        .unwrap_or("data/go9-v31/replay.jsonl");
     let mut model = PolicyValueModel::load(model_path)?;
     let samples = replay::load(replay_path)?;
     if samples.is_empty() {

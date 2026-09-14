@@ -13,6 +13,7 @@ pub fn encode(board: &Board, perspective: Player) -> Vec<f32> {
     let mut data = vec![0.0; GO_FEATURE_SIZE];
     let groups = chains(cells);
     let safe = pass_alive_with_chains(cells, &groups);
+    let analysis = crate::game::MoveAnalysis::new(&groups);
     for chain in groups {
         let side = usize::from(chain.color != perspective.stone());
         let liberties = chain.liberties.len().clamp(1, 3) - 1;
@@ -37,25 +38,11 @@ pub fn encode(board: &Board, perspective: Player) -> Vec<f32> {
             }
             data[17 * CELL_COUNT + point] =
                 f32::from(board.previous_cells()[point] != cells[point]);
-            if let Some(after) = board.placed_for(Move(point), perspective) {
+            if let Some(info) = analysis.placement(board, Move(point), perspective) {
                 data[10 * CELL_COUNT + point] = 1.0;
-                let captured = cells
-                    .iter()
-                    .zip(&after)
-                    .filter(|(a, b)| **a == perspective.other().stone() && **b == 0)
-                    .count();
-                data[11 * CELL_COUNT + point] = captured as f32 / CELL_COUNT as f32;
-                let chain = crate::game::group(&after, point).0;
-                let mut liberties = [false; CELL_COUNT];
-                for stone in chain {
-                    for n in neighbors(stone) {
-                        if after[n] == 0 {
-                            liberties[n] = true;
-                        }
-                    }
-                }
-                data[12 * CELL_COUNT + point] =
-                    f32::from(liberties.iter().filter(|&&x| x).count() == 1);
+                data[11 * CELL_COUNT + point] =
+                    info.captured.count_ones() as f32 / CELL_COUNT as f32;
+                data[12 * CELL_COUNT + point] = f32::from(info.liberties == 1);
             }
         }
     }

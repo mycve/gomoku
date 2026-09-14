@@ -59,7 +59,7 @@ enum Command {
 
 #[derive(Args)]
 struct GtpArgs {
-    #[arg(long, default_value = "go9-v30-model.safetensors")]
+    #[arg(long, default_value = "go9-v31-model.safetensors")]
     model: String,
     #[arg(long, default_value_t = 256)]
     simulations: usize,
@@ -67,7 +67,7 @@ struct GtpArgs {
 
 #[derive(Args)]
 struct AzInitArgs {
-    #[arg(default_value = "go9-v30-model.safetensors")]
+    #[arg(default_value = "go9-v31-model.safetensors")]
     output: String,
     #[arg(default_value_t = 128)]
     hidden: usize,
@@ -77,7 +77,7 @@ struct AzInitArgs {
 
 #[derive(Args)]
 struct AzSearchArgs {
-    #[arg(default_value = "go9-v30-model.safetensors")]
+    #[arg(default_value = "go9-v31-model.safetensors")]
     model: String,
     #[arg(default_value_t = 3000)]
     simulations: usize,
@@ -89,7 +89,7 @@ struct AzSearchArgs {
 
 #[derive(Args)]
 struct AzBenchArgs {
-    #[arg(default_value = "go9-v30-model.safetensors")]
+    #[arg(default_value = "go9-v31-model.safetensors")]
     model: String,
     #[arg(default_value_t = 3000)]
     simulations: usize,
@@ -102,9 +102,9 @@ struct AzBenchArgs {
 
 #[derive(Args)]
 struct AzTrainBenchArgs {
-    #[arg(default_value = "go9-v30-model.safetensors")]
+    #[arg(default_value = "go9-v31-model.safetensors")]
     model: String,
-    #[arg(default_value = "data/go9-v30/replay.jsonl")]
+    #[arg(default_value = "data/go9-v31/replay.jsonl")]
     replay: String,
     #[arg(default_value_t = 2)]
     epochs: usize,
@@ -125,9 +125,9 @@ struct AzLoopArgs {
 
 #[derive(Args)]
 struct AzArenaBestArgs {
-    #[arg(default_value = "go9-v30-model.safetensors")]
+    #[arg(default_value = "go9-v31-model.safetensors")]
     candidate: String,
-    #[arg(default_value = "go9-v30-best.safetensors")]
+    #[arg(default_value = "go9-v31-best.safetensors")]
     best: String,
     #[arg(default_value_t = 100)]
     games: usize,
@@ -148,7 +148,7 @@ enum HumanSide {
 
 #[derive(Args)]
 struct AzEvalBestArgs {
-    #[arg(default_value = "go9-v30-best.safetensors")]
+    #[arg(default_value = "go9-v31-best.safetensors")]
     best: String,
     #[arg(default_value_t = 3000)]
     simulations: usize,
@@ -160,7 +160,7 @@ struct AzEvalBestArgs {
 
 #[derive(Args)]
 struct PlayArgs {
-    #[arg(default_value = "go9-v30-model.safetensors")]
+    #[arg(default_value = "go9-v31-model.safetensors")]
     model: String,
     #[arg(default_value_t = 3000)]
     simulations: usize,
@@ -180,7 +180,7 @@ fn main() -> io::Result<()> {
             PolicyValueModel::random(args.hidden, args.seed).save(&args.output)?;
             println!("model    : initialized {}", args.output);
             println!(
-                "arch     : input={} hidden={} rmsnorm role=rank{} region=3x3x{} local=4axesx8cells-pattern{} policy=dynamic{} value={}x{}xWDL3",
+                "arch     : input={} hidden={} rmsnorm role=rank{} region=3x3x{} local=4axesx8cells-pattern{} policy=dynamic{} value={}x{}x1(sigmoid)",
                 INPUT_SIZE,
                 args.hidden,
                 ROLE_ADAPTER_RANK,
@@ -268,8 +268,8 @@ fn main() -> io::Result<()> {
                 (samples.len() * args.epochs) as f64 / seconds.max(1e-9)
             );
             println!(
-                "loss     : total={:.4} policy={:.4} value={:.4} short={:.4}",
-                stats.loss, stats.policy_loss, stats.value_loss, stats.short_value_loss
+                "loss     : total={:.4} policy={:.4} value={:.4}",
+                stats.loss, stats.policy_loss, stats.value_loss
             );
         }
         Some(Command::AzLoop(args)) => {

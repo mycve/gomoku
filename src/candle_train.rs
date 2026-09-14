@@ -5,9 +5,8 @@ use crate::{
         AXIS_FEATURES, DIAGONAL_FEATURES, INPUT_SIZE, LOCAL_AXES, LOCAL_AXIS_FEATURE_SIZE,
         LOCAL_AXIS_PATTERNS, LOCAL_CANDIDATE_SIZE, MOVE_COUNT_INPUT, POLICY_HEAD_SIZE,
         POLICY_TACTICAL_SIZE, PolicyValueModel, REGION_COUNT, REGION_FEATURE_SIZE,
-        REGION_TOTAL_SIZE, ROLE_ADAPTER_RANK, ROLE_COUNT, ROLE_INPUT_START, SHORT_VALUE_HEADS,
-        STONE_TYPES, VALUE_HEAD_SIZE, VALUE_LOCAL_SIZE, WDL_SIZE, local_ray_codes,
-        policy_tactical_index,
+        REGION_TOTAL_SIZE, ROLE_ADAPTER_RANK, ROLE_COUNT, ROLE_INPUT_START, STONE_TYPES,
+        VALUE_HEAD_SIZE, VALUE_LOCAL_SIZE, local_ray_codes, policy_tactical_index,
     },
     replay::Sample,
     selfplay::TrainStats,
@@ -83,7 +82,6 @@ impl TrainingSession {
                 stats.samples += output.samples;
                 stats.policy_loss += output.policy_sum;
                 stats.value_loss += output.value_sum;
-                stats.short_value_loss += output.short_value_sum;
                 stats.policy_entropy += output.policy_entropy_sum;
                 stats.value_entropy += output.value_entropy_sum;
                 stats.optimizer_steps += 1;
@@ -104,7 +102,6 @@ impl TrainingSession {
             stats.samples += output.samples;
             stats.policy_loss += output.policy_sum;
             stats.value_loss += output.value_sum;
-            stats.short_value_loss += output.short_value_sum;
             stats.policy_entropy += output.policy_entropy_sum;
             stats.value_entropy += output.value_entropy_sum;
         }
@@ -130,12 +127,11 @@ fn finalize_stats(mut stats: TrainStats) -> TrainStats {
     let count = stats.samples.max(1) as f32;
     stats.policy_loss /= count;
     stats.value_loss /= count;
-    stats.short_value_loss /= count;
     stats.policy_entropy /= count;
     stats.value_entropy /= count;
     stats.policy_kl = (stats.policy_loss - stats.policy_entropy).max(0.0);
     stats.value_kl = (stats.value_loss - stats.value_entropy).max(0.0);
-    stats.loss = stats.policy_loss + stats.value_loss + stats.short_value_loss;
+    stats.loss = stats.policy_loss + stats.value_loss;
     stats
 }
 
@@ -168,8 +164,6 @@ struct Replica {
     value_head_hidden2: Var,
     value_head_bias2: Var,
     value_head_output: Var,
-    short_value_head_output: Var,
-    short_value_head_bias: Var,
 }
 impl Replica {
     fn new(model: &PolicyValueModel, device: &Device) -> io::Result<Self> {
@@ -230,11 +224,7 @@ impl Replica {
                 (VALUE_HEAD_SIZE, REGION_TOTAL_SIZE),
                 device,
             )?,
-            value_local_output: var(
-                &model.value_local_output,
-                (WDL_SIZE, VALUE_LOCAL_SIZE),
-                device,
-            )?,
+            value_local_output: var(&model.value_local_output, (1, VALUE_LOCAL_SIZE), device)?,
             value_head_bias: var(&model.value_head_bias, (VALUE_HEAD_SIZE,), device)?,
             value_head_hidden2: var(
                 &model.value_head_hidden2,
@@ -242,21 +232,7 @@ impl Replica {
                 device,
             )?,
             value_head_bias2: var(&model.value_head_bias2, (VALUE_HEAD_SIZE,), device)?,
-            value_head_output: var(
-                &model.value_head_output,
-                (WDL_SIZE, VALUE_HEAD_SIZE),
-                device,
-            )?,
-            short_value_head_output: var(
-                &model.short_value_head_output,
-                (SHORT_VALUE_HEADS * WDL_SIZE, VALUE_HEAD_SIZE),
-                device,
-            )?,
-            short_value_head_bias: var(
-                &model.short_value_head_bias,
-                (SHORT_VALUE_HEADS * WDL_SIZE,),
-                device,
-            )?,
+            value_head_output: var(&model.value_head_output, (1, VALUE_HEAD_SIZE), device)?,
         })
     }
     fn vars(&self) -> Vec<Var> {
@@ -288,8 +264,6 @@ impl Replica {
             self.value_head_hidden2.clone(),
             self.value_head_bias2.clone(),
             self.value_head_output.clone(),
-            self.short_value_head_output.clone(),
-            self.short_value_head_bias.clone(),
         ]
     }
     fn forward(
@@ -333,14 +307,8 @@ impl Replica {
             .map_err(err)?;
         let masks =
             Tensor::from_vec(packed.policy_masks, (b, ACTION_COUNT), &self.device).map_err(err)?;
-        let value_wdl =
-            Tensor::from_vec(packed.value_wdl, (b, WDL_SIZE), &self.device).map_err(err)?;
-        let short_value_wdl = Tensor::from_vec(
-            packed.short_value_wdl,
-            (b, SHORT_VALUE_HEADS, WDL_SIZE),
-            &self.device,
-        )
-        .map_err(err)?;
+        let win_targets =
+            Tensor::from_vec(packed.win_targets, (b, 1), &self.device).map_err(err)?;
         let policy_weights =
             Tensor::from_vec(packed.policy_weights, (b,), &self.device).map_err(err)?;
         let value_weights =
@@ -540,32 +508,14 @@ impl Replica {
             .matmul(&self.value_head_output.t().map_err(err)?)
             .and_then(|x| x.add(&local_value.matmul(&self.value_local_output.t()?)?))
             .map_err(err)?;
-        let short_value_logits = value_features
-            .matmul(&self.short_value_head_output.t().map_err(err)?)
-            .and_then(|x| x.broadcast_add(&self.short_value_head_bias))
-            .and_then(|x| x.reshape((b, SHORT_VALUE_HEADS, WDL_SIZE)))
-            .map_err(err)?;
-        let value_log_probs = log_softmax(&value_logits, 1).map_err(err)?;
-        let value_sum_tensor = value_wdl
-            .mul(&value_log_probs)
-            .and_then(|x| x.sum(1))
+        let value_losses = binary_value_losses(&value_logits, &win_targets).map_err(err)?;
+        let value_sum_tensor = value_losses
+            .sum(1)
             .and_then(|x| x.mul(&value_weights))
             .and_then(|x| x.sum_all())
-            .and_then(|x| x.affine(-1.0, 0.0))
             .map_err(err)?;
-        let short_value_log_probs = log_softmax(&short_value_logits, 2).map_err(err)?;
-        let short_value_sum_tensor = short_value_wdl
-            .mul(&short_value_log_probs)
-            .and_then(|x| x.sum(2))
-            .and_then(|x| x.mean(1))
-            .and_then(|x| x.mul(&value_weights))
-            .and_then(|x| x.sum_all())
-            .and_then(|x| x.affine(-0.05, 0.0))
-            .map_err(err)?;
-        let short_value_sum = short_value_sum_tensor.to_scalar::<f32>().map_err(err)?;
         let loss = policy_sum_tensor
             .add(&value_sum_tensor)
-            .and_then(|x| x.add(&short_value_sum_tensor))
             .and_then(|x| x.affine(1.0 / global_batch_size.max(1) as f64, 0.0))
             .map_err(err)?;
         let policy_sum = policy_sum_tensor.to_scalar::<f32>().map_err(err)?;
@@ -583,7 +533,6 @@ impl Replica {
             samples: b,
             policy_sum,
             value_sum,
-            short_value_sum,
             policy_entropy_sum: packed.policy_entropy_sum,
             value_entropy_sum: packed.value_entropy_sum,
         })
@@ -631,8 +580,6 @@ impl Replica {
         m.value_head_hidden2 = v[24].clone();
         m.value_head_bias2 = v[25].clone();
         m.value_head_output = v[26].clone();
-        m.short_value_head_output = v[27].clone();
-        m.short_value_head_bias = v[28].clone();
         m.refresh_local_axis_features();
         Ok(())
     }
@@ -643,7 +590,6 @@ struct BatchOutput {
     samples: usize,
     policy_sum: f32,
     value_sum: f32,
-    short_value_sum: f32,
     policy_entropy_sum: f32,
     value_entropy_sum: f32,
 }
@@ -691,8 +637,7 @@ struct Packed {
     local_axis_indices: Vec<u32>,
     policy_tactical_indices: Vec<u32>,
     local_legal_mask: Vec<f32>,
-    value_wdl: Vec<f32>,
-    short_value_wdl: Vec<f32>,
+    win_targets: Vec<f32>,
     policy_weights: Vec<f32>,
     value_weights: Vec<f32>,
     policy_entropy_sum: f32,
@@ -712,8 +657,7 @@ fn pack(samples: &[Sample]) -> Packed {
     let mut local_axis_indices = vec![0_u32; samples.len() * ACTION_COUNT * LOCAL_AXES];
     let mut policy_tactical_indices = vec![u32::MAX; samples.len() * ACTION_COUNT * LOCAL_AXES];
     let mut local_legal_mask = vec![0.0; samples.len() * ACTION_COUNT];
-    let mut value_wdl = Vec::with_capacity(samples.len() * WDL_SIZE);
-    let mut short_value_wdl = Vec::with_capacity(samples.len() * SHORT_VALUE_HEADS * WDL_SIZE);
+    let mut win_targets = Vec::with_capacity(samples.len());
     let mut policy_weights = Vec::with_capacity(samples.len());
     let mut value_weights = Vec::with_capacity(samples.len());
     let mut policy_entropy_sum = 0.0;
@@ -790,25 +734,14 @@ fn pack(samples: &[Sample]) -> Packed {
             }
         }
         policy_entropy_sum += policy_entropy * s.policy_weight.max(0.0);
-        let final_wdl = s.value_wdl.unwrap_or_else(|| {
-            if s.value > 0.5 {
-                [1.0, 0.0, 0.0]
-            } else if s.value < -0.5 {
-                [0.0, 0.0, 1.0]
-            } else {
-                [0.0, 1.0, 0.0]
-            }
-        });
+        let target = (s.value + 1.0) * 0.5;
         value_entropy_sum -= s.value_weight.max(0.0)
-            * final_wdl
-                .iter()
-                .filter(|&&probability| probability > 0.0)
-                .map(|&probability| probability * probability.ln())
+            * [target, 1.0 - target]
+                .into_iter()
+                .filter(|&p| p > 0.0)
+                .map(|p| p * p.ln())
                 .sum::<f32>();
-        value_wdl.extend_from_slice(&final_wdl);
-        for target in s.short_value_wdl {
-            short_value_wdl.extend_from_slice(&target);
-        }
+        win_targets.push(target);
     }
     Packed {
         inputs,
@@ -824,14 +757,21 @@ fn pack(samples: &[Sample]) -> Packed {
         local_axis_indices,
         policy_tactical_indices,
         local_legal_mask,
-        value_wdl,
-        short_value_wdl,
+        win_targets,
         policy_weights,
         value_weights,
         policy_entropy_sum,
         value_entropy_sum,
     }
 }
+// 单个可训练 logit，使用库的稳定 log_softmax 计算加权 BCE。
+fn binary_value_losses(logits: &Tensor, targets: &Tensor) -> candle_core::Result<Tensor> {
+    let zeros = Tensor::zeros(logits.shape(), logits.dtype(), logits.device())?;
+    let log_probs = log_softmax(&Tensor::cat(&[logits, &zeros], 1)?, 1)?;
+    let targets = Tensor::cat(&[targets, &targets.affine(-1.0, 1.0)?], 1)?;
+    targets.mul(&log_probs)?.neg()
+}
+
 fn var(data: &[f32], shape: impl Into<candle_core::Shape>, device: &Device) -> io::Result<Var> {
     Var::from_slice(data, shape, device).map_err(err)
 }
@@ -845,6 +785,30 @@ mod tests {
     use crate::game::{Board, Move};
 
     #[test]
+    fn binary_value_loss_is_stable_and_has_correct_gradient() {
+        for device in [Device::Cpu, make_device(0).unwrap().0] {
+            let logits = Var::from_slice(&[-1000f32, 0.0, 1000.0, 0.0], (4, 1), &device).unwrap();
+            let targets = Tensor::from_slice(&[1f32, 1.0, 0.0, 0.0], (4, 1), &device).unwrap();
+            let loss = binary_value_losses(&logits, &targets)
+                .unwrap()
+                .sum_all()
+                .unwrap();
+            assert!((loss.to_scalar::<f32>().unwrap() - (2000.0 + 2.0 * 2f32.ln())).abs() < 1e-3);
+            let grads = loss.backward().unwrap();
+            let actual = grads
+                .get(&logits)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            for (actual, expected) in actual.iter().zip([-1.0, -0.5, 1.0, 0.5]) {
+                assert!((actual - expected).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
     fn packing_masks_only_rule_illegal_moves() {
         let mut board = Board::new();
         let occupied = Move::new(7, 7).unwrap();
@@ -855,14 +819,12 @@ mod tests {
             board,
             policy: vec![(nearby, 1.0)],
             value: 0.0,
-            value_wdl: None,
             generation: 0,
             policy_weight: 1.0,
             value_weight: 1.0,
             policy_surprise: 0.0,
             value_surprise: 0.0,
             predicted_value: 0.0,
-            short_value_wdl: [[0.0, 1.0, 0.0]; SHORT_VALUE_HEADS],
         }]);
 
         assert_eq!(packed.policy_masks[occupied.0], -1e9);
@@ -883,14 +845,12 @@ mod tests {
             board,
             policy: Vec::new(),
             value: 0.0,
-            value_wdl: None,
             generation: 0,
             policy_weight: 1.0,
             value_weight: 1.0,
             policy_surprise: 0.0,
             value_surprise: 0.0,
             predicted_value: 0.0,
-            short_value_wdl: [[0.0, 1.0, 0.0]; SHORT_VALUE_HEADS],
         };
         let packed = pack(&[sample(black), sample(white)]);
         assert_eq!(&packed.roles, &[1.0, 0.0, 0.0, 1.0]);
@@ -910,22 +870,23 @@ mod tests {
         let first = Move::new(7, 8).unwrap();
         let second = Move::new(8, 7).unwrap();
         let policy = [0.25_f32, 0.75];
-        let wdl = [0.2_f32, 0.3, 0.5];
+        let target = 0.35_f32;
         let packed = pack(&[Sample {
             board,
             policy: vec![(first, policy[0]), (second, policy[1])],
-            value: -0.3,
-            value_wdl: Some(wdl),
+            value: 2.0 * target - 1.0,
             generation: 0,
             policy_weight: 1.0,
             value_weight: 1.0,
             policy_surprise: 0.0,
             value_surprise: 0.0,
             predicted_value: 0.0,
-            short_value_wdl: [[0.0, 1.0, 0.0]; SHORT_VALUE_HEADS],
         }]);
         let expected_policy = -policy.iter().map(|p| p * p.ln()).sum::<f32>();
-        let expected_value = -wdl.iter().map(|p| p * p.ln()).sum::<f32>();
+        let expected_value = -[target, 1.0 - target]
+            .iter()
+            .map(|p| p * p.ln())
+            .sum::<f32>();
         assert!((packed.policy_entropy_sum - expected_policy).abs() < 1e-6);
         assert!((packed.value_entropy_sum - expected_value).abs() < 1e-6);
     }
@@ -934,7 +895,6 @@ mod tests {
     fn trains_policy_and_value_on_available_device() {
         let mut model = PolicyValueModel::random(16, 9);
         let before_local = model.local_axis_embedding.clone();
-        let before_short = model.short_value_head_output.clone();
         let mut board = Board::new();
         assert!(board.play(Move::new(7, 7).unwrap()));
         assert!(board.play(Move::new(7, 8).unwrap()));
@@ -942,14 +902,12 @@ mod tests {
             board,
             policy: vec![(Move::new(8, 7).unwrap(), 1.0)],
             value: 1.0,
-            value_wdl: None,
             generation: 0,
             policy_weight: 1.0,
             value_weight: 1.0,
             policy_surprise: 0.0,
             value_surprise: 0.0,
             predicted_value: 0.0,
-            short_value_wdl: [[0.0, 1.0, 0.0]; SHORT_VALUE_HEADS],
         };
         let stats = train(
             &mut model,
@@ -962,14 +920,9 @@ mod tests {
         assert_eq!(stats.optimizer_steps, 2);
         assert!(stats.policy_loss.is_finite());
         assert!(stats.value_loss.is_finite());
-        assert!(stats.short_value_loss.is_finite());
-        assert!(
-            (stats.loss - stats.policy_loss - stats.value_loss - stats.short_value_loss).abs()
-                < 1.0e-5
-        );
+        assert!((stats.loss - stats.policy_loss - stats.value_loss).abs() < 1.0e-5);
         assert!(model.policy_local.iter().any(|&weight| weight != 0.0));
         assert_ne!(model.local_axis_embedding, before_local);
-        assert_ne!(model.short_value_head_output, before_short);
         let (policy, value) = model.evaluate(&Board::new());
         assert_eq!(policy.len(), ACTION_COUNT);
         assert!(
@@ -997,14 +950,12 @@ mod tests {
             board,
             policy: vec![(Move::PASS, 1.0)],
             value: 1.0,
-            value_wdl: None,
             generation: 0,
             policy_weight: 1.0,
             value_weight: 1.0,
             policy_surprise: 0.0,
             value_surprise: 0.0,
             predicted_value: 0.0,
-            short_value_wdl: [[1.0, 0.0, 0.0]; SHORT_VALUE_HEADS],
         };
         let packed = pack(std::slice::from_ref(&sample));
         assert_eq!(packed.policy_targets[Move::PASS.0], 1.0);
@@ -1013,10 +964,15 @@ mod tests {
         let before = model.policy_bias[Move::PASS.0];
         train(&mut model, std::slice::from_ref(&sample), 2, 1e-3, 1).unwrap();
         assert!(model.policy_bias[Move::PASS.0] > before);
-        let (policy, _) = model.evaluate(&sample.board);
+        let (policy, value) = model.evaluate(&sample.board);
         let probability = policy.iter().find(|(mv, _)| *mv == Move::PASS).unwrap().1;
         let session = TrainingSession::new(&model, 1e-3).unwrap();
-        let stats = session.evaluate(&[sample], 1).unwrap();
+        let stats = session.evaluate(std::slice::from_ref(&sample), 1).unwrap();
         assert!((stats.policy_loss + probability.ln()).abs() < 1e-4);
+        assert!((stats.value_loss + ((value + 1.0) * 0.5).ln()).abs() < 1e-4);
+        let mut loss_sample = sample;
+        loss_sample.value = -1.0;
+        let stats = session.evaluate(&[loss_sample], 1).unwrap();
+        assert!((stats.value_loss + ((1.0 - value) * 0.5).ln()).abs() < 1e-4);
     }
 }

@@ -8,23 +8,19 @@ use std::{
 };
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Sample {
     pub board: Board,
     pub policy: Vec<(Move, f32)>,
+    /// 当前行棋方的真实终局结果；v31 必填，旧 TD 回放不可直接复用。
+    #[serde(rename = "mc_value")]
     pub value: f32,
-    pub value_wdl: Option<[f32; 3]>,
     pub generation: u64,
     pub policy_weight: f32,
     pub value_weight: f32,
     pub policy_surprise: f32,
     pub value_surprise: f32,
     pub predicted_value: f32,
-    #[serde(default = "default_short_value_wdl")]
-    pub short_value_wdl: [[f32; 3]; 3],
-}
-
-fn default_short_value_wdl() -> [[f32; 3]; 3] {
-    [[0.0, 1.0, 0.0]; 3]
 }
 
 impl Sample {
@@ -37,14 +33,12 @@ impl Sample {
                 .map(|&(mv, probability)| (Move(transform_index(mv.0, symmetry)), probability))
                 .collect(),
             value: self.value,
-            value_wdl: self.value_wdl,
             generation: self.generation,
             policy_weight: self.policy_weight,
             value_weight: self.value_weight,
             policy_surprise: self.policy_surprise,
             value_surprise: self.value_surprise,
             predicted_value: self.predicted_value,
-            short_value_wdl: self.short_value_wdl,
         }
     }
 }
@@ -252,15 +246,34 @@ mod tests {
             board: Board::new(),
             policy: Vec::new(),
             value: 0.0,
-            value_wdl: None,
             generation,
             policy_weight: 1.0,
             value_weight: 1.0,
             policy_surprise: 0.0,
             value_surprise: 0.0,
             predicted_value: 0.0,
-            short_value_wdl: default_short_value_wdl(),
         }
+    }
+
+    #[test]
+    fn old_td_replay_is_rejected() {
+        let sample = Sample {
+            board: Board::new(),
+            policy: vec![],
+            value: 1.0,
+            generation: 0,
+            policy_weight: 1.0,
+            value_weight: 1.0,
+            policy_surprise: 0.0,
+            value_surprise: 0.0,
+            predicted_value: 0.0,
+        };
+        let mut json = serde_json::to_value(&sample).unwrap();
+        assert_eq!(json["mc_value"], 1.0);
+        assert!(serde_json::from_value::<Sample>(json.clone()).is_ok());
+        json.as_object_mut().unwrap().remove("mc_value");
+        json["value"] = serde_json::json!(0.2);
+        assert!(serde_json::from_value::<Sample>(json).is_err());
     }
 
     #[test]

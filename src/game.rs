@@ -77,6 +77,106 @@ pub struct Board {
     /// 精确盘面历史，用于位置超级劫；pass 不受超级劫限制。
     history: Vec<Vec<i8>>,
 }
+/// 单个候选的精确提子与落子后气数，不分配临时棋盘。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PlacementInfo {
+    pub captured: u128,
+    pub liberties: u32,
+}
+
+/// 每个局面只建立一次棋块索引，用位集合合并相邻棋块和气。
+pub(crate) struct MoveAnalysis {
+    at: [usize; CELL_COUNT],
+    stones: Vec<u128>,
+    liberties: Vec<u128>,
+}
+impl MoveAnalysis {
+    pub(crate) fn new(groups: &[crate::scoring::Chain]) -> Self {
+        let mut at = [usize::MAX; CELL_COUNT];
+        let mut stones = Vec::with_capacity(groups.len());
+        let mut liberties = Vec::with_capacity(groups.len());
+        for (id, chain) in groups.iter().enumerate() {
+            let mut mask = 0;
+            for &p in &chain.stones {
+                at[p] = id;
+                mask |= 1u128 << p;
+            }
+            stones.push(mask);
+            liberties.push(
+                chain
+                    .liberties
+                    .iter()
+                    .fold(0, |mask, &p| mask | (1u128 << p)),
+            );
+        }
+        Self {
+            at,
+            stones,
+            liberties,
+        }
+    }
+    pub(crate) fn placement(
+        &self,
+        board: &Board,
+        mv: Move,
+        player: Player,
+    ) -> Option<PlacementInfo> {
+        let point = mv.0;
+        if point >= CELL_COUNT || board.cells[point] != 0 {
+            return None;
+        }
+        let bit = 1u128 << point;
+        let mut own = bit;
+        let mut liberties = 0;
+        let mut captured = 0;
+        for n in neighbors(point) {
+            if board.cells[n] == 0 {
+                liberties |= 1u128 << n;
+            } else {
+                let id = self.at[n];
+                if board.cells[n] == player.stone() {
+                    own |= self.stones[id];
+                    liberties |= self.liberties[id];
+                } else if self.liberties[id] == bit {
+                    captured |= self.stones[id];
+                }
+            }
+        }
+        liberties = (liberties | (adjacent_mask(own) & captured)) & !bit;
+        if liberties == 0 {
+            return None;
+        }
+        // 精确比较历史，保持位置超级劫语义，不依赖有碰撞风险的哈希。
+        let mut after = [0; CELL_COUNT];
+        after.copy_from_slice(&board.cells);
+        after[point] = player.stone();
+        let mut removed = captured;
+        while removed != 0 {
+            let p = removed.trailing_zeros() as usize;
+            after[p] = 0;
+            removed &= removed - 1;
+        }
+        if board.history.iter().any(|old| old.as_slice() == after) {
+            return None;
+        }
+        Some(PlacementInfo {
+            captured,
+            liberties: liberties.count_ones(),
+        })
+    }
+}
+
+fn adjacent_mask(stones: u128) -> u128 {
+    const BOARD: u128 = (1u128 << CELL_COUNT) - 1;
+    const LEFT: u128 = BOARD / ((1u128 << BOARD_SIZE) - 1);
+    const RIGHT: u128 = LEFT << (BOARD_SIZE - 1);
+    ((stones << BOARD_SIZE)
+        | (stones >> BOARD_SIZE)
+        | ((stones & !LEFT) >> 1)
+        | ((stones & !RIGHT) << 1))
+        & BOARD
+}
+
 impl Default for Board {
     fn default() -> Self {
         Self::new()
@@ -193,9 +293,10 @@ impl Board {
         if self.is_finished() {
             return Vec::new();
         }
+        let analysis = MoveAnalysis::new(&crate::scoring::chains(&self.cells));
         (0..ACTION_COUNT)
             .map(Move)
-            .filter(|&mv| mv == Move::PASS || self.placed(mv).is_some())
+            .filter(|&mv| mv == Move::PASS || analysis.placement(self, mv, self.to_move).is_some())
             .collect()
     }
     pub fn search_candidates(&self) -> Vec<Move> {
@@ -337,6 +438,58 @@ mod tests {
     pub(super) fn ko_position() -> Board {
         position(&["a2", "b1", "c2"], &["b2", "a3", "c3", "b4"])
     }
+    #[test]
+    fn bitset_candidates_match_reference_placement() {
+        let mut rng = 719u64;
+        for _ in 0..12 {
+            let mut board = Board::new();
+            for _ in 0..180 {
+                let analysis = MoveAnalysis::new(&crate::scoring::chains(board.cells()));
+                for player in [Player::Black, Player::White] {
+                    for point in 0..CELL_COUNT {
+                        let reference = board.placed_for(Move(point), player);
+                        let actual = analysis.placement(&board, Move(point), player);
+                        assert_eq!(
+                            actual.is_some(),
+                            reference.is_some(),
+                            "point={point}, player={player:?}, board={board}"
+                        );
+                        if let Some(after) = reference {
+                            let actual = actual.unwrap();
+                            let mut captured = 0;
+                            for p in 0..CELL_COUNT {
+                                if board.cells[p] != 0 && after[p] == 0 {
+                                    captured |= 1u128 << p;
+                                }
+                            }
+                            assert_eq!(actual.captured, captured);
+                            let mut liberties = [false; CELL_COUNT];
+                            for p in group(&after, point).0 {
+                                for n in neighbors(p) {
+                                    if after[n] == 0 {
+                                        liberties[n] = true;
+                                    }
+                                }
+                            }
+                            assert_eq!(
+                                actual.liberties as usize,
+                                liberties.iter().filter(|&&v| v).count()
+                            );
+                        }
+                    }
+                }
+                let moves = board.rule_legal_moves();
+                if moves.is_empty() {
+                    break;
+                }
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                assert!(board.play(moves[rng as usize % moves.len()]));
+            }
+        }
+    }
+
     #[test]
     fn captures_connected_group_and_rejects_suicide_without_mutation() {
         let mut board = position(&["a2", "b1", "c1", "d2", "b3"], &["b2", "c2"]);
