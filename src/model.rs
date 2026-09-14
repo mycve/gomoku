@@ -1,25 +1,27 @@
-use crate::game::{BOARD_SIZE, Board, CELL_COUNT, Move, Player};
+use crate::game::{ACTION_COUNT, BOARD_SIZE, Board, CELL_COUNT, Move, Player};
 use candle_core::{DType, Device, Shape, Var};
 use candle_nn::VarMap;
 use std::{fs, io, path::Path};
 
 pub const MOVE_COUNT_INPUT: usize = CELL_COUNT * 2;
-pub const ROLE_INPUT_START: usize = MOVE_COUNT_INPUT + 1;
+pub const PASS_INPUT: usize = MOVE_COUNT_INPUT + 1;
+pub const ROLE_INPUT_START: usize = PASS_INPUT + 1;
 pub const ROLE_COUNT: usize = 2;
-pub const INPUT_SIZE: usize = ROLE_INPUT_START + ROLE_COUNT;
-/// 与 chineseai 默认主干宽度一致；五子棋保留自己的盘面和局部战术特征。
+pub const GO_INPUT_START: usize = ROLE_INPUT_START + ROLE_COUNT;
+pub const INPUT_SIZE: usize = GO_INPUT_START + crate::features::GO_FEATURE_SIZE;
+/// 与 chineseai 默认主干宽度一致；围棋实验沿用盘面与局部方向特征。
 pub const DEFAULT_HIDDEN_SIZE: usize = 128;
 pub const VALUE_HEAD_SIZE: usize = 96;
 pub const WDL_SIZE: usize = 3;
 pub const SHORT_VALUE_HEADS: usize = 3;
 pub const STONE_TYPES: usize = 2;
-pub const AXIS_FEATURES: usize = STONE_TYPES * 15;
+pub const AXIS_FEATURES: usize = STONE_TYPES * BOARD_SIZE;
 pub const DIAGONAL_FEATURES: usize = STONE_TYPES * (BOARD_SIZE * 2 - 1);
 pub const LOCAL_AXES: usize = 4;
 pub const LOCAL_RADIUS: usize = 4;
 pub const LOCAL_RAY_PATTERNS: usize = 4usize.pow(LOCAL_RADIUS as u32);
 pub const LOCAL_AXIS_PATTERNS: usize = LOCAL_RAY_PATTERNS * (LOCAL_RAY_PATTERNS + 1) / 2;
-/// 五子棋的主要容量放在 32,896 种精确方向棋形上，
+/// 局部特征的主要容量放在 32,896 种精确方向棋形上，
 /// 类似 chineseai 把大部分参数放在稀疏战术表，而不是盲目加宽稠密主干。
 pub const LOCAL_AXIS_FEATURE_SIZE: usize = 16;
 pub const LOCAL_CANDIDATE_SIZE: usize = LOCAL_AXIS_FEATURE_SIZE * 2;
@@ -32,9 +34,9 @@ pub const ROLE_ADAPTER_RANK: usize = 8;
 pub const REGION_COUNT: usize = 9;
 pub const REGION_FEATURE_SIZE: usize = 8;
 pub const REGION_TOTAL_SIZE: usize = REGION_COUNT * REGION_FEATURE_SIZE;
-const FORMAT_VERSION: f32 = 28.0;
+const FORMAT_VERSION: f32 = 30.0;
 const LOCAL_BOUNDARY: u8 = u8::MAX;
-const LOCAL_NEIGHBORS: [u8; CELL_COUNT * LOCAL_AXES * 2 * LOCAL_RADIUS] = build_local_neighbors();
+const LOCAL_NEIGHBORS: [u8; ACTION_COUNT * LOCAL_AXES * 2 * LOCAL_RADIUS] = build_local_neighbors();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PolicyValueArch {
@@ -66,8 +68,8 @@ impl Default for PolicyValueArch {
     }
 }
 
-const fn build_local_neighbors() -> [u8; CELL_COUNT * LOCAL_AXES * 2 * LOCAL_RADIUS] {
-    let mut table = [LOCAL_BOUNDARY; CELL_COUNT * LOCAL_AXES * 2 * LOCAL_RADIUS];
+const fn build_local_neighbors() -> [u8; ACTION_COUNT * LOCAL_AXES * 2 * LOCAL_RADIUS] {
+    let mut table = [LOCAL_BOUNDARY; ACTION_COUNT * LOCAL_AXES * 2 * LOCAL_RADIUS];
     let directions = [(1_i32, 0_i32), (0, 1), (1, 1), (1, -1)];
     let mut cell = 0;
     while cell < CELL_COUNT {
@@ -158,15 +160,13 @@ pub(crate) struct EvalScratch {
     policy_dynamic: Vec<f32>,
     role_adapter: Vec<f32>,
     local_states: Vec<u8>,
-    winning_us: Vec<bool>,
-    winning_them: Vec<bool>,
 }
 
 impl EvalScratch {
     pub(crate) fn new(hidden_size: usize) -> Self {
         Self {
             hidden: Vec::with_capacity(hidden_size),
-            logits: Vec::with_capacity(CELL_COUNT),
+            logits: Vec::with_capacity(ACTION_COUNT),
             local_candidate: vec![0.0; LOCAL_CANDIDATE_SIZE],
             local_value: vec![0.0; VALUE_LOCAL_SIZE],
             value1: Vec::with_capacity(VALUE_HEAD_SIZE),
@@ -175,16 +175,6 @@ impl EvalScratch {
             policy_dynamic: vec![0.0; LOCAL_CANDIDATE_SIZE],
             role_adapter: vec![0.0; ROLE_ADAPTER_RANK],
             local_states: vec![0; CELL_COUNT],
-            winning_us: vec![false; CELL_COUNT],
-            winning_them: vec![false; CELL_COUNT],
-        }
-    }
-
-    pub(crate) fn is_winning_move(&self, mv: Move, opponent: bool) -> bool {
-        if opponent {
-            self.winning_them[mv.0]
-        } else {
-            self.winning_us[mv.0]
         }
     }
 }
@@ -201,7 +191,7 @@ impl PolicyValueModel {
     }
 
     pub fn random_with_arch(arch: PolicyValueArch, seed: u64) -> Self {
-        arch.validate().expect("五子棋网络架构必须合法");
+        arch.validate().expect("9×9围棋网络架构必须合法");
         Self::random(arch.hidden_size, seed)
     }
 
@@ -216,7 +206,7 @@ impl PolicyValueModel {
         let policy_global = (0..POLICY_HEAD_SIZE * hidden_size)
             .map(|_| rng.weight(head_scale))
             .collect();
-        let policy_bias = vec![0.0; CELL_COUNT];
+        let policy_bias = vec![0.0; ACTION_COUNT];
         let mut model = Self {
             hidden_size,
             input_hidden,
@@ -237,7 +227,7 @@ impl PolicyValueModel {
             policy_global,
             policy_global_bias: vec![0.0; POLICY_HEAD_SIZE],
             policy_dynamic: vec![0.0; LOCAL_CANDIDATE_SIZE * POLICY_HEAD_SIZE],
-            policy_output: (0..CELL_COUNT * POLICY_HEAD_SIZE)
+            policy_output: (0..ACTION_COUNT * POLICY_HEAD_SIZE)
                 .map(|_| rng.weight((2.0 / POLICY_HEAD_SIZE as f32).sqrt() * 0.25))
                 .collect(),
             policy_bias,
@@ -373,13 +363,11 @@ impl PolicyValueModel {
                 };
             }
             for &mv in &moves {
-                let (winning_us, winning_them, tactical) = self.local_candidate_into(
+                let tactical = self.local_candidate_into(
                     &scratch.local_states,
                     mv,
                     &mut scratch.local_candidate,
                 );
-                scratch.winning_us[mv.0] = winning_us;
-                scratch.winning_them[mv.0] = winning_them;
                 let tactical_logit = tactical
                     .into_iter()
                     .map(|index| self.policy_tactical[index])
@@ -498,6 +486,29 @@ impl PolicyValueModel {
             );
         }
         self.set_move_count(&mut accumulator, board.move_count());
+        for h in 0..self.hidden_size {
+            let change = self.input_hidden[PASS_INPUT * self.hidden_size + h]
+                * board.consecutive_passes() as f32;
+            accumulator.black[h] += change;
+            accumulator.white[h] += change;
+        }
+        for (perspective, hidden) in [
+            (Player::Black, &mut accumulator.black),
+            (Player::White, &mut accumulator.white),
+        ] {
+            for (feature, value) in crate::features::encode(board, perspective)
+                .into_iter()
+                .enumerate()
+            {
+                if value == 0.0 {
+                    continue;
+                }
+                let start = (GO_INPUT_START + feature) * self.hidden_size;
+                for h in 0..self.hidden_size {
+                    hidden[h] += self.input_hidden[start + h] * value;
+                }
+            }
+        }
         accumulator
     }
 
@@ -509,32 +520,6 @@ impl PolicyValueModel {
         arena.extend_from_slice(&accumulator.white);
         arena.extend_from_slice(&accumulator.black_regions);
         arena.extend_from_slice(&accumulator.white_regions);
-        offset
-    }
-
-    pub(crate) fn accumulator_after_move_into_arena(
-        &self,
-        arena: &mut Vec<f32>,
-        parent_offset: usize,
-        mv: Move,
-        player: Player,
-    ) -> usize {
-        let width = self.accumulator_width();
-        debug_assert!(parent_offset + width <= arena.len());
-        let offset = arena.len();
-        arena.extend_from_within(parent_offset..parent_offset + width);
-        let (black, rest) = arena[offset..offset + width].split_at_mut(self.hidden_size);
-        let (white, rest) = rest.split_at_mut(self.hidden_size);
-        let (black_regions, white_regions) = rest.split_at_mut(REGION_TOTAL_SIZE);
-        self.add_stone_to_slices(black, white, mv, player);
-        self.add_region_to_slices(black_regions, white_regions, mv, player);
-        let rule_offset = MOVE_COUNT_INPUT * self.hidden_size;
-        let delta = 1.0 / CELL_COUNT as f32;
-        for h in 0..self.hidden_size {
-            let change = self.input_hidden[rule_offset + h] * delta;
-            black[h] += change;
-            white[h] += change;
-        }
         offset
     }
 
@@ -581,7 +566,7 @@ impl PolicyValueModel {
     }
 
     fn add_region_to_slices(&self, black: &mut [f32], white: &mut [f32], mv: Move, player: Player) {
-        let region = (mv.row() / 5) * 3 + mv.col() / 5;
+        let region = (mv.row() / (BOARD_SIZE / 3)) * 3 + mv.col() / (BOARD_SIZE / 3);
         for (perspective, values) in [(Player::Black, black), (Player::White, white)] {
             let side = usize::from(player != perspective);
             let source = (region * STONE_TYPES + side) * REGION_FEATURE_SIZE;
@@ -605,8 +590,8 @@ impl PolicyValueModel {
         for (perspective, hidden) in [(Player::Black, black), (Player::White, white)] {
             let side = usize::from(player != perspective);
             let exact = (side * CELL_COUNT + mv.0) * self.hidden_size;
-            let rank = (side * 15 + mv.row()) * self.hidden_size;
-            let file = (side * 15 + mv.col()) * self.hidden_size;
+            let rank = (side * BOARD_SIZE + mv.row()) * self.hidden_size;
+            let file = (side * BOARD_SIZE + mv.col()) * self.hidden_size;
             let diagonal = (side * (BOARD_SIZE * 2 - 1) + mv.row() + BOARD_SIZE - 1 - mv.col())
                 * self.hidden_size;
             let anti_diagonal =
@@ -678,25 +663,21 @@ impl PolicyValueModel {
         states: &[u8],
         mv: Move,
         output: &mut [f32],
-    ) -> (bool, bool, [usize; LOCAL_AXES]) {
+    ) -> [usize; LOCAL_AXES] {
         output.fill(0.0);
         let (mean, max) = output.split_at_mut(LOCAL_AXIS_FEATURE_SIZE);
         max.fill(f32::NEG_INFINITY);
-        let mut winning_us = false;
-        let mut winning_them = false;
         let mut feature_starts = [0; LOCAL_AXES];
         let mut tactical = [0; LOCAL_AXES];
         for axis in 0..LOCAL_AXES {
             let (first_code, second_code) = local_ray_codes_from_states(states, mv, axis);
-            winning_us |= ray_prefix(first_code, 1) + ray_prefix(second_code, 1) >= 4;
-            winning_them |= ray_prefix(first_code, 2) + ray_prefix(second_code, 2) >= 4;
             let pattern = second_code * (second_code + 1) / 2 + first_code;
             tactical[axis] = policy_tactical_index(mv, axis, pattern);
             feature_starts[axis] =
                 ((axis / 2) * LOCAL_AXIS_PATTERNS + pattern) * LOCAL_AXIS_FEATURE_SIZE;
         }
         aggregate_axis_features(&self.local_axis_features, feature_starts, mean, max);
-        (winning_us, winning_them, tactical)
+        tactical
     }
 
     pub(crate) fn refresh_local_axis_features(&mut self) {
@@ -804,9 +785,9 @@ impl PolicyValueModel {
             &vars,
             "policy_output",
             &self.policy_output,
-            (CELL_COUNT, POLICY_HEAD_SIZE),
+            (ACTION_COUNT, POLICY_HEAD_SIZE),
         )?;
-        insert(&vars, "policy_bias", &self.policy_bias, (CELL_COUNT,))?;
+        insert(&vars, "policy_bias", &self.policy_bias, (ACTION_COUNT,))?;
         insert(
             &vars,
             "policy_tactical",
@@ -903,7 +884,7 @@ impl PolicyValueModel {
         if version != FORMAT_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "不支持的五子棋模型版本",
+                "不支持的9×9围棋模型版本",
             ));
         }
         let hidden_bias = load(&tensors, "hidden_bias")?;
@@ -911,7 +892,7 @@ impl PolicyValueModel {
         if hidden_size == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "五子棋模型隐藏层不能为空",
+                "9×9围棋模型隐藏层不能为空",
             ));
         }
         let model = Self {
@@ -959,8 +940,8 @@ impl PolicyValueModel {
             || model.policy_global.len() != POLICY_HEAD_SIZE * hidden_size
             || model.policy_global_bias.len() != POLICY_HEAD_SIZE
             || model.policy_dynamic.len() != LOCAL_CANDIDATE_SIZE * POLICY_HEAD_SIZE
-            || model.policy_output.len() != CELL_COUNT * POLICY_HEAD_SIZE
-            || model.policy_bias.len() != CELL_COUNT
+            || model.policy_output.len() != ACTION_COUNT * POLICY_HEAD_SIZE
+            || model.policy_bias.len() != ACTION_COUNT
             || model.policy_tactical.len() != POLICY_TACTICAL_SIZE
             || model.local_axis_embedding.len() != LOCAL_AXIS_PATTERNS * LOCAL_AXIS_FEATURE_SIZE
             || model.local_axis_scale.len() != 2 * LOCAL_AXIS_FEATURE_SIZE
@@ -978,7 +959,7 @@ impl PolicyValueModel {
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "五子棋模型张量尺寸错误",
+                "9×9围棋模型张量尺寸错误",
             ));
         }
         let mut model = model;
@@ -1052,15 +1033,6 @@ fn local_ray_codes_from_states(states: &[u8], mv: Move, axis: usize) -> (usize, 
     } else {
         (rays.1, rays.0)
     }
-}
-
-fn ray_prefix(mut code: usize, state: usize) -> usize {
-    let mut count = 0;
-    while code & 3 == state {
-        count += 1;
-        code >>= 2;
-    }
-    count
 }
 
 pub(crate) fn policy_tactical_index(mv: Move, axis: usize, pattern: usize) -> usize {
@@ -1385,37 +1357,13 @@ mod tests {
     #[test]
     fn local_axis_encoding_is_reflection_invariant() {
         let mut board = Board::new();
-        for text in ["h8", "g8", "i8", "a1", "j8", "a2"] {
+        for text in ["d5", "c5", "e5", "a1", "f5", "a2"] {
             assert!(board.play(Move::parse(text).unwrap()));
         }
-        let candidate = Move::parse("k8").unwrap();
+        let candidate = Move::parse("g5").unwrap();
         let forward = local_ray_codes(&board, candidate, 0, 1);
         let backward = local_ray_codes(&board, candidate, 0, -1);
         assert_eq!(forward, backward);
-    }
-
-    #[test]
-    fn arena_accumulator_matches_full_rebuild_after_move() {
-        let model = PolicyValueModel::random(12, 19);
-        let mut board = Board::new();
-        assert!(board.play(Move::parse("h8").unwrap()));
-        let mut arena = Vec::new();
-        let root = model.accumulator_into_arena(&board, &mut arena);
-        let mv = Move::parse("h9").unwrap();
-        let player = board.to_move();
-        let child = model.accumulator_after_move_into_arena(&mut arena, root, mv, player);
-        assert!(board.play(mv));
-        let rebuilt = model.accumulator(&board);
-        for (incremental, rebuilt) in arena[child..child + model.accumulator_width()].iter().zip(
-            rebuilt
-                .black
-                .iter()
-                .chain(&rebuilt.white)
-                .chain(&rebuilt.black_regions)
-                .chain(&rebuilt.white_regions),
-        ) {
-            assert!((incremental - rebuilt).abs() < 1.0e-6);
-        }
     }
 
     #[test]
@@ -1452,7 +1400,7 @@ mod tests {
         let mut board = Board::new();
         assert!(board.play(Move::parse("h8").unwrap()));
         assert!(board.play(Move::parse("h9").unwrap()));
-        assert!(board.play(Move::parse("i8").unwrap()));
+        assert!(board.play(Move::parse("j8").unwrap()));
         let accumulator = model.accumulator(&board);
         for (role, actual) in [
             (Player::Black, &accumulator.black),
@@ -1476,10 +1424,11 @@ mod tests {
                 let mv = Move(sq);
                 let offsets = [
                     (side * CELL_COUNT + sq) * model.hidden_size,
-                    (side * 15 + mv.row()) * model.hidden_size,
-                    (side * 15 + mv.col()) * model.hidden_size,
-                    (side * 29 + mv.row() + 14 - mv.col()) * model.hidden_size,
-                    (side * 29 + mv.row() + mv.col()) * model.hidden_size,
+                    (side * BOARD_SIZE + mv.row()) * model.hidden_size,
+                    (side * BOARD_SIZE + mv.col()) * model.hidden_size,
+                    (side * (BOARD_SIZE * 2 - 1) + mv.row() + BOARD_SIZE - 1 - mv.col())
+                        * model.hidden_size,
+                    (side * (BOARD_SIZE * 2 - 1) + mv.row() + mv.col()) * model.hidden_size,
                     side * model.hidden_size,
                 ];
                 for h in 0..model.hidden_size {
@@ -1489,6 +1438,16 @@ mod tests {
                         + model.diagonal_hidden[offsets[3] + h]
                         + model.anti_diagonal_hidden[offsets[4] + h]
                         + model.stone_hidden[offsets[5] + h];
+                }
+            }
+            for (feature, value) in crate::features::encode(&board, role)
+                .into_iter()
+                .enumerate()
+            {
+                for h in 0..model.hidden_size {
+                    expected[h] += model.input_hidden
+                        [(GO_INPUT_START + feature) * model.hidden_size + h]
+                        * value;
                 }
             }
             let phase = board.move_count() as f32 / CELL_COUNT as f32;

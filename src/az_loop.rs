@@ -686,10 +686,11 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             let color_passed = report.passes_color_floor(config.arena_color_score_floor);
             let promoted = overall_passed && color_passed;
             println!(
-                "arena    : W/L/D={}/{}/{} score={:.2}% lower={:.2}% target={:.2}% overall_passed={} elo={:+.1} promoted={}",
+                "arena    : W/L/D={}/{}/{} aborted={} score={:.2}% lower={:.2}% target={:.2}% overall_passed={} elo={:+.1} promoted={}",
                 report.wins,
                 report.losses,
                 report.draws,
+                report.aborted,
                 report.score_rate() * 100.0,
                 lower_bound * 100.0,
                 config.arena_promotion_rate * 100.0,
@@ -850,10 +851,11 @@ fn print_event(
             .unwrap_or_default()
     );
     println!(
-        "result   : B/W/D={}/{}/{} avg_plies={:.1}",
+        "result   : B/W/D={}/{}/{} aborted={} avg_plies={:.1}",
         event.batch.stats.black_wins,
         event.batch.stats.white_wins,
         event.batch.stats.draws,
+        event.batch.stats.aborted,
         event.batch.stats.plies as f32 / event.batch.games.max(1) as f32
     );
     println!(

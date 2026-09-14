@@ -1,253 +1,103 @@
-# GomokuAI
+# Go9
 
-基于 AlphaZero 方法实现的五子棋自博弈、训练、评估与协议引擎系统。
+`codex/go` 分支上的 9×9 围棋 AlphaZero 实验；原五子棋版本保留在 `main`。
+支持自博弈、CUDA 训练、Arena 评估、终端对战和 GTP 2。
 
-当前规则为 15×15 自由五子棋：黑先，任一方横、竖或斜线连续五子（含长连）获胜，不含 Renju 禁手。
-
-## 快速开始
-
-```bash
-cargo test
-cargo run -- az-init model.safetensors 192
-cargo run -- az-loop                 # 首次生成 gomoku.azloop.toml
-cargo run -- az-loop --target-update 10
-cargo run -- az-search model.safetensors 3000 1.5 h8 h9 i8
-cargo run -- az-bench model.safetensors 3000 20
-cargo run -- az-train-bench
-cargo run --profile fast -- az-distill
-cargo run -- az-eval-best best.safetensors 3000 --human-side black
-cargo run -- az-arena-best model.safetensors best.safetensors 100 3000
-cargo run --profile fast --bin pbrain-gomoku
-cargo run -- play
-```
-
-### KataGo 数据蒸馏
-
-`az-distill` 读取 `fs15x_label28b` 的 NPZ 分片，使用教师搜索策略和软 WDL 标签训练
-当前策略价值网络。训练会在每个分片内确定性洗牌并应用随机八向对称变换，学习率按全部
-分片进度从 `learning-rate` 余弦衰减到 `min-learning-rate`。默认命令为：
+## 启动训练
 
 ```powershell
-cargo run --profile fast -- az-distill `
-  --output distilled.safetensors `
-  --best-output distilled-best.safetensors
+cargo test --profile fast
+cargo run --profile fast -- az-loop   # 首次生成 go9-v30.azloop.toml
+cargo run --profile fast -- az-loop --target-update 10
+cargo run --profile fast -- play
 ```
 
-每处理完一个分片，最新模型和 `data/distill-progress.txt` 都会保存；重新执行相同命令
-会自动加载 `distilled.safetensors` 并从下一个分片继续。验证损失最低的模型单独保存在
-`distilled-best.safetensors`，恢复训练时会先重新评估它，避免用退化的最新模型覆盖。
-控制台的 `mass` 表示搜索候选保留的教师策略概率质量，`top1` 表示教师首选着仍在候选
-集合中的比例。新版验证输出还报告策略/价值 KL，它扣除了软标签自身的熵，比原始交叉熵
-更直接地反映拟合差距。
+默认配置：隐藏宽度 128，每步 64 次模拟，4 个自博弈线程，每次更新训练 2048 样本。
+更新编号是绝对值，运行会读取已有进度。模型、Best、回放、日志分别使用
+`go9-v30-model.safetensors`、`go9-v30-best.safetensors`、`data/go9-v30/`、`runs/go9-v30/`。
 
-常用控制参数：
+小规模端到端验证：
 
-```text
---learning-rate 0.001       初始学习率
---min-learning-rate 0.00001 最终学习率
---validation-samples 200000 验证样本上限
---validate-every 25         验证间隔（分片）
---max-files N               本次最多处理 N 个分片
---skip-files N              手工跳过前 N 个分片
---progress PATH             独立实验的续跑状态文件
+```powershell
+cargo run --profile fast -- az-loop --config go9.smoke.toml --target-update 2
 ```
 
-独立的 `pbrain-gomoku` 可执行文件通过纯标准输入/输出实现 Gomocup/Piskvork 协议。Piskvork
-以必需的 `pbrain-` 文件名前缀识别标准输入/输出新协议。引擎支持 `START`、
-`BEGIN`、`TURN`、`BOARD`、`INFO timeout_turn`、`TAKEBACK`、`RESTART`、`ABOUT`
-和 `END`。协议坐标为零起始的 `x,y`；正常对局只按 `timeout_turn` 与 `time_left`
-确定搜索截止时间，不再设置固定模拟次数上限。`timeout_turn = 0` 按协议要求尽快
-落子。默认优先加载 `model.safetensors`，不存在时自动加载同目录的
-`best.safetensors`。
-当前规则为 15×15 freestyle Gomoku，不支持 Renju 禁手及非 15×15 棋盘。
+小配置使用独立的 `data/go9-smoke-v30/` 与 `runs/go9-smoke-v30/`，每次更新进行 4 局 Arena。
+少量更新只能验证运行流程，不能证明棋力提升。
 
-交付引擎时只需编译并复制独立二进制与模型，不包含训练命令入口：
+## 围棋规则与自动计分
 
-```bash
-cargo build --profile fast --bin pbrain-gomoku
-cp target/fast/pbrain-gomoku ./dist/
-cp model.safetensors ./dist/       # 优先加载
-# 或复制 best.safetensors，model 不存在时自动回退
-```
+- 9×9、黑先、默认白贴 7.5 目，提子、禁自杀、位置超级劫。
+- 82 个动作：81 个交点和 `pass`。连续两次停一手结束。
+- Benson 算法证明无条件活棋；只在确定活棋围成的至多 8 点区域内做战术搜索，
+  自动移除即使防守方先走也无法救出的死子。每个棋块最多 4000 个搜索节点；预算耗尽为未定。
+- 能识别两个棋块共用两气、任一方填气会被提且没有简单倒扑的双活。
+- 计分使用棋子加单方围住的空域，双方接触的空域中立；双活棋子保留。
+- **复杂死活、劫争和双活不保证全部判定。未定棋子保留，自博弈的两次停一手按双方接受当前盘面处理，
+  使用移除确定死子后的面积估分。该标签仍有近似性，不能当作死活求解器的真值。**
+- 324 手上限只中止对局：不计作和棋、不产生训练样本，Arena 不使用中止对局晋级。
 
-GUI 中的引擎命令设置为：
+终端终局显示确认的死棋、双活和未定棋块数量。方向键移动，Enter 落子，P 停一手，Q 退出。
+摆局搜索还支持 Backspace 撤销、R 清盘。坐标 A–H、J（跳过 I），从底部 1 到顶部 9。
 
-```bash
-./pbrain-gomoku
-```
+## 围棋专用网络输入
 
-日常开发和训练部署可使用快速优化编译模式：
+除棋子位置、手数、停一手和执棋方外，新增 18 个输入平面与贴目标量：
 
-```bash
+| 平面 | 内容 |
+| --- | --- |
+| 0–5 | 双方棋块气数：1 气、2 气、3 气以上 |
+| 6–7 | 双方棋块大小 / 81 |
+| 8–9 | 双方局部眼形 |
+| 10 | 当前方合法落点，含超级劫约束 |
+| 11 | 当前方该处落子可提子数 / 81 |
+| 12 | 当前方落子后是否只有一气 |
+| 13–14 | 双方 Benson 确定活棋 |
+| 15–16 | 上一手盘面上的双方棋子 |
+| 17 | 上一手改变的交点，包含提子 |
+
+训练和推理共用 `features::encode`。八向对称同步变换盘面、上一手与超级劫历史。
+提子后重建搜索节点累加器。贴目按相对视角输入网络。
+
+**模型格式升级为 30、配置格式升级为 22，需要重新训练。**
+旧模型、回放和配置不能混用；旧文件保留，新默认路径独立。
+
+## GTP 2 接口
+
+先训练或初始化当前格式模型，然后在围棋 GUI 中配置可执行文件与参数：
+
+```powershell
 cargo build --profile fast
-./target/fast/gomoku az-loop
-# 或直接运行
-cargo run --profile fast -- az-loop
+.\target\fast\go9.exe gtp --model go9-v30-model.safetensors --simulations 256
 ```
 
-`fast` 继承 Release 优化，但使用 Thin LTO、16 个 codegen unit 和增量编译，明显缩短
-重复编译时间；最终性能测量或正式长期训练仍可使用 `--release` 的 Fat LTO 单元构建。
+支持 `protocol_version`、`name`、`version`、`known_command`、`list_commands`、`quit`、
+`boardsize`（仅 9）、`clear_board`、`komi`、`play`、`genmove`、`reg_genmove`、`undo`、
+`showboard`、`fixed_handicap`（2–5 子）、`set_free_handicap`、`time_settings`、`time_left`、
+`final_score`、`final_status_list`。
 
-需要定位搜索和训练热点时，可启用轻量性能分析 feature：
+- 标准输入接收命令，标准输出只有 GTP 响应；支持命令编号、注释与空行。
+- `play` 接受指定颜色并维护超级劫历史；`undo` 恢复盘面、历史与停一手状态。
+- `komi` 接受有限的小数（精度 0.001），同时影响网络输入与计分。
+- 时间控制支持主时间及加拿大读秒，搜索同时受模拟次数与时间预算限制。
+- **`final_score` 在仍有未定棋块时返回 `? cannot score`**，不把估分冒充确定结果。
+  可用扩展命令 `estimate_score` 查看移除已确认死子后的面积估计，
+  `final_status_list unsettled` 列出需要继续对弈或人工裁决的棋块。
+- `final_status_list dead` 返回已证明的死子；不把所有未证明活的棋子报告为死子。
+- 尚不支持 SGF 导入或 19×19 棋盘，不对外宣称支持这些命令。
 
-```bash
-cargo run --profile fast --features profile -- az-bench model.safetensors 3000 50
-cargo run --profile fast --features profile -- az-train-bench model.safetensors data/replay.jsonl
-```
+协议参考：[GTP 2 规范](https://www.lysator.liu.se/~gunnar/gtp/gtp2-spec-draft2/gtp2-spec.html)。
+保守无条件活棋与封闭区域分析参考：[Solving Go on Small Boards，章节 5](https://project.dke.maastrichtuniversity.nl/games/files/phd/Van%20der%20Werf_thesis.pdf)。
 
-程序结束时会按总耗时排序输出调用次数、总耗时、平均耗时和最大耗时。正常长期训练不要
-启用 `profile`，避免计时器带来额外开销。
-
-人工评估默认在终端原位刷新，不会重复堆叠棋盘。对局中输入 `info` 查看 Best 上次
-搜索的候选着，输入 `help` 查看命令，输入 `quit` 退出；不支持 ANSI 的控制台可增加
-`--no-clear`。
-
-AlphaZero 训练循环首次执行 `az-loop` 时会自动生成
-`gomoku.azloop.toml`，检查参数后再次执行即可持续训练。进度记录在
-`data/azloop-progress.json`，中断后会从绝对更新编号继续。
-
-默认每个训练周期生成至少 50,000 个新局面，双方每步搜索 400 次。Collector 只按
-`selfplay_samples_per_update` 判断是否触发训练，不再按对局数控制。短局时自动生成
-更多对局，长局时减少对局，使每轮新增样本量与 50,000 条训练抽样量大致匹配，避免
-对局长度改变训练强度。每次更新依次执行并行自博弈、回放池裁剪、策略价值训练、
-进度保存。自博弈保持空棋盘起步，每次训练更新后都立即把最新学习器推送给 Actor，
-使后续数据持续跟随网络进化；不再维护历史冠军联赛和非对称搜索参数。
-冷启动默认先累计 `replay_warmup_samples = 100000` 个局面，再执行第一次训练；之后
-按 `selfplay_samples_per_update = 50000` 触发更新。中断快照中已恢复的经验会计入
-预热数量，且预热目标不能超过经验池容量。
-配置的 Arena 间隔到达后，让候选模型与当前最佳模型交换先后手进行
-竞技场比赛；默认要求候选总得分的成对90%置信下界达到50%，且候选执黑、执白得分
-分别不低于45%后才覆盖 `best.safetensors`。默认不保存周期检查点。停止时仅写入内部续训快照
-`model.safetensors`，下次启动会将它读入内存并删除；对外长期发布的模型只有 `best.safetensors`。
-周期性 Arena 默认先生成 2 ply 随机开局，再由在线候选与 Best 接管；相邻两盘复用
-同一开局并交换黑白。在线候选通过总下界和分颜色门槛后才覆盖 `best.safetensors`。
-新配置版本为 20，`hidden_size = 128` 显式描述网络主干宽度。模型格式为 v28，
-新增 4/12/32 ply 短期 WDL 训练辅助头；这些头不参与推理，因此不增加 MCTS 成本。
-方向棋形使用 16 维局部表示，另有 2^22 项哈希战术表直接输出 Policy logit；
-这种大表设计与 chineseai 一样避免展开宽激活。Policy 上下文为 32 维，Value 头为 96 维。
-旧 Replay 会自动补默认值；由于主要张量维度已变，v25-v27 模型不能与 v28 混用。
-精度契约：稀疏主干、Policy、主 Value、短期 Value、融合查表、梯度与保存权重全部使用
-FP32，不允许 INT8/F16/BF16 权重或价值路径。模型加载时会拒绝任何非 F32 张量。
-棋盘的 `i8/u8` 只用于无损的离散状态和稀疏索引，不参与网络数值计算。
-训练损失、学习率、自博弈速度、回放池大小和竞技场得分会写入 `runs/gomoku`，
-可用 `tensorboard --logdir runs/gomoku` 查看。训练使用 Candle 自动微分和 AdamW，
-优化器动量在同一次运行的各次 update 之间持续保留。
-训练只使用一个设备和一份网络副本：Windows/Linux 优先 CUDA 0，macOS 使用
-Metal 0，不可用时回退 CPU。不再包含 NCCL、数据并行、梯度 AllReduce 或参数广播路径。
-
-### Windows CUDA 训练
-
-Windows 原生训练需要 64 位 NVIDIA 驱动、CUDA Toolkit（含 `nvcc`）、Visual Studio
-2022 的“使用 C++ 的桌面开发”组件，以及 Rust MSVC 工具链。建议在 **x64 Native
-Tools Command Prompt for VS 2022** 或已加载 MSVC 环境的 PowerShell 中执行：
+## 棋力评估
 
 ```powershell
-rustup default stable-x86_64-pc-windows-msvc
-nvcc --version
-nvidia-smi
-cargo build --profile fast
-cargo run --profile fast -- az-init model.safetensors 192
-cargo run --profile fast -- az-loop
+cargo run --profile fast -- az-init
+cargo run --profile fast -- az-search go9-v30-model.safetensors 256 1.5 e5 e6 f5
+cargo run --profile fast -- az-bench go9-v30-model.safetensors 256 5
+cargo run --profile fast -- az-arena-best go9-v30-model.safetensors go9-v30-best.safetensors 100 256
 ```
 
-首次运行 `az-loop` 会生成 `gomoku.azloop.toml`。若显示 `cpu`，请检查前面输出的
-`CUDA unavailable` 原因。可用已有回放数据单独测速：
-
-```powershell
-cargo run --profile fast -- az-train-bench model.safetensors data/replay.jsonl
-```
-
-自博弈使用常驻异步 Worker，配置值超过机器可用 CPU 核心数时会自动限制到核心数。
-`selfplay_workers = 0` 表示使用可用 CPU 线程数，
-`selfplay_queue_capacity = 0` 表示使用自动队列容量。Worker 在
-每盘开始时获取模型快照；训练、检查点和竞技场运行期间继续生产。队列满时采用
-非阻塞投递并丢弃已完成对局，避免 Actor 被消费者阻塞；丢弃总数写入 TensorBoard。
-
-训练流水线分为常驻 Actor、独立 Collector 和独立 Trainer 三段。
-默认 Actor 队列容量为 `max(workers × 8, 32)`；Collector 持续排空 Actor 结果并只
-缓存一个完整训练批次，Trainer 独占回放池和 GPU 模型，主线程仅发布新模型、保存
-检查点、运行竞技场和输出日志。
-
-经验池采用固定训练量分层采样：每次更新不再遍历整个经验池，
-而是默认有放回采样 50,000 条，其中 40% 来自最近 5 个模型版本，其余 60% 只从更早的
-历史样本抽取，并在训练前执行确定性洗牌；历史区为空时才回退到全近期样本。控制台和
-TensorBoard 分别报告近期配额和实际近期样本占比。队列饱和时 Actor 使用非阻塞投递并丢弃结果；模型发布
-后 Collector 与 Trainer 会丢弃旧版本数据，避免 Worker 背压和旧数据持续排队。
-
-探索过程使用可配置的温度与噪声参数：网络策略 logits 在 MCTS 前按
-`policy_softmax_temp` 软化；自博弈根节点混合 Dirichlet 噪声；落子按访问次数和
-逐手退火温度采样，并支持胜率差过滤与访问次数偏移。五子棋默认退火区间缩短为
-12+24 手，适配五子棋较短的有效对局长度；竞技场、人工评估和普通搜索自动关闭
-根噪声与随机采样。
-
-控制台每次更新分行报告黑白胜负、平均手数、平均搜索模拟数、根策略熵、访问动作数、
-策略 Top-1/Top-2 集中度、温度采样命中率、Worker 活跃数、模型版本滞后、生产吞吐、
-回放池利用率，以及训练设备、损失和样本吞吐；相应核心指标也写入 TensorBoard。
-TensorBoard 进一步记录学习率、优化步数、各损失、训练耗时与吞吐，自博弈胜率、
-平均手数、策略质量，Actor 活跃率、队列积压、累计丢弃和版本延迟，经验池填充率与
-采样组成，以及 Arena 的得分、置信下界、Elo、分颜色得分、耗时和晋级事件；每个
-update 都主动刷新日志，便于实时查看。
-
-## 目录
-
-- `game.rs`：棋盘、坐标、胜负与合法着
-- `mcts.rs`：PUCT 蒙特卡洛树搜索
-- `model.rs`：可保存、可训练的策略价值模型
-- `selfplay.rs`：并行自博弈与训练
-- `replay.rs`：LZ4 压缩经验池中断快照与混合采样
-- `az_loop_config.rs`：训练配置及默认值
-- `az_loop.rs`：可续跑训练循环、检查点与竞技场晋级
-- `main.rs`：`az-*` 训练、评估命令及人机对战入口
-- `gomocup.rs`：Gomocup/Piskvork 协议状态机与限时搜索
-- `bin/gomoku-engine.rs`：不含训练命令入口的独立交付引擎
-
-当前模型采用面向高速增量推理的 AZ-NNUE 结构：默认 192 宽共享隐藏层、ReLU 后
-RMSNorm，以及 `64 → 64 → WDL(3)` 价值头。MCTS 标量价值由
-`P(win) - P(loss)` 得到；初始 WDL 输出层为零，避免随机模型产生虚假胜率。
-在线模型执行梯度更新并直接作为 Arena 候选；Best 只由 Arena 晋级替换，晋级后发布给
-自博弈 Actor。候选连续拒绝达到配置次数时，在线模型与优化器重置到当前冠军。
-输入侧将精确棋子格点嵌入与己/彼棋子类型、15 行、15 列及两个方向各 29 条对角线
-结构嵌入相加；CPU 推理使用一次稀疏棋盘遍历完成全部累加，训练侧使用等价的
-Candle 批量矩阵运算。经验池抽样时会随机应用正方形的 8 种旋转/镜像对称变换，
-棋盘与策略标签同步变换，从而提高等价棋形的样本利用率而不增加推理开销。
-Policy 和 Value 均只从可训练的棋盘结构编码中学习，不注入成五、阻五、开放三等
-手工战术标签；Policy 的位置 bias 也从全零开始训练。每个候选点额外读取水平、垂直
-和两条对角线共 4 条轴线，每条轴线同时包含前后两个射线各 4 格。空、己、敌、边界
-四态形成有限的轴棋形类别，由四轴共享的可训练查表产生两个统计量；轴内左右射线按
-无序对编码，因此镜像棋形严格共享表示。候选特征通过均值与最大值残差接入 Policy，
-并再次跨候选池化后直接校准 WDL logits。局部 Policy 和 Value 输出均从零初始化，
-不会在未训练时形成随机战术偏见。Value 只使用完整对局的最终胜、和、负作为 WDL
-监督，不混入当前网络搜索产生的 Q 值。
-MCTS 节点缓存黑白双视角的增量累加器，并显式编码当前绝对角色；共享主干后使用
-黑白各自的低秩残差适配器。扩展子节点时只加入新落子、手数特征和对应的 3×3
-区域 Value 特征，避免每次叶子求值重新扫描整盘。
-模型格式为 v28。Policy 使用 32 维轻量全局上下文动态生成局部棋形打分权重，再与
-位置输出相加；Value 同时读取共享全局主干、九宫格区域累加器和候选棋形池化。
-训练日志与 TensorBoard 同时报告目标熵和 KL，区分“标签本身复杂”与“模型未拟合”。
-搜索、训练与模型策略均覆盖规则允许的全部空点，不再使用空间半径
-裁剪；立即成五、必须阻五和根节点开放四仍会将搜索收缩到强制战术着。根节点
-Dirichlet 噪声使用固定总浓度 10.83，并按当时合法着数量动态换算单动作 alpha。
-搜索使用随访问量对数增长的动态 PUCT、根节点目标子访问补偿、带哈希碰撞校验和容量上限的 DAG 转置复用，以及基于价值标准误差的 LCB 落子
-排序；根节点随机取 4 种棋盘对称平均网络输出，并使用独立于树内策略的温度调度。
-自博弈会以 4% 概率从早期次优着分叉，以 10% 概率随机指定一方使用最多 4 倍搜索预算。
-Replay 分别记录搜索策略相对原始网络的 KL Surprise 和终局相对预测价值的 Value
-Surprise；每批训练有 40%/10% 分别按两类 Surprise 加权抽样，其余保持近期/历史混合。
-Policy 和 Value 损失具有独立样本权重。价值塔采用适合 NEON/AVX2/FMA 点积的输出优先布局。旧模型不再
-迁移；升级后请清理旧模型、进度和经验池，再用 `az-init` 开始全新训练。
-
-正常训练时经验池只保存在 Trainer 内存中，不再
-每个更新周期重写 50 万条 JSONL；仅在 Ctrl+C 中断时原子写入 LZ4 压缩快照。下次
-启动会加载该快照并立即删除已消费的快照文件，避免旧快照被重复加载；正常达到目标
-更新退出时不会保留中断快照。
-
-开始全新训练配置 v20 及模型格式 v28 时，应先停止旧进程，再只删除该实验对应文件和旧配置。
-训练学习率按累计 optimizer step 调度：前 200 steps 从 `1e-4` 线性升至 `8e-4`，
-随后用 10000 steps 余弦下降至 `1e-4`，累计 step 会随 progress 持久化：
-
-```bash
-rm -f model.safetensors best.safetensors
-rm -f data/azloop-progress.json data/replay.jsonl data/replay.jsonl.tmp
-rm -f gomoku.azloop.toml
-rm -rf checkpoints runs/gomoku
-cargo run --profile fast -- az-init model.safetensors 192
-```
+观察训练 loss、自博弈平均手数和中止数，再与冻结的早期模型在相同预算下交替执黑执白评估。
+仅 loss 下降不代表棋力提升；终局存在未定棋块的对局应人工复核或与成熟围棋引擎交叉评估。
+日常使用 `--profile fast`。Windows/Linux 沿用 Candle CUDA，macOS 使用 Metal/Accelerate。

@@ -1,8 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-pub const BOARD_SIZE: usize = 15;
+pub const BOARD_SIZE: usize = 9;
 pub const CELL_COUNT: usize = BOARD_SIZE * BOARD_SIZE;
+pub const ACTION_COUNT: usize = CELL_COUNT + 1;
+pub const KOMI: f32 = 7.5;
+/// 超过此上限中止对局，不生成胜负训练标签。
+pub const MAX_MOVES: usize = CELL_COUNT * 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Player {
@@ -27,8 +31,8 @@ impl Player {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct Move(pub usize);
-
 impl Move {
+    pub const PASS: Self = Self(CELL_COUNT);
     pub fn new(row: usize, col: usize) -> Option<Self> {
         (row < BOARD_SIZE && col < BOARD_SIZE).then_some(Self(row * BOARD_SIZE + col))
     }
@@ -40,43 +44,55 @@ impl Move {
     }
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.trim().to_ascii_lowercase();
+        if s == "pass" {
+            return Some(Self::PASS);
+        }
         let mut chars = s.chars();
-        let col = (chars.next()? as usize).checked_sub('a' as usize)?;
+        let col = "abcdefghj".find(chars.next()?)?;
         let row = chars.as_str().parse::<usize>().ok()?.checked_sub(1)?;
         Self::new(row, col)
     }
     pub fn notation(self) -> String {
-        format!("{}{}", (b'a' + self.col() as u8) as char, self.row() + 1)
+        if self == Self::PASS {
+            return "pass".into();
+        }
+        format!("{}{}", b"abcdefghj"[self.col()] as char, self.row() + 1)
     }
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Outcome {
     Win(Player),
     Draw,
+    Aborted,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Board {
     cells: Vec<i8>,
     to_move: Player,
     moves: usize,
-    last: Option<Move>,
+    passes: usize,
+    komi_milli: i32,
+    previous: Vec<i8>,
+    /// 精确盘面历史，用于位置超级劫；pass 不受超级劫限制。
+    history: Vec<Vec<i8>>,
 }
-
 impl Default for Board {
     fn default() -> Self {
         Self::new()
     }
 }
-
 impl Board {
     pub fn new() -> Self {
+        let cells = vec![0; CELL_COUNT];
         Self {
-            cells: vec![0; CELL_COUNT],
+            history: vec![cells.clone()],
+            cells: cells.clone(),
             to_move: Player::Black,
             moves: 0,
-            last: None,
+            passes: 0,
+            komi_milli: 7500,
+            previous: cells.clone(),
         }
     }
     pub fn cells(&self) -> &[i8] {
@@ -88,224 +104,185 @@ impl Board {
     pub fn move_count(&self) -> usize {
         self.moves
     }
-    pub fn from_stones(stones: &[(Move, Player)]) -> Option<Self> {
-        let mut cells = vec![0; CELL_COUNT];
-        let mut black = 0usize;
-        let mut white = 0usize;
+    pub fn consecutive_passes(&self) -> usize {
+        self.passes
+    }
+    /// 摆局必须显式指定行棋方，不能用提子后的黑白子数推断。
+    pub fn from_position(stones: &[(Move, Player)], to_move: Player) -> Option<Self> {
+        let mut board = Self::new();
         for &(mv, player) in stones {
-            if mv.0 >= CELL_COUNT || cells[mv.0] != 0 {
+            if mv.0 >= CELL_COUNT || board.cells[mv.0] != 0 {
                 return None;
             }
-            cells[mv.0] = player.stone();
-            match player {
-                Player::Black => black += 1,
-                Player::White => white += 1,
+            board.cells[mv.0] = player.stone();
+        }
+        for index in 0..CELL_COUNT {
+            if board.cells[index] != 0 && !group(&board.cells, index).1 {
+                return None;
             }
         }
-        if black != white && black != white + 1 {
-            return None;
-        }
-        Some(Self {
-            cells,
-            to_move: if black == white {
-                Player::Black
-            } else {
-                Player::White
-            },
-            moves: stones.len(),
-            last: None,
-        })
+        board.to_move = to_move;
+        board.previous = board.cells.clone();
+        board.history = vec![board.cells.clone()];
+        Some(board)
     }
     pub(crate) fn transformed(&self, symmetry: usize) -> Self {
-        let mut cells = vec![0; CELL_COUNT];
-        for (index, &stone) in self.cells.iter().enumerate() {
-            cells[transform_index(index, symmetry)] = stone;
-        }
+        let transform = |cells: &[i8]| {
+            let mut result = vec![0; CELL_COUNT];
+            for (index, &stone) in cells.iter().enumerate() {
+                result[transform_index(index, symmetry)] = stone;
+            }
+            result
+        };
         Self {
-            cells,
-            to_move: self.to_move,
-            moves: self.moves,
-            last: self.last.map(|mv| Move(transform_index(mv.0, symmetry))),
+            cells: transform(&self.cells),
+            history: self.history.iter().map(|cells| transform(cells)).collect(),
+            previous: transform(&self.previous),
+            ..self.clone()
         }
+    }
+    pub(crate) fn placed(&self, mv: Move) -> Option<Vec<i8>> {
+        if mv.0 >= CELL_COUNT || self.cells[mv.0] != 0 {
+            return None;
+        }
+        let mut cells = self.cells.clone();
+        cells[mv.0] = self.to_move.stone();
+        for neighbor in neighbors(mv.0) {
+            if cells[neighbor] == self.to_move.other().stone() {
+                let (stones, has_liberty) = group(&cells, neighbor);
+                if !has_liberty {
+                    for stone in stones {
+                        cells[stone] = 0;
+                    }
+                }
+            }
+        }
+        if !group(&cells, mv.0).1 || self.history.contains(&cells) {
+            return None;
+        }
+        Some(cells)
     }
     pub fn is_legal(&self, mv: Move) -> bool {
-        mv.0 < CELL_COUNT && self.cells[mv.0] == 0 && self.outcome().is_none()
+        !self.is_finished() && (mv == Move::PASS || self.placed(mv).is_some())
     }
     pub fn play(&mut self, mv: Move) -> bool {
-        crate::scope_profile!("game.play");
-        if !self.is_legal(mv) {
+        if self.is_finished() {
             return false;
         }
-        self.cells[mv.0] = self.to_move.stone();
+        let previous = self.cells.clone();
+        if mv == Move::PASS {
+            self.passes += 1;
+        } else {
+            let Some(cells) = self.placed(mv) else {
+                return false;
+            };
+            self.cells = cells;
+            self.history.push(self.cells.clone());
+            self.passes = 0;
+        }
+        self.previous = previous;
         self.moves += 1;
-        self.last = Some(mv);
         self.to_move = self.to_move.other();
         true
     }
-    /// 返回规则允许的全部落点，不包含任何搜索剪枝或启发式。
     pub fn rule_legal_moves(&self) -> Vec<Move> {
-        crate::scope_profile!("game.rule_legal_moves");
-        if self.outcome().is_some() {
-            return vec![];
+        if self.is_finished() {
+            return Vec::new();
         }
-        self.cells
-            .iter()
-            .enumerate()
-            .filter_map(|(index, &stone)| (stone == 0).then_some(Move(index)))
+        (0..ACTION_COUNT)
+            .map(Move)
+            .filter(|&mv| mv == Move::PASS || self.placed(mv).is_some())
             .collect()
     }
-    /// 搜索与训练使用完整规则合法着，不做空间半径裁剪。
     pub fn search_candidates(&self) -> Vec<Move> {
         self.rule_legal_moves()
     }
-    pub(crate) fn is_winning_move(&self, mv: Move, player: Player) -> bool {
-        if mv.0 >= CELL_COUNT || self.cells[mv.0] != 0 {
+    pub fn komi(&self) -> f32 {
+        self.komi_milli as f32 / 1000.0
+    }
+    pub fn set_komi(&mut self, komi: f32) -> bool {
+        if !komi.is_finite() || komi.abs() > 1000.0 {
             return false;
         }
-        let stone = player.stone();
-        [(1, 0), (0, 1), (1, 1), (1, -1)]
-            .into_iter()
-            .any(|(dr, dc)| {
-                let mut run = 1;
-                for sign in [-1, 1] {
-                    let mut row = mv.row() as i32 + dr * sign;
-                    let mut col = mv.col() as i32 + dc * sign;
-                    while row >= 0
-                        && col >= 0
-                        && row < BOARD_SIZE as i32
-                        && col < BOARD_SIZE as i32
-                        && self.cells[row as usize * BOARD_SIZE + col as usize] == stone
-                    {
-                        run += 1;
-                        row += dr * sign;
-                        col += dc * sign;
-                    }
-                }
-                run >= 5
-            })
+        self.komi_milli = (komi * 1000.0).round() as i32;
+        true
     }
-    pub(crate) fn winning_replies_after(&self, mv: Move, player: Player) -> usize {
-        if mv.0 >= CELL_COUNT || self.cells[mv.0] != 0 {
-            return 0;
-        }
-        let stone = player.stone();
-        let mut replies = [false; CELL_COUNT];
-        for (dr, dc) in [(1, 0), (0, 1), (1, 1), (1, -1)] {
-            for start in -4..=0 {
-                let mut empty = None;
-                let mut valid = true;
-                for offset in start..start + 5 {
-                    let row = mv.row() as i32 + dr * offset;
-                    let col = mv.col() as i32 + dc * offset;
-                    if row < 0 || col < 0 || row >= BOARD_SIZE as i32 || col >= BOARD_SIZE as i32 {
-                        valid = false;
-                        break;
-                    }
-                    let index = row as usize * BOARD_SIZE + col as usize;
-                    let cell = if index == mv.0 {
-                        stone
-                    } else {
-                        self.cells[index]
-                    };
-                    if cell == 0 {
-                        if empty.replace(index).is_some() {
-                            valid = false;
-                            break;
-                        }
-                    } else if cell != stone {
-                        valid = false;
-                        break;
-                    }
-                }
-                if valid {
-                    if let Some(index) = empty {
-                        replies[index] = true;
-                    }
-                }
-            }
-        }
-        replies.into_iter().filter(|&reply| reply).count()
+    pub fn previous_cells(&self) -> &[i8] {
+        &self.previous
+    }
+    pub fn is_finished(&self) -> bool {
+        self.passes >= 2 || self.moves >= MAX_MOVES
+    }
+    /// GTP 允许指定任意行棋方，也允许在停一手后继续处理争议。
+    pub fn for_turn(&self, player: Player) -> Self {
+        let mut board = self.clone();
+        board.to_move = player;
+        board.passes = 0;
+        board
+    }
+    pub(crate) fn for_reading(&self, player: Player) -> Self {
+        let mut board = self.for_turn(player);
+        board.moves = 0;
+        board
+    }
+    pub fn score(&self) -> f32 {
+        crate::scoring::analyze(self).score
+    }
+    pub fn raw_score(&self) -> f32 {
+        crate::scoring::area_score(&self.cells) - self.komi()
     }
     pub fn outcome(&self) -> Option<Outcome> {
-        crate::scope_profile!("game.outcome");
-        if let Some(mv) = self.last {
-            let stone = self.cells[mv.0];
-            for (dr, dc) in [(1, 0), (0, 1), (1, 1), (1, -1)] {
-                let mut n = 1;
-                for sign in [-1, 1] {
-                    let mut r = mv.row() as i32 + dr * sign;
-                    let mut c = mv.col() as i32 + dc * sign;
-                    while r >= 0
-                        && c >= 0
-                        && r < BOARD_SIZE as i32
-                        && c < BOARD_SIZE as i32
-                        && self.cells[r as usize * BOARD_SIZE + c as usize] == stone
-                    {
-                        n += 1;
-                        r += dr * sign;
-                        c += dc * sign;
-                    }
-                }
-                if n >= 5 {
-                    return Some(Outcome::Win(if stone == 1 {
-                        Player::Black
-                    } else {
-                        Player::White
-                    }));
-                }
-            }
+        if self.moves >= MAX_MOVES {
+            return Some(Outcome::Aborted);
         }
-        if self.last.is_none() {
-            for index in 0..CELL_COUNT {
-                let stone = self.cells[index];
-                if stone == 0 {
-                    continue;
-                }
-                let mv = Move(index);
-                for (dr, dc) in [(1, 0), (0, 1), (1, 1), (1, -1)] {
-                    if line_shape(self, mv, stone, dr, dc).0 >= 5 {
-                        return Some(Outcome::Win(if stone == 1 {
-                            Player::Black
-                        } else {
-                            Player::White
-                        }));
-                    }
-                }
-            }
+        if self.passes < 2 {
+            return None;
         }
-        (self.moves == CELL_COUNT).then_some(Outcome::Draw)
+        let score = self.score();
+        Some(if score > 0.0 {
+            Outcome::Win(Player::Black)
+        } else if score < 0.0 {
+            Outcome::Win(Player::White)
+        } else {
+            Outcome::Draw
+        })
     }
 }
-
-fn line_shape(board: &Board, mv: Move, stone: i8, dr: i32, dc: i32) -> (usize, usize) {
-    let mut run = 1;
-    let mut open = 0;
-    for sign in [-1, 1] {
-        let mut row = mv.row() as i32 + dr * sign;
-        let mut col = mv.col() as i32 + dc * sign;
-        while row >= 0
-            && col >= 0
-            && row < BOARD_SIZE as i32
-            && col < BOARD_SIZE as i32
-            && board.cells[row as usize * BOARD_SIZE + col as usize] == stone
-        {
-            run += 1;
-            row += dr * sign;
-            col += dc * sign;
-        }
-        if row >= 0
-            && col >= 0
-            && row < BOARD_SIZE as i32
-            && col < BOARD_SIZE as i32
-            && board.cells[row as usize * BOARD_SIZE + col as usize] == 0
-        {
-            open += 1;
-        }
-    }
-    (run, open)
+pub(crate) fn neighbors(index: usize) -> impl Iterator<Item = usize> {
+    let row = index / BOARD_SIZE;
+    let col = index % BOARD_SIZE;
+    [
+        row.checked_sub(1).map(|r| r * BOARD_SIZE + col),
+        (row + 1 < BOARD_SIZE).then_some(index + BOARD_SIZE),
+        col.checked_sub(1).map(|c| row * BOARD_SIZE + c),
+        (col + 1 < BOARD_SIZE).then_some(index + 1),
+    ]
+    .into_iter()
+    .flatten()
 }
-
+pub(crate) fn group(cells: &[i8], start: usize) -> (Vec<usize>, bool) {
+    let mut stones = vec![start];
+    let mut visited = [false; CELL_COUNT];
+    visited[start] = true;
+    let mut has_liberty = false;
+    let mut cursor = 0;
+    while cursor < stones.len() {
+        for neighbor in neighbors(stones[cursor]) {
+            if cells[neighbor] == 0 {
+                has_liberty = true;
+            } else if cells[neighbor] == cells[start] && !visited[neighbor] {
+                visited[neighbor] = true;
+                stones.push(neighbor);
+            }
+        }
+        cursor += 1;
+    }
+    (stones, has_liberty)
+}
 pub(crate) fn transform_index(index: usize, symmetry: usize) -> usize {
+    if index == CELL_COUNT {
+        return index;
+    }
     let mut row = index / BOARD_SIZE;
     let mut col = index % BOARD_SIZE;
     if symmetry & 4 != 0 {
@@ -316,22 +293,16 @@ pub(crate) fn transform_index(index: usize, symmetry: usize) -> usize {
     }
     row * BOARD_SIZE + col
 }
-
 impl fmt::Display for Board {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "   ")?;
-        for c in 0..BOARD_SIZE {
-            write!(f, " {}", (b'A' + c as u8) as char)?;
-        }
-        writeln!(f)?;
-        for r in 0..BOARD_SIZE {
-            write!(f, "{:>2} ", r + 1)?;
-            for c in 0..BOARD_SIZE {
-                let x = self.cells[r * BOARD_SIZE + c];
+        writeln!(f, "   A B C D E F G H J")?;
+        for row in (0..BOARD_SIZE).rev() {
+            write!(f, "{:>2} ", row + 1)?;
+            for col in 0..BOARD_SIZE {
                 write!(
                     f,
-                    " {}",
-                    match x {
+                    "{} ",
+                    match self.cells[row * BOARD_SIZE + col] {
                         1 => '●',
                         -1 => '○',
                         _ => '·',
@@ -347,113 +318,91 @@ impl fmt::Display for Board {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn horizontal_win() {
-        let mut b = Board::new();
-        for c in 0..5 {
-            assert!(b.play(Move::new(7, c).unwrap()));
-            if c < 4 {
-                assert!(b.play(Move::new(8, c).unwrap()));
-            }
-        }
-        assert_eq!(b.outcome(), Some(Outcome::Win(Player::Black)));
+    fn mv(text: &str) -> Move {
+        Move::parse(text).unwrap()
     }
-
-    #[test]
-    fn detects_winning_move_for_either_player_without_playing_it() {
-        let board = Board::from_stones(&[
-            (Move::new(7, 3).unwrap(), Player::Black),
-            (Move::new(7, 4).unwrap(), Player::Black),
-            (Move::new(7, 5).unwrap(), Player::Black),
-            (Move::new(7, 6).unwrap(), Player::Black),
-            (Move::new(6, 3).unwrap(), Player::White),
-            (Move::new(6, 4).unwrap(), Player::White),
-            (Move::new(6, 5).unwrap(), Player::White),
-        ])
-        .unwrap();
-        assert!(board.is_winning_move(Move::new(7, 7).unwrap(), Player::Black));
-        assert!(!board.is_winning_move(Move::new(6, 6).unwrap(), Player::White));
-    }
-
-    #[test]
-    fn counts_distinct_winning_replies_created_by_a_move() {
-        let board = Board::from_stones(&[
-            (Move::parse("d8").unwrap(), Player::Black),
-            (Move::parse("a1").unwrap(), Player::White),
-            (Move::parse("e8").unwrap(), Player::Black),
-            (Move::parse("a3").unwrap(), Player::White),
-            (Move::parse("g8").unwrap(), Player::Black),
-            (Move::parse("a5").unwrap(), Player::White),
-        ])
-        .unwrap();
-        assert_eq!(
-            board.winning_replies_after(Move::parse("f8").unwrap(), Player::Black),
-            2
-        );
-    }
-
-    #[test]
-    fn rule_legal_moves_include_every_empty_point() {
-        let mut board = Board::new();
-        assert_eq!(board.rule_legal_moves().len(), CELL_COUNT);
-        assert!(board.play(Move::new(7, 7).unwrap()));
-        let legal = board.rule_legal_moves();
-        assert_eq!(legal.len(), CELL_COUNT - 1);
-        assert!(legal.contains(&Move::new(0, 0).unwrap()));
-        assert!(legal.contains(&Move::new(14, 14).unwrap()));
-        assert!(!legal.contains(&Move::new(7, 7).unwrap()));
-    }
-
-    #[test]
-    fn search_candidates_include_every_legal_move() {
-        let mut board = Board::new();
-        assert_eq!(board.search_candidates().len(), CELL_COUNT);
-        assert!(board.play(Move::new(7, 7).unwrap()));
-        assert_eq!(board.search_candidates(), board.rule_legal_moves());
-    }
-    #[test]
-    fn notation_roundtrip() {
-        for s in ["a1", "h8", "o15"] {
-            let m = Move::parse(s).unwrap();
-            assert_eq!(m.notation(), s);
-        }
-    }
-
-    #[test]
-    fn notation_parser_rejects_out_of_range_input_without_panicking() {
-        assert!(Move::parse("@1").is_none());
-        assert!(Move::parse("p1").is_none());
-        assert!(Move::parse("a0").is_none());
-        assert!(Move::parse("中1").is_none());
-    }
-    #[test]
-    fn eight_symmetries_are_distinct_and_invertible() {
-        let point = Move::new(2, 4).unwrap().0;
-        let mut mapped = (0..8)
-            .map(|s| transform_index(point, s))
+    fn position(black: &[&str], white: &[&str]) -> Board {
+        let stones = black
+            .iter()
+            .map(|s| (mv(s), Player::Black))
+            .chain(white.iter().map(|s| (mv(s), Player::White)))
             .collect::<Vec<_>>();
-        mapped.sort_unstable();
-        mapped.dedup();
-        assert_eq!(mapped.len(), 8);
+        Board::from_position(&stones, Player::Black).unwrap()
+    }
+    pub(super) fn ko_position() -> Board {
+        position(&["a2", "b1", "c2"], &["b2", "a3", "c3", "b4"])
+    }
+    #[test]
+    fn captures_connected_group_and_rejects_suicide_without_mutation() {
+        let mut board = position(&["a2", "b1", "c1", "d2", "b3"], &["b2", "c2"]);
+        assert!(board.play(mv("c3")));
+        assert_eq!(board.cells()[mv("b2").0], 0);
+        assert_eq!(board.cells()[mv("c2").0], 0);
+        let mut suicide = position(&[], &["b1", "a2"]);
+        let before = suicide.clone();
+        assert!(!suicide.play(mv("a1")));
+        assert_eq!(suicide, before);
+        assert!(!suicide.is_legal(Move(ACTION_COUNT)));
+    }
+    #[test]
+    fn ko_history_survives_symmetry_and_serialization() {
+        let mut board = ko_position();
+        assert!(board.play(mv("b3")));
+        assert!(!board.is_legal(mv("b2")));
+        // 相同盘面但无历史的摆局允许回提：合法性确实来自历史。
+        let stones = board
+            .cells()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &s)| {
+                (s != 0).then_some((Move(i), if s == 1 { Player::Black } else { Player::White }))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            Board::from_position(&stones, Player::White)
+                .unwrap()
+                .is_legal(mv("b2"))
+        );
+        let restored: Board =
+            serde_json::from_str(&serde_json::to_string(&board).unwrap()).unwrap();
+        assert_eq!(restored, board);
         for symmetry in 0..8 {
-            assert!(transform_index(point, symmetry) < CELL_COUNT);
+            let transformed = restored.transformed(symmetry);
+            assert!(!transformed.is_legal(Move(transform_index(mv("b2").0, symmetry))));
+            assert_eq!(transform_index(Move::PASS.0, symmetry), Move::PASS.0);
         }
     }
     #[test]
-    fn restores_protocol_position_without_move_history() {
-        let stones = [
-            (Move::new(7, 3).unwrap(), Player::Black),
-            (Move::new(0, 0).unwrap(), Player::White),
-            (Move::new(7, 4).unwrap(), Player::Black),
-            (Move::new(0, 1).unwrap(), Player::White),
-            (Move::new(7, 5).unwrap(), Player::Black),
-            (Move::new(0, 2).unwrap(), Player::White),
-            (Move::new(7, 6).unwrap(), Player::Black),
-            (Move::new(0, 3).unwrap(), Player::White),
-            (Move::new(7, 7).unwrap(), Player::Black),
-        ];
-        let board = Board::from_stones(&stones).unwrap();
-        assert_eq!(board.to_move(), Player::White);
-        assert_eq!(board.outcome(), Some(Outcome::Win(Player::Black)));
+    fn passes_end_game_and_placement_resets_pass_count() {
+        let mut board = Board::new();
+        assert_eq!(board.rule_legal_moves().len(), ACTION_COUNT);
+        assert!(board.play(Move::PASS));
+        assert!(board.play(mv("e5")));
+        assert_eq!(board.consecutive_passes(), 0);
+        assert!(board.play(Move::PASS));
+        assert!(board.play(Move::PASS));
+        assert_eq!(board.outcome(), Some(Outcome::Win(Player::White)));
+        assert!(board.rule_legal_moves().is_empty());
+        assert!(!board.play(Move::PASS));
+    }
+    #[test]
+    fn area_counts_stones_territory_and_neutral_regions() {
+        assert_eq!(Board::new().score(), -KOMI);
+        assert_eq!(position(&["e5"], &[]).score(), CELL_COUNT as f32 - KOMI);
+        assert_eq!(position(&["a1"], &["j9"]).score(), -KOMI);
+        let mut board = position(&["a1", "b1", "c1", "d1", "e1"], &[]);
+        assert_eq!(board.outcome(), None); // 五连不结束围棋。
+        board.moves = MAX_MOVES - 1;
+        assert!(board.play(Move::PASS));
+        assert_eq!(board.outcome(), Some(Outcome::Aborted));
+    }
+    #[test]
+    fn coordinates_skip_i_and_roundtrip_all_actions() {
+        for index in 0..ACTION_COUNT {
+            assert_eq!(Move::parse(&Move(index).notation()), Some(Move(index)));
+        }
+        for text in ["i1", "a0", "a10", "k1", "中1", "@1", ""] {
+            assert!(Move::parse(text).is_none());
+        }
     }
 }

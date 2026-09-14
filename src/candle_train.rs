@@ -1,6 +1,6 @@
 use crate::{
     fused_feature_pool::sparse_pool,
-    game::CELL_COUNT,
+    game::{ACTION_COUNT, BOARD_SIZE, CELL_COUNT},
     model::{
         AXIS_FEATURES, DIAGONAL_FEATURES, INPUT_SIZE, LOCAL_AXES, LOCAL_AXIS_FEATURE_SIZE,
         LOCAL_AXIS_PATTERNS, LOCAL_CANDIDATE_SIZE, MOVE_COUNT_INPUT, POLICY_HEAD_SIZE,
@@ -205,8 +205,12 @@ impl Replica {
                 (LOCAL_CANDIDATE_SIZE, POLICY_HEAD_SIZE),
                 device,
             )?,
-            policy_output: var(&model.policy_output, (CELL_COUNT, POLICY_HEAD_SIZE), device)?,
-            policy_bias: var(&model.policy_bias, (CELL_COUNT,), device)?,
+            policy_output: var(
+                &model.policy_output,
+                (ACTION_COUNT, POLICY_HEAD_SIZE),
+                device,
+            )?,
+            policy_bias: var(&model.policy_bias, (ACTION_COUNT,), device)?,
             policy_tactical: var(&model.policy_tactical, (POLICY_TACTICAL_SIZE, 1), device)?,
             local_axis_embedding: var(
                 &model.local_axis_embedding,
@@ -324,10 +328,10 @@ impl Replica {
             &self.device,
         )
         .map_err(err)?;
-        let targets =
-            Tensor::from_vec(packed.policy_targets, (b, CELL_COUNT), &self.device).map_err(err)?;
+        let targets = Tensor::from_vec(packed.policy_targets, (b, ACTION_COUNT), &self.device)
+            .map_err(err)?;
         let masks =
-            Tensor::from_vec(packed.policy_masks, (b, CELL_COUNT), &self.device).map_err(err)?;
+            Tensor::from_vec(packed.policy_masks, (b, ACTION_COUNT), &self.device).map_err(err)?;
         let value_wdl =
             Tensor::from_vec(packed.value_wdl, (b, WDL_SIZE), &self.device).map_err(err)?;
         let short_value_wdl = Tensor::from_vec(
@@ -342,18 +346,18 @@ impl Replica {
             Tensor::from_vec(packed.value_weights, (b,), &self.device).map_err(err)?;
         let local_axis_indices = Tensor::from_vec(
             packed.local_axis_indices,
-            (b * CELL_COUNT * LOCAL_AXES,),
+            (b * ACTION_COUNT * LOCAL_AXES,),
             &self.device,
         )
         .map_err(err)?;
         let policy_tactical_indices = Tensor::from_vec(
             packed.policy_tactical_indices,
-            (b * CELL_COUNT, LOCAL_AXES),
+            (b * ACTION_COUNT, LOCAL_AXES),
             &self.device,
         )
         .map_err(err)?;
         let local_legal_mask =
-            Tensor::from_vec(packed.local_legal_mask, (b, CELL_COUNT, 1), &self.device)
+            Tensor::from_vec(packed.local_legal_mask, (b, ACTION_COUNT, 1), &self.device)
                 .map_err(err)?;
         let hidden = {
             crate::scope_profile!("train.forward");
@@ -406,10 +410,10 @@ impl Replica {
         // 与 chineseai 相同：通过前向/反向融合的稀疏池化查表，
         // 不构造巨大中间张量。每行只有一个 item，因此池化等价于 lookup。
         let local_axis_items = local_axis_indices
-            .reshape((b * CELL_COUNT * LOCAL_AXES, 1))
+            .reshape((b * ACTION_COUNT * LOCAL_AXES, 1))
             .map_err(err)?;
         let local_axes = sparse_pool(self.local_axis_embedding.as_tensor(), &local_axis_items)
-            .and_then(|x| x.reshape((b, CELL_COUNT, LOCAL_AXES, LOCAL_AXIS_FEATURE_SIZE)))
+            .and_then(|x| x.reshape((b, ACTION_COUNT, LOCAL_AXES, LOCAL_AXIS_FEATURE_SIZE)))
             .map_err(err)?;
         let axis_scale = Tensor::cat(
             &[
@@ -488,7 +492,7 @@ impl Replica {
             .map_err(err)?;
         let tactical_logits =
             sparse_pool(self.policy_tactical.as_tensor(), &policy_tactical_indices)
-                .and_then(|x| x.reshape((b, CELL_COUNT)))
+                .and_then(|x| x.reshape((b, ACTION_COUNT)))
                 .map_err(err)?;
         let logits = policy_global
             .matmul(&self.policy_output.t().map_err(err)?)
@@ -694,11 +698,11 @@ fn pack(samples: &[Sample]) -> Packed {
     let mut file_counts = vec![0.0; samples.len() * AXIS_FEATURES];
     let mut diagonal_counts = vec![0.0; samples.len() * DIAGONAL_FEATURES];
     let mut anti_diagonal_counts = vec![0.0; samples.len() * DIAGONAL_FEATURES];
-    let mut targets = vec![0.0; samples.len() * CELL_COUNT];
-    let mut masks = vec![-1e9; samples.len() * CELL_COUNT];
-    let mut local_axis_indices = vec![0_u32; samples.len() * CELL_COUNT * LOCAL_AXES];
-    let mut policy_tactical_indices = vec![u32::MAX; samples.len() * CELL_COUNT * LOCAL_AXES];
-    let mut local_legal_mask = vec![0.0; samples.len() * CELL_COUNT];
+    let mut targets = vec![0.0; samples.len() * ACTION_COUNT];
+    let mut masks = vec![-1e9; samples.len() * ACTION_COUNT];
+    let mut local_axis_indices = vec![0_u32; samples.len() * ACTION_COUNT * LOCAL_AXES];
+    let mut policy_tactical_indices = vec![u32::MAX; samples.len() * ACTION_COUNT * LOCAL_AXES];
+    let mut local_legal_mask = vec![0.0; samples.len() * ACTION_COUNT];
     let mut value_wdl = Vec::with_capacity(samples.len() * WDL_SIZE);
     let mut short_value_wdl = Vec::with_capacity(samples.len() * SHORT_VALUE_HEADS * WDL_SIZE);
     let mut policy_weights = Vec::with_capacity(samples.len());
@@ -708,50 +712,67 @@ fn pack(samples: &[Sample]) -> Packed {
     for (row, s) in samples.iter().enumerate() {
         policy_weights.push(s.policy_weight.max(0.0));
         value_weights.push(s.value_weight.max(0.0));
+        let extras = crate::features::encode(&s.board, s.board.to_move());
+        inputs[row * INPUT_SIZE + crate::model::GO_INPUT_START..(row + 1) * INPUT_SIZE]
+            .copy_from_slice(&extras);
         let us = s.board.to_move().stone();
         for (sq, &stone) in s.board.cells().iter().enumerate() {
             if stone == us {
                 inputs[row * INPUT_SIZE + sq] = 1.0;
                 stone_counts[row * STONE_TYPES] += 1.0;
-                rank_counts[row * AXIS_FEATURES + sq / 15] += 1.0;
-                file_counts[row * AXIS_FEATURES + sq % 15] += 1.0;
-                diagonal_counts[row * DIAGONAL_FEATURES + sq / 15 + 14 - sq % 15] += 1.0;
-                anti_diagonal_counts[row * DIAGONAL_FEATURES + sq / 15 + sq % 15] += 1.0;
-                let region = (sq / 15 / 5) * 3 + (sq % 15) / 5;
+                rank_counts[row * AXIS_FEATURES + sq / BOARD_SIZE] += 1.0;
+                file_counts[row * AXIS_FEATURES + sq % BOARD_SIZE] += 1.0;
+                diagonal_counts[row * DIAGONAL_FEATURES + sq / BOARD_SIZE + BOARD_SIZE
+                    - 1
+                    - sq % BOARD_SIZE] += 1.0;
+                anti_diagonal_counts
+                    [row * DIAGONAL_FEATURES + sq / BOARD_SIZE + sq % BOARD_SIZE] += 1.0;
+                let region =
+                    (sq / BOARD_SIZE / (BOARD_SIZE / 3)) * 3 + (sq % BOARD_SIZE) / (BOARD_SIZE / 3);
                 region_counts[(row * REGION_COUNT + region) * STONE_TYPES] += 1.0;
             } else if stone == -us {
                 inputs[row * INPUT_SIZE + CELL_COUNT + sq] = 1.0;
                 stone_counts[row * STONE_TYPES + 1] += 1.0;
-                rank_counts[row * AXIS_FEATURES + 15 + sq / 15] += 1.0;
-                file_counts[row * AXIS_FEATURES + 15 + sq % 15] += 1.0;
-                diagonal_counts[row * DIAGONAL_FEATURES + 29 + sq / 15 + 14 - sq % 15] += 1.0;
-                anti_diagonal_counts[row * DIAGONAL_FEATURES + 29 + sq / 15 + sq % 15] += 1.0;
-                let region = (sq / 15 / 5) * 3 + (sq % 15) / 5;
+                rank_counts[row * AXIS_FEATURES + BOARD_SIZE + sq / BOARD_SIZE] += 1.0;
+                file_counts[row * AXIS_FEATURES + BOARD_SIZE + sq % BOARD_SIZE] += 1.0;
+                diagonal_counts[row * DIAGONAL_FEATURES
+                    + (BOARD_SIZE * 2 - 1)
+                    + sq / BOARD_SIZE
+                    + BOARD_SIZE
+                    - 1
+                    - sq % BOARD_SIZE] += 1.0;
+                anti_diagonal_counts[row * DIAGONAL_FEATURES
+                    + (BOARD_SIZE * 2 - 1)
+                    + sq / BOARD_SIZE
+                    + sq % BOARD_SIZE] += 1.0;
+                let region =
+                    (sq / BOARD_SIZE / (BOARD_SIZE / 3)) * 3 + (sq % BOARD_SIZE) / (BOARD_SIZE / 3);
                 region_counts[(row * REGION_COUNT + region) * STONE_TYPES + 1] += 1.0;
             }
         }
         inputs[row * INPUT_SIZE + MOVE_COUNT_INPUT] =
             s.board.move_count() as f32 / CELL_COUNT as f32;
+        inputs[row * INPUT_SIZE + crate::model::PASS_INPUT] = s.board.consecutive_passes() as f32;
         let role = usize::from(s.board.to_move() == crate::game::Player::White);
         inputs[row * INPUT_SIZE + ROLE_INPUT_START + role] = 1.0;
         roles[row * ROLE_COUNT + role] = 1.0;
         for m in s.board.search_candidates() {
-            masks[row * CELL_COUNT + m.0] = 0.0;
-            local_legal_mask[row * CELL_COUNT + m.0] = 1.0;
+            masks[row * ACTION_COUNT + m.0] = 0.0;
+            local_legal_mask[row * ACTION_COUNT + m.0] = 1.0;
             for (axis, (dr, dc)) in [(1, 0), (0, 1), (1, 1), (1, -1)].into_iter().enumerate() {
                 let (first, second) = local_ray_codes(&s.board, m, dr, dc);
                 let pattern = second * (second + 1) / 2 + first;
-                local_axis_indices[(row * CELL_COUNT + m.0) * LOCAL_AXES + axis] = pattern as u32;
-                policy_tactical_indices[(row * CELL_COUNT + m.0) * LOCAL_AXES + axis] =
+                local_axis_indices[(row * ACTION_COUNT + m.0) * LOCAL_AXES + axis] = pattern as u32;
+                policy_tactical_indices[(row * ACTION_COUNT + m.0) * LOCAL_AXES + axis] =
                     policy_tactical_index(m, axis, pattern) as u32;
             }
         }
         let sum: f32 = s.policy.iter().map(|(_, p)| p.max(0.0)).sum();
         let mut policy_entropy = 0.0;
         for &(m, p) in &s.policy {
-            if m.0 < CELL_COUNT && sum > 1e-12 {
+            if m.0 < ACTION_COUNT && sum > 1e-12 {
                 let probability = p.max(0.0) / sum;
-                targets[row * CELL_COUNT + m.0] = probability;
+                targets[row * ACTION_COUNT + m.0] = probability;
                 if probability > 0.0 {
                     policy_entropy -= probability * probability.ln();
                 }
@@ -939,12 +960,52 @@ mod tests {
         assert_ne!(model.local_axis_embedding, before_local);
         assert_ne!(model.short_value_head_output, before_short);
         let (policy, value) = model.evaluate(&Board::new());
-        assert_eq!(policy.len(), CELL_COUNT);
+        assert_eq!(policy.len(), ACTION_COUNT);
         assert!(
             policy
                 .iter()
                 .all(|(_, probability)| probability.is_finite())
         );
         assert!(value.is_finite());
+    }
+
+    #[test]
+    fn pass_training_matches_inference_after_capture_and_pass() {
+        let stones = [
+            ("a2", crate::game::Player::Black),
+            ("b1", crate::game::Player::Black),
+            ("c2", crate::game::Player::Black),
+            ("b2", crate::game::Player::White),
+        ]
+        .map(|(s, p)| (Move::parse(s).unwrap(), p));
+        let mut board = Board::from_position(&stones, crate::game::Player::Black).unwrap();
+        assert!(board.play(Move::parse("b3").unwrap()));
+        assert_eq!(board.cells()[Move::parse("b2").unwrap().0], 0);
+        assert!(board.play(Move::PASS));
+        let sample = Sample {
+            board,
+            policy: vec![(Move::PASS, 1.0)],
+            value: 1.0,
+            value_wdl: None,
+            generation: 0,
+            policy_weight: 1.0,
+            value_weight: 1.0,
+            policy_surprise: 0.0,
+            value_surprise: 0.0,
+            predicted_value: 0.0,
+            short_value_wdl: [[1.0, 0.0, 0.0]; SHORT_VALUE_HEADS],
+        };
+        let packed = pack(std::slice::from_ref(&sample));
+        assert_eq!(packed.policy_targets[Move::PASS.0], 1.0);
+        assert_eq!(packed.inputs[crate::model::PASS_INPUT], 1.0);
+        let mut model = PolicyValueModel::random(16, 71);
+        let before = model.policy_bias[Move::PASS.0];
+        train(&mut model, std::slice::from_ref(&sample), 2, 1e-3, 1).unwrap();
+        assert!(model.policy_bias[Move::PASS.0] > before);
+        let (policy, _) = model.evaluate(&sample.board);
+        let probability = policy.iter().find(|(mv, _)| *mv == Move::PASS).unwrap().1;
+        let session = TrainingSession::new(&model, 1e-3).unwrap();
+        let stats = session.evaluate(&[sample], 1).unwrap();
+        assert!((stats.policy_loss + probability.ln()).abs() < 1e-4);
     }
 }

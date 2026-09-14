@@ -1,12 +1,13 @@
 [package]
-name = "gomoku"
+name = "go9"
 version = "0.1.0"
 edition = "2024"
-default-run = "gomoku"
+default-run = "go9"
+autobins = false
 
 [[bin]]
-name = "pbrain-gomoku"
-path = "src/bin/gomoku-engine.rs"
+name = "go9"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -20,8 +21,6 @@ serde_json = "1"
 toml = "0.8"
 tensorboard-rs = "0.5"
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "frame"] }
-# Candle 的 NPZ 支持默认不带压缩算法；KataGo 分片使用 deflate。
-zip = { version = "7.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [features]
 default = []

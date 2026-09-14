@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::{fs, io, path::Path};
 
-pub const DEFAULT_CONFIG_PATH: &str = "gomoku.azloop.toml";
+pub const DEFAULT_CONFIG_PATH: &str = "go9-v30.azloop.toml";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -55,50 +55,50 @@ pub struct AzLoopConfig {
 impl Default for AzLoopConfig {
     fn default() -> Self {
         Self {
-            format_version: 20,
-            model_path: "model.safetensors".into(),
-            best_model_path: "best.safetensors".into(),
-            replay_path: "data/replay.jsonl".into(),
-            progress_path: "data/azloop-progress.json".into(),
-            simulations: 400,
+            format_version: 22,
+            model_path: "go9-v30-model.safetensors".into(),
+            best_model_path: "go9-v30-best.safetensors".into(),
+            replay_path: "data/go9-v30/replay.jsonl".into(),
+            progress_path: "data/go9-v30/azloop-progress.json".into(),
+            simulations: 64,
             hidden_size: 128,
             seed: 20260730,
-            selfplay_samples_per_update: 50_000,
-            selfplay_workers: 192,
+            selfplay_samples_per_update: 2048,
+            selfplay_workers: 4,
             selfplay_queue_capacity: 0,
             learning_rate: 0.0008,
             learning_rate_min: 0.0001,
             learning_rate_warmup_steps: 200,
             learning_rate_cosine_steps: 10_000,
             batch_epochs: 1,
-            batch_size: 1024,
+            batch_size: 256,
             cpuct: 1.5,
             cpuct_log: 0.45,
             cpuct_base: 500.0,
             temperature_start: 1.0,
             temperature_endgame: 0.0,
-            temperature_decay_delay_plies: 4,
-            temperature_decay_plies: 8,
+            temperature_decay_delay_plies: 12,
+            temperature_decay_plies: 48,
             root_dirichlet_total_concentration: 10.83,
             root_exploration_fraction: 0.25,
             root_policy_temperature: 1.1,
-            replay_capacity: 500_000,
-            replay_warmup_samples: 100_000,
-            train_samples_per_update: 50_000,
+            replay_capacity: 50_000,
+            replay_warmup_samples: 2048,
+            train_samples_per_update: 2048,
             replay_recent_sample_fraction: 0.4,
             replay_recent_updates: 5,
             replay_policy_surprise_fraction: 0.4,
             replay_value_surprise_fraction: 0.1,
             checkpoint_interval: 0,
-            checkpoint_dir: "checkpoints".into(),
+            checkpoint_dir: "checkpoints/go9-v30".into(),
             max_checkpoints: 20,
             arena_interval: 10,
-            arena_games: 200,
+            arena_games: 40,
             arena_opening_plies: 2,
             arena_promotion_rate: 0.50,
             arena_promotion_confidence_z: 1.28,
             arena_color_score_floor: 0.45,
-            tensorboard_logdir: "runs/gomoku".into(),
+            tensorboard_logdir: "runs/go9-v30".into(),
         }
     }
 }
@@ -157,9 +157,9 @@ impl AzLoopConfig {
                 return Err(io::Error::other(format!("配置 `{name}` 必须是有限数值")));
             }
         }
-        if self.format_version != 20 {
+        if self.format_version != 22 {
             return Err(io::Error::other(
-                "仅支持 format_version = 20；请重新生成配置",
+                "仅支持 format_version = 22；请重新生成配置",
             ));
         }
         if self.simulations == 0
@@ -215,50 +215,50 @@ impl AzLoopConfig {
     }
 }
 
-const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 20
-model_path = "model.safetensors"
-best_model_path = "best.safetensors"
-replay_path = "data/replay.jsonl"
-progress_path = "data/azloop-progress.json"
-simulations = 400
+const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 22
+model_path = "go9-v30-model.safetensors"
+best_model_path = "go9-v30-best.safetensors"
+replay_path = "data/go9-v30/replay.jsonl"
+progress_path = "data/go9-v30/azloop-progress.json"
+simulations = 64
 hidden_size = 128
 seed = 20260730
-selfplay_samples_per_update = 50000
-selfplay_workers = 192
+selfplay_samples_per_update = 2048
+selfplay_workers = 4
 selfplay_queue_capacity = 0
 learning_rate = 0.0008
 learning_rate_min = 0.0001
 learning_rate_warmup_steps = 200
 learning_rate_cosine_steps = 10000
 batch_epochs = 1
-batch_size = 1024
+batch_size = 256
 cpuct = 1.5
 cpuct_log = 0.45
 cpuct_base = 500.0
 temperature_start = 1.0
 temperature_endgame = 0.0
-temperature_decay_delay_plies = 4
-temperature_decay_plies = 8
+temperature_decay_delay_plies = 12
+temperature_decay_plies = 48
 root_dirichlet_total_concentration = 10.83
 root_exploration_fraction = 0.25
 root_policy_temperature = 1.1
-replay_capacity = 500000
-replay_warmup_samples = 100000
-train_samples_per_update = 50000
+replay_capacity = 50000
+replay_warmup_samples = 2048
+train_samples_per_update = 2048
 replay_recent_sample_fraction = 0.4
 replay_recent_updates = 5
 replay_policy_surprise_fraction = 0.4
 replay_value_surprise_fraction = 0.1
 checkpoint_interval = 0
-checkpoint_dir = "checkpoints"
+checkpoint_dir = "checkpoints/go9-v30"
 max_checkpoints = 20
 arena_interval = 10
-arena_games = 200
+arena_games = 40
 arena_opening_plies = 2
 arena_promotion_rate = 0.5
 arena_promotion_confidence_z = 1.2799999713897705
 arena_color_score_floor = 0.45
-tensorboard_logdir = "runs/gomoku"
+tensorboard_logdir = "runs/go9-v30"
 "#;
 
 #[cfg(test)]
@@ -269,15 +269,15 @@ mod tests {
     fn default_text_is_exact_and_valid() {
         let config: AzLoopConfig = toml::from_str(DEFAULT_CONFIG_TEXT).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.format_version, 20);
-        assert_eq!(config.batch_size, 1024);
+        assert_eq!(config.format_version, 22);
+        assert_eq!(config.batch_size, 256);
         assert_eq!(config.hidden_size, 128);
-        assert_eq!(config.selfplay_samples_per_update, 50_000);
-        assert_eq!(config.selfplay_workers, 192);
-        assert_eq!(config.arena_games, 200);
-        assert_eq!(config.replay_capacity, 500_000);
-        assert_eq!(config.replay_warmup_samples, 100_000);
-        assert_eq!(config.train_samples_per_update, 50_000);
+        assert_eq!(config.selfplay_samples_per_update, 2048);
+        assert_eq!(config.selfplay_workers, 4);
+        assert_eq!(config.arena_games, 40);
+        assert_eq!(config.replay_capacity, 50_000);
+        assert_eq!(config.replay_warmup_samples, 2048);
+        assert_eq!(config.train_samples_per_update, 2048);
         assert!(DEFAULT_CONFIG_TEXT.contains("learning_rate = 0.0008\n"));
         assert!(DEFAULT_CONFIG_TEXT.contains("arena_promotion_rate = 0.5\n"));
         assert_eq!(config.arena_color_score_floor, 0.45);

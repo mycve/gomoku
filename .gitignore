@@ -10,3 +10,7 @@ Cargo.lock
 katago-gomoku-distill-2025.5
 data
 *.safetensors
+
+go9.azloop.toml
+
+go9-v30.azloop.toml

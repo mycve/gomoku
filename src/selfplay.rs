@@ -24,6 +24,7 @@ pub struct SelfplayStats {
     pub black_wins: usize,
     pub white_wins: usize,
     pub draws: usize,
+    pub aborted: usize,
     pub plies: usize,
     pub black_win_plies: usize,
     pub white_win_plies: usize,
@@ -60,6 +61,7 @@ impl SelfplayStats {
         self.black_wins += other.black_wins;
         self.white_wins += other.white_wins;
         self.draws += other.draws;
+        self.aborted += other.aborted;
         self.plies += other.plies;
         self.black_win_plies += other.black_win_plies;
         self.white_win_plies += other.white_win_plies;
@@ -221,6 +223,13 @@ pub fn generate_one_detailed_match_controlled(
     }
     let out = board.outcome();
     stats.plies = board.move_count();
+    if out.is_none() || out == Some(Outcome::Aborted) {
+        stats.aborted = 1;
+        return GeneratedGame {
+            samples: Vec::new(),
+            stats,
+        };
+    }
     match out {
         Some(Outcome::Win(crate::game::Player::Black)) => {
             stats.black_wins = 1;
@@ -237,7 +246,7 @@ pub fn generate_one_detailed_match_controlled(
     }
     for s in &mut samples {
         s.value = match out {
-            Some(Outcome::Draw) | None => 0.0,
+            Some(Outcome::Draw | Outcome::Aborted) | None => 0.0,
             Some(Outcome::Win(p)) => {
                 if p == s.board.to_move() {
                     1.0
@@ -416,6 +425,7 @@ pub struct ArenaReport {
     pub wins: usize,
     pub losses: usize,
     pub draws: usize,
+    pub aborted: usize,
     pub wins_as_black: usize,
     pub losses_as_black: usize,
     pub draws_as_black: usize,
@@ -457,7 +467,9 @@ impl ArenaReport {
         self.score_rate() - z.max(0.0) * self.score_rate_standard_error()
     }
     pub fn promotes_with_lower_bound(self, threshold: f32, z: f32) -> bool {
-        self.score_rate_lower_bound(z) >= threshold.clamp(0.0, 1.0)
+        self.aborted == 0
+            && self.games() > 0
+            && self.score_rate_lower_bound(z) >= threshold.clamp(0.0, 1.0)
     }
     pub fn score_as_black(self) -> f32 {
         let games = self.wins_as_black + self.losses_as_black + self.draws_as_black;
@@ -543,6 +555,10 @@ fn play_arena_game(
     }
     let plies = board.move_count();
     match board.outcome() {
+        Some(Outcome::Aborted) | None => ArenaReport {
+            aborted: 1,
+            ..Default::default()
+        },
         Some(Outcome::Win(player)) => {
             let candidate_won = (player == crate::game::Player::Black) == candidate_black;
             if candidate_won {
@@ -581,6 +597,7 @@ fn merge_arena_reports(a: ArenaReport, b: ArenaReport) -> ArenaReport {
         wins: a.wins + b.wins,
         losses: a.losses + b.losses,
         draws: a.draws + b.draws,
+        aborted: a.aborted + b.aborted,
         wins_as_black: a.wins_as_black + b.wins_as_black,
         losses_as_black: a.losses_as_black + b.losses_as_black,
         draws_as_black: a.draws_as_black + b.draws_as_black,
@@ -607,6 +624,28 @@ fn random_index(seed: &mut u64, len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_game_has_no_training_labels() {
+        let model = PolicyValueModel::random(8, 101);
+        let stop = AtomicBool::new(true);
+        let game =
+            generate_one_detailed_controlled(&model, SearchConfig::default(), 1, Some(&stop));
+        assert!(game.samples.is_empty());
+        assert_eq!(game.stats.aborted, 1);
+        assert_eq!(game.stats.draws, 0);
+    }
+
+    #[test]
+    fn incomplete_arena_cannot_promote_a_model() {
+        let report = ArenaReport {
+            wins: 100,
+            aborted: 1,
+            ..Default::default()
+        };
+        assert!(!report.promotes_with_lower_bound(0.5, 0.0));
+        assert!(!ArenaReport::default().promotes_with_lower_bound(0.0, 0.0));
+    }
 
     #[test]
     fn temperature_decays_linearly() {

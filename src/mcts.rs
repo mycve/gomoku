@@ -1,5 +1,5 @@
 use crate::{
-    game::{Board, CELL_COUNT, Move, Outcome, transform_index},
+    game::{ACTION_COUNT, Board, Move, Outcome, transform_index},
     model::{EvalScratch, PolicyValueModel},
 };
 use std::{
@@ -185,7 +185,7 @@ fn expand(
     crate::scope_profile!("mcts.expand");
     if let Some(out) = nodes[idx].board.outcome() {
         return match out {
-            Outcome::Draw => 0.0,
+            Outcome::Draw | Outcome::Aborted => 0.0,
             Outcome::Win(p) => {
                 if p == nodes[idx].board.to_move() {
                     1.0
@@ -195,7 +195,6 @@ fn expand(
             }
         };
     }
-    let cached_tactics = !(idx == 0 && cfg.root_num_symmetries_to_sample > 1);
     let (mut policy, value) = {
         crate::scope_profile!("mcts.nn_eval");
         if idx == 0 && cfg.root_num_symmetries_to_sample > 1 {
@@ -211,62 +210,12 @@ fn expand(
         }
     };
     nodes[idx].initial_value = value;
-    let mut raw_priors = [0.0_f32; CELL_COUNT];
+    let mut raw_priors = [0.0_f32; ACTION_COUNT];
     for &(mv, prior) in &policy {
         raw_priors[mv.0] = prior;
     }
     if idx == 0 {
         apply_policy_temperature(&mut policy, cfg.root_policy_temperature);
-    }
-    let us = nodes[idx].board.to_move();
-    let winning = policy
-        .iter()
-        .filter_map(|&(mv, _)| {
-            (if cached_tactics {
-                scratch.is_winning_move(mv, false)
-            } else {
-                nodes[idx].board.is_winning_move(mv, us)
-            })
-            .then_some(mv)
-        })
-        .collect::<Vec<_>>();
-    if !winning.is_empty() {
-        let prior = 1.0 / winning.len() as f32;
-        policy = winning.into_iter().map(|mv| (mv, prior)).collect();
-    } else {
-        let forced_blocks = policy
-            .iter()
-            .filter_map(|&(mv, _)| {
-                (if cached_tactics {
-                    scratch.is_winning_move(mv, true)
-                } else {
-                    nodes[idx].board.is_winning_move(mv, us.other())
-                })
-                .then_some(mv)
-            })
-            .collect::<Vec<_>>();
-        if !forced_blocks.is_empty() {
-            let prior = 1.0 / forced_blocks.len() as f32;
-            policy = forced_blocks.into_iter().map(|mv| (mv, prior)).collect();
-        } else if idx == 0 {
-            let forcing_threshold = policy
-                .iter()
-                .map(|(_, prior)| *prior)
-                .fold(0.0_f32, f32::max)
-                * 0.1;
-            let forcing = policy
-                .iter()
-                .filter_map(|&(mv, prior)| {
-                    (prior >= forcing_threshold
-                        && nodes[idx].board.winning_replies_after(mv, us) >= 2)
-                        .then_some(mv)
-                })
-                .collect::<Vec<_>>();
-            if !forcing.is_empty() {
-                let prior = 1.0 / forcing.len() as f32;
-                policy = forcing.into_iter().map(|mv| (mv, prior)).collect();
-            }
-        }
     }
     if idx == 0
         && cfg.root_dirichlet_total_concentration > 0.0
@@ -313,7 +262,7 @@ fn simulate(
 ) -> f32 {
     if let Some(out) = nodes[idx].board.outcome() {
         return match out {
-            Outcome::Draw => 0.0,
+            Outcome::Draw | Outcome::Aborted => 0.0,
             Outcome::Win(p) => {
                 if p == nodes[idx].board.to_move() {
                     1.0
@@ -360,14 +309,8 @@ fn simulate(
         crate::scope_profile!("mcts.create_child");
         let mut b = nodes[idx].board.clone();
         let mv = nodes[idx].children[best].mv;
-        let player = b.to_move();
-        let accumulator_offset = model.accumulator_after_move_into_arena(
-            accumulator_arena,
-            nodes[idx].accumulator_offset,
-            mv,
-            player,
-        );
-        b.play(mv);
+        assert!(b.play(mv));
+        let accumulator_offset = model.accumulator_into_arena(&b, accumulator_arena);
         let key = board_hash(&b);
         let c = if cfg.use_graph_search {
             transpositions.get(&key).and_then(|candidates| {
@@ -422,7 +365,7 @@ fn board_hash(board: &Board) -> u64 {
 }
 
 fn same_position(a: &Board, b: &Board) -> bool {
-    a.to_move() == b.to_move() && a.cells() == b.cells()
+    a == b
 }
 
 fn edge_std_error(edge: &Edge) -> f32 {
@@ -464,12 +407,12 @@ fn evaluate_root_symmetries(
     cfg: SearchConfig,
 ) -> (Vec<(Move, f32)>, f32) {
     let count = cfg.root_num_symmetries_to_sample.clamp(1, 8);
-    let mut probabilities = vec![0.0f32; CELL_COUNT];
+    let mut probabilities = vec![0.0f32; ACTION_COUNT];
     let mut value = 0.0;
     for index in 0..count {
         let symmetry = (cfg.root_noise_seed as usize + index * 3) % 8;
-        let mut inverse = [0usize; CELL_COUNT];
-        for original in 0..CELL_COUNT {
+        let mut inverse = [0usize; ACTION_COUNT];
+        for original in 0..ACTION_COUNT {
             inverse[transform_index(original, symmetry)] = original;
         }
         let transformed = board.transformed(symmetry);
@@ -539,83 +482,27 @@ impl SplitMix64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::game::Player;
 
     #[test]
-    fn immediate_win_replaces_network_policy() {
-        let board = Board::from_stones(&[
-            (Move::parse("d8").unwrap(), Player::Black),
-            (Move::parse("d7").unwrap(), Player::White),
-            (Move::parse("e8").unwrap(), Player::Black),
-            (Move::parse("e7").unwrap(), Player::White),
-            (Move::parse("f8").unwrap(), Player::Black),
-            (Move::parse("f7").unwrap(), Player::White),
-            (Move::parse("g8").unwrap(), Player::Black),
-            (Move::parse("a1").unwrap(), Player::White),
-        ])
-        .unwrap();
-        let result = search(
+    fn search_preserves_pass_under_symmetries_and_scores_second_pass() {
+        let mut board = Board::new();
+        assert!(board.play(Move::PASS));
+        let candidates = search(
             &board,
-            &PolicyValueModel::random(8, 23),
+            &PolicyValueModel::random(8, 41),
             SearchConfig {
-                simulations: 2,
+                simulations: 164,
+                root_num_symmetries_to_sample: 8,
+                use_graph_search: true,
                 ..Default::default()
             },
         );
-        assert!(result.iter().all(|candidate| {
-            candidate.mv == Move::parse("c8").unwrap() || candidate.mv == Move::parse("h8").unwrap()
-        }));
-        assert_eq!(result.len(), 2);
-    }
-
-    #[test]
-    fn immediate_loss_restricts_search_to_blocks() {
-        let board = Board::from_stones(&[
-            (Move::parse("a1").unwrap(), Player::Black),
-            (Move::parse("d8").unwrap(), Player::White),
-            (Move::parse("a3").unwrap(), Player::Black),
-            (Move::parse("e8").unwrap(), Player::White),
-            (Move::parse("a5").unwrap(), Player::Black),
-            (Move::parse("f8").unwrap(), Player::White),
-            (Move::parse("a7").unwrap(), Player::Black),
-            (Move::parse("g8").unwrap(), Player::White),
-        ])
-        .unwrap();
-        let result = search(
-            &board,
-            &PolicyValueModel::random(8, 29),
-            SearchConfig {
-                simulations: 2,
-                ..Default::default()
-            },
-        );
-        assert!(result.iter().all(|candidate| {
-            candidate.mv == Move::parse("c8").unwrap() || candidate.mv == Move::parse("h8").unwrap()
-        }));
-        assert_eq!(result.len(), 2);
-    }
-
-    #[test]
-    fn open_four_replaces_network_policy() {
-        let board = Board::from_stones(&[
-            (Move::parse("d8").unwrap(), Player::Black),
-            (Move::parse("a1").unwrap(), Player::White),
-            (Move::parse("e8").unwrap(), Player::Black),
-            (Move::parse("a3").unwrap(), Player::White),
-            (Move::parse("g8").unwrap(), Player::Black),
-            (Move::parse("a5").unwrap(), Player::White),
-        ])
-        .unwrap();
-        let result = search(
-            &board,
-            &PolicyValueModel::random(8, 31),
-            SearchConfig {
-                simulations: 2,
-                ..Default::default()
-            },
-        );
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].mv, Move::parse("f8").unwrap());
+        assert_eq!(candidates.len(), ACTION_COUNT);
+        assert!(candidates.iter().all(|c| board.is_legal(c.mv)));
+        let pass = candidates.iter().find(|c| c.mv == Move::PASS).unwrap();
+        assert!(pass.visits > 0);
+        assert_eq!(pass.q, 1.0); // 白停一手后依靠贴目获胜。
+        assert!(!same_position(&board, &Board::new()));
     }
 
     #[test]
@@ -651,7 +538,7 @@ mod tests {
             one.iter().filter(|candidate| candidate.visits > 0).count(),
             1
         );
-        assert_eq!(one.len(), 224);
+        assert_eq!(one.len(), ACTION_COUNT - 1);
 
         let full = search(
             &board,
