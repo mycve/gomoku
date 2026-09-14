@@ -1,43 +1,27 @@
 use crate::{
+    fused_feature_pool::sparse_pool,
     game::CELL_COUNT,
     model::{
         AXIS_FEATURES, DIAGONAL_FEATURES, INPUT_SIZE, LOCAL_AXES, LOCAL_AXIS_FEATURE_SIZE,
         LOCAL_AXIS_PATTERNS, LOCAL_CANDIDATE_SIZE, MOVE_COUNT_INPUT, POLICY_HEAD_SIZE,
-        PolicyValueModel, REGION_COUNT, REGION_FEATURE_SIZE, REGION_TOTAL_SIZE, ROLE_ADAPTER_RANK,
-        ROLE_COUNT, ROLE_INPUT_START, STONE_TYPES, VALUE_HEAD_SIZE, VALUE_LOCAL_SIZE, WDL_SIZE,
-        local_ray_codes,
+        POLICY_TACTICAL_SIZE, PolicyValueModel, REGION_COUNT, REGION_FEATURE_SIZE,
+        REGION_TOTAL_SIZE, ROLE_ADAPTER_RANK, ROLE_COUNT, ROLE_INPUT_START, SHORT_VALUE_HEADS,
+        STONE_TYPES, VALUE_HEAD_SIZE, VALUE_LOCAL_SIZE, WDL_SIZE, local_ray_codes,
+        policy_tactical_index,
     },
     replay::Sample,
     selfplay::TrainStats,
-};
-#[cfg(any(
-    feature = "nccl-train",
-    all(target_os = "linux", not(target_env = "musl"))
-))]
-use candle_core::{
-    CudaStorage, Storage,
-    cuda_backend::cudarc::nccl::{result as nccl_result, safe as nccl},
-    op::BackpropOp,
 };
 use candle_core::{Device, Tensor, Var, backprop::GradStore};
 use candle_nn::{
     ops::log_softmax,
     optim::{AdamW, Optimizer, ParamsAdamW},
 };
-#[cfg(any(
-    feature = "nccl-train",
-    all(target_os = "linux", not(target_env = "musl"))
-))]
-use std::process::Command;
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::{io, thread};
 
 pub fn training_device_name() -> io::Result<String> {
-    let names = training_device_indices()
-        .iter()
-        .map(|&index| make_device(index).map(|(_, name)| name))
-        .collect::<io::Result<Vec<_>>>()?;
-    Ok(names.join(","))
+    make_device(0).map(|(_, name)| name)
 }
 
 pub fn train(
@@ -52,62 +36,16 @@ pub fn train(
 }
 
 pub struct TrainingSession {
-    replicas: Vec<Replica>,
+    replica: Replica,
     optimizer: AdamW,
-    #[cfg(any(
-        feature = "nccl-train",
-        all(target_os = "linux", not(target_env = "musl"))
-    ))]
-    nccl: Option<NcclAllReduce>,
 }
-
-#[cfg(any(
-    feature = "nccl-train",
-    all(target_os = "linux", not(target_env = "musl"))
-))]
-struct NcclAllReduce {
-    comms: Vec<nccl::Comm>,
-}
-
-#[cfg(any(
-    feature = "nccl-train",
-    all(target_os = "linux", not(target_env = "musl"))
-))]
-unsafe impl Send for NcclAllReduce {}
-#[cfg(any(
-    feature = "nccl-train",
-    all(target_os = "linux", not(target_env = "musl"))
-))]
-unsafe impl Sync for NcclAllReduce {}
 
 impl TrainingSession {
     pub fn new(model: &PolicyValueModel, learning_rate: f32) -> io::Result<Self> {
-        let unique = training_device_indices();
-        #[cfg(not(any(
-            feature = "nccl-train",
-            all(target_os = "linux", not(target_env = "musl"))
-        )))]
-        if unique.len() > 1 {
-            return Err(io::Error::other(
-                "多卡训练需要使用 --features nccl-train 编译",
-            ));
-        }
-        let devices = unique
-            .iter()
-            .map(|&index| make_device(index).map(|(device, _)| device))
-            .collect::<io::Result<Vec<_>>>()?;
-        let replicas = devices
-            .iter()
-            .map(|device| Replica::new(model, device))
-            .collect::<io::Result<Vec<_>>>()?;
-        if replicas.len() > 1 {
-            eprintln!(
-                "train    : NCCL data parallel devices={:?} global_batch_sharded_each_step",
-                unique
-            );
-        }
+        let (device, _) = make_device(0)?;
+        let replica = Replica::new(model, &device)?;
         let optimizer = AdamW::new(
-            replicas[0].vars(),
+            replica.vars(),
             ParamsAdamW {
                 lr: learning_rate as f64,
                 beta1: 0.9,
@@ -117,20 +55,7 @@ impl TrainingSession {
             },
         )
         .map_err(err)?;
-        #[cfg(any(
-            feature = "nccl-train",
-            all(target_os = "linux", not(target_env = "musl"))
-        ))]
-        let nccl = init_nccl_all_reduce(&replicas)?;
-        Ok(Self {
-            replicas,
-            optimizer,
-            #[cfg(any(
-                feature = "nccl-train",
-                all(target_os = "linux", not(target_env = "musl"))
-            ))]
-            nccl,
-        })
+        Ok(Self { replica, optimizer })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -158,6 +83,7 @@ impl TrainingSession {
                 stats.samples += output.samples;
                 stats.policy_loss += output.policy_sum;
                 stats.value_loss += output.value_sum;
+                stats.short_value_loss += output.short_value_sum;
                 stats.policy_entropy += output.policy_entropy_sum;
                 stats.value_entropy += output.value_entropy_sum;
                 stats.optimizer_steps += 1;
@@ -174,10 +100,11 @@ impl TrainingSession {
         }
         let mut stats = TrainStats::default();
         for batch in samples.chunks(batch_size.max(1)) {
-            let output = self.replicas[0].forward(batch, false, batch.len())?;
+            let output = self.replica.forward(batch, false, batch.len())?;
             stats.samples += output.samples;
             stats.policy_loss += output.policy_sum;
             stats.value_loss += output.value_sum;
+            stats.short_value_loss += output.short_value_sum;
             stats.policy_entropy += output.policy_entropy_sum;
             stats.value_entropy += output.value_entropy_sum;
         }
@@ -185,211 +112,17 @@ impl TrainingSession {
     }
 
     fn copy_model(&self, model: &mut PolicyValueModel) -> io::Result<()> {
-        self.replicas[0].copy_to(model)?;
+        self.replica.copy_to(model)?;
         Ok(())
     }
 
     fn train_batch(&mut self, batch: &[Sample]) -> io::Result<BatchOutput> {
-        let active = self.replicas.len().min(batch.len());
-        if active <= 1 {
-            let output = self.replicas[0].forward(batch, true, batch.len())?;
-            crate::scope_profile!("train.optimizer_step");
-            self.optimizer
-                .step(output.grads.as_ref().expect("训练批次必须包含梯度"))
-                .map_err(err)?;
-            #[cfg(any(
-                feature = "nccl-train",
-                all(target_os = "linux", not(target_env = "musl"))
-            ))]
-            if self.replicas.len() > 1 {
-                self.nccl_broadcast_vars()?;
-            }
-            return Ok(output);
-        }
-        let shard_size = batch.len().div_ceil(active);
-        #[allow(unused_mut)]
-        let mut outputs = thread::scope(|scope| {
-            let handles = batch
-                .chunks(shard_size)
-                .zip(&self.replicas)
-                .map(|(shard, replica)| {
-                    scope.spawn(move || replica.forward(shard, true, batch.len()))
-                })
-                .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .map_err(|_| io::Error::other("多卡训练线程异常退出"))?
-                })
-                .collect::<io::Result<Vec<_>>>()
-        })?;
-        #[cfg(any(
-            feature = "nccl-train",
-            all(target_os = "linux", not(target_env = "musl"))
-        ))]
-        {
-            self.nccl_all_reduce_grads(&mut outputs)?;
-            crate::scope_profile!("train.optimizer_step");
-            self.optimizer
-                .step(outputs[0].grads.as_ref().expect("NCCL 后主卡梯度缺失"))
-                .map_err(err)?;
-            self.nccl_broadcast_vars()?;
-        }
-        let mut total = BatchOutput::default();
-        for output in outputs {
-            total.add_stats(output);
-        }
-        Ok(total)
-    }
-
-    #[cfg(any(
-        feature = "nccl-train",
-        all(target_os = "linux", not(target_env = "musl"))
-    ))]
-    fn nccl_all_reduce_grads(&self, outputs: &mut [BatchOutput]) -> io::Result<()> {
-        let vars_by_rank = self.replicas.iter().map(Replica::vars).collect::<Vec<_>>();
-        for var_index in 0..vars_by_rank[0].len() {
-            let grads = outputs
-                .iter()
-                .zip(&vars_by_rank)
-                .map(|(output, vars)| {
-                    output
-                        .grads
-                        .as_ref()
-                        .and_then(|store| store.get(&vars[var_index]))
-                })
-                .collect::<Vec<_>>();
-            if grads.iter().all(|grad| grad.is_none()) {
-                continue;
-            }
-            if grads.iter().any(|grad| grad.is_none()) {
-                return Err(io::Error::other(format!(
-                    "NCCL 参数 {var_index} 的梯度在部分 GPU 上缺失"
-                )));
-            }
-            let tensors = grads
-                .into_iter()
-                .map(|grad| grad.expect("已检查梯度").contiguous().map_err(err))
-                .collect::<io::Result<Vec<_>>>()?;
-            let storages = tensors
-                .iter()
-                .map(|tensor| {
-                    let (storage, layout) = tensor.storage_and_layout();
-                    if !layout.is_contiguous() || layout.start_offset() != 0 {
-                        return Err(io::Error::other("NCCL 梯度必须连续且偏移为零"));
-                    }
-                    Ok(storage)
-                })
-                .collect::<io::Result<Vec<_>>>()?;
-            let mut receives = tensors
-                .iter()
-                .map(|tensor| {
-                    tensor
-                        .device()
-                        .as_cuda_device()
-                        .map_err(err)?
-                        .cuda_stream()
-                        .alloc_zeros::<f32>(tensor.elem_count())
-                        .map_err(nccl_cuda_error)
-                })
-                .collect::<io::Result<Vec<_>>>()?;
-            let nccl = self.nccl.as_ref().expect("多卡必须初始化 NCCL");
-            nccl::group_start().map_err(nccl_error)?;
-            let reduce = (|| -> io::Result<()> {
-                for rank in 0..outputs.len() {
-                    let send = match &*storages[rank] {
-                        Storage::Cuda(storage) => storage.as_cuda_slice::<f32>().map_err(err)?,
-                        _ => return Err(io::Error::other("NCCL 梯度不在 CUDA 设备上")),
-                    };
-                    nccl.comms[rank]
-                        .all_reduce(send, &mut receives[rank], &nccl::ReduceOp::Sum)
-                        .map_err(nccl_error)?;
-                }
-                Ok(())
-            })();
-            let group_end = nccl::group_end().map_err(nccl_error);
-            reduce?;
-            group_end?;
-            for (rank, recv) in receives.into_iter().enumerate() {
-                let var = &vars_by_rank[rank][var_index];
-                let device = self.replicas[rank]
-                    .device
-                    .as_cuda_device()
-                    .map_err(err)?
-                    .clone();
-                let storage = Storage::Cuda(CudaStorage::wrap_cuda_slice(recv, device));
-                let reduced =
-                    Tensor::from_storage(storage, var.shape().clone(), BackpropOp::none(), false);
-                outputs[rank]
-                    .grads
-                    .as_mut()
-                    .expect("训练输出必须有梯度")
-                    .insert(var, reduced);
-            }
-        }
-        Ok(())
-    }
-
-    #[cfg(any(
-        feature = "nccl-train",
-        all(target_os = "linux", not(target_env = "musl"))
-    ))]
-    fn nccl_broadcast_vars(&self) -> io::Result<()> {
-        let vars_by_rank = self.replicas.iter().map(Replica::vars).collect::<Vec<_>>();
-        let nccl = self.nccl.as_ref().expect("多卡必须初始化 NCCL");
-        for var_index in 0..vars_by_rank[0].len() {
-            let root = vars_by_rank[0][var_index]
-                .as_detached_tensor()
-                .contiguous()
-                .map_err(err)?;
-            let (root_storage, root_layout) = root.storage_and_layout();
-            if !root_layout.is_contiguous() || root_layout.start_offset() != 0 {
-                return Err(io::Error::other("NCCL 广播参数必须连续且偏移为零"));
-            }
-            let mut receives = vars_by_rank
-                .iter()
-                .map(|vars| {
-                    vars[var_index]
-                        .device()
-                        .as_cuda_device()
-                        .map_err(err)?
-                        .cuda_stream()
-                        .alloc_zeros::<f32>(root.elem_count())
-                        .map_err(nccl_cuda_error)
-                })
-                .collect::<io::Result<Vec<_>>>()?;
-            nccl::group_start().map_err(nccl_error)?;
-            let broadcast = (|| -> io::Result<()> {
-                let send = match &*root_storage {
-                    Storage::Cuda(storage) => storage.as_cuda_slice::<f32>().map_err(err)?,
-                    _ => return Err(io::Error::other("NCCL 广播源不在 CUDA 设备上")),
-                };
-                for rank in 0..vars_by_rank.len() {
-                    nccl.comms[rank]
-                        .broadcast((rank == 0).then_some(send), &mut receives[rank], 0)
-                        .map_err(nccl_error)?;
-                }
-                Ok(())
-            })();
-            let group_end = nccl::group_end().map_err(nccl_error);
-            broadcast?;
-            group_end?;
-            for (rank, recv) in receives.into_iter().enumerate().skip(1) {
-                let var = &vars_by_rank[rank][var_index];
-                let device = self.replicas[rank]
-                    .device
-                    .as_cuda_device()
-                    .map_err(err)?
-                    .clone();
-                let storage = Storage::Cuda(CudaStorage::wrap_cuda_slice(recv, device));
-                let tensor =
-                    Tensor::from_storage(storage, var.shape().clone(), BackpropOp::none(), false);
-                var.set(&tensor).map_err(err)?;
-            }
-        }
-        Ok(())
+        let output = self.replica.forward(batch, true, batch.len())?;
+        crate::scope_profile!("train.optimizer_step");
+        self.optimizer
+            .step(output.grads.as_ref().expect("训练批次必须包含梯度"))
+            .map_err(err)?;
+        Ok(output)
     }
 }
 
@@ -397,11 +130,12 @@ fn finalize_stats(mut stats: TrainStats) -> TrainStats {
     let count = stats.samples.max(1) as f32;
     stats.policy_loss /= count;
     stats.value_loss /= count;
+    stats.short_value_loss /= count;
     stats.policy_entropy /= count;
     stats.value_entropy /= count;
     stats.policy_kl = (stats.policy_loss - stats.policy_entropy).max(0.0);
     stats.value_kl = (stats.value_loss - stats.value_entropy).max(0.0);
-    stats.loss = stats.policy_loss + stats.value_loss;
+    stats.loss = stats.policy_loss + stats.value_loss + stats.short_value_loss;
     stats
 }
 
@@ -422,6 +156,7 @@ struct Replica {
     policy_dynamic: Var,
     policy_output: Var,
     policy_bias: Var,
+    policy_tactical: Var,
     local_axis_embedding: Var,
     local_axis_scale: Var,
     local_axis_bias: Var,
@@ -433,6 +168,8 @@ struct Replica {
     value_head_hidden2: Var,
     value_head_bias2: Var,
     value_head_output: Var,
+    short_value_head_output: Var,
+    short_value_head_bias: Var,
 }
 impl Replica {
     fn new(model: &PolicyValueModel, device: &Device) -> io::Result<Self> {
@@ -470,6 +207,7 @@ impl Replica {
             )?,
             policy_output: var(&model.policy_output, (CELL_COUNT, POLICY_HEAD_SIZE), device)?,
             policy_bias: var(&model.policy_bias, (CELL_COUNT,), device)?,
+            policy_tactical: var(&model.policy_tactical, (POLICY_TACTICAL_SIZE, 1), device)?,
             local_axis_embedding: var(
                 &model.local_axis_embedding,
                 (LOCAL_AXIS_PATTERNS, LOCAL_AXIS_FEATURE_SIZE),
@@ -505,6 +243,16 @@ impl Replica {
                 (WDL_SIZE, VALUE_HEAD_SIZE),
                 device,
             )?,
+            short_value_head_output: var(
+                &model.short_value_head_output,
+                (SHORT_VALUE_HEADS * WDL_SIZE, VALUE_HEAD_SIZE),
+                device,
+            )?,
+            short_value_head_bias: var(
+                &model.short_value_head_bias,
+                (SHORT_VALUE_HEADS * WDL_SIZE,),
+                device,
+            )?,
         })
     }
     fn vars(&self) -> Vec<Var> {
@@ -524,6 +272,7 @@ impl Replica {
             self.policy_dynamic.clone(),
             self.policy_output.clone(),
             self.policy_bias.clone(),
+            self.policy_tactical.clone(),
             self.local_axis_embedding.clone(),
             self.local_axis_scale.clone(),
             self.local_axis_bias.clone(),
@@ -535,6 +284,8 @@ impl Replica {
             self.value_head_hidden2.clone(),
             self.value_head_bias2.clone(),
             self.value_head_output.clone(),
+            self.short_value_head_output.clone(),
+            self.short_value_head_bias.clone(),
         ]
     }
     fn forward(
@@ -579,6 +330,12 @@ impl Replica {
             Tensor::from_vec(packed.policy_masks, (b, CELL_COUNT), &self.device).map_err(err)?;
         let value_wdl =
             Tensor::from_vec(packed.value_wdl, (b, WDL_SIZE), &self.device).map_err(err)?;
+        let short_value_wdl = Tensor::from_vec(
+            packed.short_value_wdl,
+            (b, SHORT_VALUE_HEADS, WDL_SIZE),
+            &self.device,
+        )
+        .map_err(err)?;
         let policy_weights =
             Tensor::from_vec(packed.policy_weights, (b,), &self.device).map_err(err)?;
         let value_weights =
@@ -586,6 +343,12 @@ impl Replica {
         let local_axis_indices = Tensor::from_vec(
             packed.local_axis_indices,
             (b * CELL_COUNT * LOCAL_AXES,),
+            &self.device,
+        )
+        .map_err(err)?;
+        let policy_tactical_indices = Tensor::from_vec(
+            packed.policy_tactical_indices,
+            (b * CELL_COUNT, LOCAL_AXES),
             &self.device,
         )
         .map_err(err)?;
@@ -640,10 +403,12 @@ impl Replica {
             .and_then(|x| x.sum(2))
             .and_then(|x| x.reshape((b, REGION_TOTAL_SIZE)))
             .map_err(err)?;
-        let local_axes = self
-            .local_axis_embedding
-            .as_tensor()
-            .index_select(&local_axis_indices, 0)
+        // 与 chineseai 相同：通过前向/反向融合的稀疏池化查表，
+        // 不构造巨大中间张量。每行只有一个 item，因此池化等价于 lookup。
+        let local_axis_items = local_axis_indices
+            .reshape((b * CELL_COUNT * LOCAL_AXES, 1))
+            .map_err(err)?;
+        let local_axes = sparse_pool(self.local_axis_embedding.as_tensor(), &local_axis_items)
             .and_then(|x| x.reshape((b, CELL_COUNT, LOCAL_AXES, LOCAL_AXIS_FEATURE_SIZE)))
             .map_err(err)?;
         let axis_scale = Tensor::cat(
@@ -721,10 +486,15 @@ impl Replica {
             .broadcast_mul(&dynamic_weights)
             .and_then(|x| x.sum(2))
             .map_err(err)?;
+        let tactical_logits =
+            sparse_pool(self.policy_tactical.as_tensor(), &policy_tactical_indices)
+                .and_then(|x| x.reshape((b, CELL_COUNT)))
+                .map_err(err)?;
         let logits = policy_global
             .matmul(&self.policy_output.t().map_err(err)?)
             .and_then(|x| x.add(&local_policy_logits))
             .and_then(|x| x.broadcast_add(&self.policy_bias))
+            .and_then(|x| x.add(&tactical_logits))
             .and_then(|x| x.add(&masks))
             .map_err(err)?;
         let log_probs = log_softmax(&logits, 1).map_err(err)?;
@@ -761,6 +531,11 @@ impl Replica {
             .matmul(&self.value_head_output.t().map_err(err)?)
             .and_then(|x| x.add(&local_value.matmul(&self.value_local_output.t()?)?))
             .map_err(err)?;
+        let short_value_logits = value_features
+            .matmul(&self.short_value_head_output.t().map_err(err)?)
+            .and_then(|x| x.broadcast_add(&self.short_value_head_bias))
+            .and_then(|x| x.reshape((b, SHORT_VALUE_HEADS, WDL_SIZE)))
+            .map_err(err)?;
         let value_log_probs = log_softmax(&value_logits, 1).map_err(err)?;
         let value_sum_tensor = value_wdl
             .mul(&value_log_probs)
@@ -769,8 +544,19 @@ impl Replica {
             .and_then(|x| x.sum_all())
             .and_then(|x| x.affine(-1.0, 0.0))
             .map_err(err)?;
+        let short_value_log_probs = log_softmax(&short_value_logits, 2).map_err(err)?;
+        let short_value_sum_tensor = short_value_wdl
+            .mul(&short_value_log_probs)
+            .and_then(|x| x.sum(2))
+            .and_then(|x| x.mean(1))
+            .and_then(|x| x.mul(&value_weights))
+            .and_then(|x| x.sum_all())
+            .and_then(|x| x.affine(-0.05, 0.0))
+            .map_err(err)?;
+        let short_value_sum = short_value_sum_tensor.to_scalar::<f32>().map_err(err)?;
         let loss = policy_sum_tensor
             .add(&value_sum_tensor)
+            .and_then(|x| x.add(&short_value_sum_tensor))
             .and_then(|x| x.affine(1.0 / global_batch_size.max(1) as f64, 0.0))
             .map_err(err)?;
         let policy_sum = policy_sum_tensor.to_scalar::<f32>().map_err(err)?;
@@ -786,6 +572,7 @@ impl Replica {
             samples: b,
             policy_sum,
             value_sum,
+            short_value_sum,
             policy_entropy_sum: packed.policy_entropy_sum,
             value_entropy_sum: packed.value_entropy_sum,
         })
@@ -819,17 +606,20 @@ impl Replica {
         m.policy_dynamic = v[12].clone();
         m.policy_output = v[13].clone();
         m.policy_bias = v[14].clone();
-        m.local_axis_embedding = v[15].clone();
-        m.local_axis_scale = v[16].clone();
-        m.local_axis_bias = v[17].clone();
-        m.policy_local = v[18].clone();
-        m.value_head_hidden = v[19].clone();
-        m.value_region_hidden = v[20].clone();
-        m.value_local_output = v[21].clone();
-        m.value_head_bias = v[22].clone();
-        m.value_head_hidden2 = v[23].clone();
-        m.value_head_bias2 = v[24].clone();
-        m.value_head_output = v[25].clone();
+        m.policy_tactical = v[15].clone();
+        m.local_axis_embedding = v[16].clone();
+        m.local_axis_scale = v[17].clone();
+        m.local_axis_bias = v[18].clone();
+        m.policy_local = v[19].clone();
+        m.value_head_hidden = v[20].clone();
+        m.value_region_hidden = v[21].clone();
+        m.value_local_output = v[22].clone();
+        m.value_head_bias = v[23].clone();
+        m.value_head_hidden2 = v[24].clone();
+        m.value_head_bias2 = v[25].clone();
+        m.value_head_output = v[26].clone();
+        m.short_value_head_output = v[27].clone();
+        m.short_value_head_bias = v[28].clone();
         m.refresh_local_axis_features();
         Ok(())
     }
@@ -840,125 +630,9 @@ struct BatchOutput {
     samples: usize,
     policy_sum: f32,
     value_sum: f32,
+    short_value_sum: f32,
     policy_entropy_sum: f32,
     value_entropy_sum: f32,
-}
-impl BatchOutput {
-    fn add_stats(&mut self, other: Self) {
-        self.samples += other.samples;
-        self.policy_sum += other.policy_sum;
-        self.value_sum += other.value_sum;
-        self.policy_entropy_sum += other.policy_entropy_sum;
-        self.value_entropy_sum += other.value_entropy_sum;
-    }
-}
-
-fn training_device_indices() -> Vec<usize> {
-    #[cfg(any(
-        feature = "nccl-train",
-        all(target_os = "linux", not(target_env = "musl"))
-    ))]
-    {
-        let candidates = visible_cuda_device_count()
-            .or_else(nvidia_smi_device_count)
-            .map(|count| (0..count).collect::<Vec<_>>())
-            .unwrap_or_else(|| probe_cuda_devices(64));
-        let available = candidates
-            .into_iter()
-            .filter(|&index| Device::new_cuda(index).is_ok())
-            .collect::<Vec<_>>();
-        if !available.is_empty() {
-            return available;
-        }
-    }
-    vec![0]
-}
-
-#[cfg(any(
-    feature = "nccl-train",
-    all(target_os = "linux", not(target_env = "musl"))
-))]
-fn visible_cuda_device_count() -> Option<usize> {
-    let value = std::env::var("CUDA_VISIBLE_DEVICES").ok()?;
-    let value = value.trim();
-    if value.is_empty() || value == "-1" || value.eq_ignore_ascii_case("NoDevFiles") {
-        return None;
-    }
-    let count = value
-        .split(',')
-        .filter(|item| !item.trim().is_empty())
-        .count();
-    (count > 0).then_some(count)
-}
-
-#[cfg(any(
-    feature = "nccl-train",
-    all(target_os = "linux", not(target_env = "musl"))
-))]
-fn nvidia_smi_device_count() -> Option<usize> {
-    let output = Command::new("nvidia-smi").arg("-L").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let count = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|line| line.trim_start().starts_with("GPU "))
-        .count();
-    (count > 0).then_some(count)
-}
-
-#[cfg(any(
-    feature = "nccl-train",
-    all(target_os = "linux", not(target_env = "musl"))
-))]
-fn probe_cuda_devices(limit: usize) -> Vec<usize> {
-    let mut devices = Vec::new();
-    for index in 0..limit {
-        if Device::new_cuda(index).is_ok() {
-            devices.push(index);
-        } else if !devices.is_empty() {
-            break;
-        }
-    }
-    devices
-}
-
-#[cfg(any(
-    feature = "nccl-train",
-    all(target_os = "linux", not(target_env = "musl"))
-))]
-fn init_nccl_all_reduce(replicas: &[Replica]) -> io::Result<Option<NcclAllReduce>> {
-    if replicas.len() <= 1 {
-        return Ok(None);
-    }
-    let streams = replicas
-        .iter()
-        .map(|replica| {
-            replica
-                .device
-                .as_cuda_device()
-                .map(|device| device.cuda_stream())
-                .map_err(err)
-        })
-        .collect::<io::Result<Vec<_>>>()?;
-    let comms = nccl::Comm::from_devices(streams).map_err(nccl_error)?;
-    Ok(Some(NcclAllReduce { comms }))
-}
-
-#[cfg(any(
-    feature = "nccl-train",
-    all(target_os = "linux", not(target_env = "musl"))
-))]
-fn nccl_error(error: nccl_result::NcclError) -> io::Error {
-    io::Error::other(format!("NCCL failed: {error:?}"))
-}
-
-#[cfg(any(
-    feature = "nccl-train",
-    all(target_os = "linux", not(target_env = "musl"))
-))]
-fn nccl_cuda_error(error: candle_core::cuda_backend::cudarc::driver::DriverError) -> io::Error {
-    io::Error::other(format!("NCCL CUDA allocation failed: {error:?}"))
 }
 fn make_device(requested: usize) -> io::Result<(Device, String)> {
     #[cfg(target_os = "macos")]
@@ -1002,8 +676,10 @@ struct Packed {
     policy_targets: Vec<f32>,
     policy_masks: Vec<f32>,
     local_axis_indices: Vec<u32>,
+    policy_tactical_indices: Vec<u32>,
     local_legal_mask: Vec<f32>,
     value_wdl: Vec<f32>,
+    short_value_wdl: Vec<f32>,
     policy_weights: Vec<f32>,
     value_weights: Vec<f32>,
     policy_entropy_sum: f32,
@@ -1021,8 +697,10 @@ fn pack(samples: &[Sample]) -> Packed {
     let mut targets = vec![0.0; samples.len() * CELL_COUNT];
     let mut masks = vec![-1e9; samples.len() * CELL_COUNT];
     let mut local_axis_indices = vec![0_u32; samples.len() * CELL_COUNT * LOCAL_AXES];
+    let mut policy_tactical_indices = vec![u32::MAX; samples.len() * CELL_COUNT * LOCAL_AXES];
     let mut local_legal_mask = vec![0.0; samples.len() * CELL_COUNT];
     let mut value_wdl = Vec::with_capacity(samples.len() * WDL_SIZE);
+    let mut short_value_wdl = Vec::with_capacity(samples.len() * SHORT_VALUE_HEADS * WDL_SIZE);
     let mut policy_weights = Vec::with_capacity(samples.len());
     let mut value_weights = Vec::with_capacity(samples.len());
     let mut policy_entropy_sum = 0.0;
@@ -1064,6 +742,8 @@ fn pack(samples: &[Sample]) -> Packed {
                 let (first, second) = local_ray_codes(&s.board, m, dr, dc);
                 let pattern = second * (second + 1) / 2 + first;
                 local_axis_indices[(row * CELL_COUNT + m.0) * LOCAL_AXES + axis] = pattern as u32;
+                policy_tactical_indices[(row * CELL_COUNT + m.0) * LOCAL_AXES + axis] =
+                    policy_tactical_index(m, axis, pattern) as u32;
             }
         }
         let sum: f32 = s.policy.iter().map(|(_, p)| p.max(0.0)).sum();
@@ -1094,6 +774,9 @@ fn pack(samples: &[Sample]) -> Packed {
                 .map(|&probability| probability * probability.ln())
                 .sum::<f32>();
         value_wdl.extend_from_slice(&final_wdl);
+        for target in s.short_value_wdl {
+            short_value_wdl.extend_from_slice(&target);
+        }
     }
     Packed {
         inputs,
@@ -1107,8 +790,10 @@ fn pack(samples: &[Sample]) -> Packed {
         policy_targets: targets,
         policy_masks: masks,
         local_axis_indices,
+        policy_tactical_indices,
         local_legal_mask,
         value_wdl,
+        short_value_wdl,
         policy_weights,
         value_weights,
         policy_entropy_sum,
@@ -1145,6 +830,7 @@ mod tests {
             policy_surprise: 0.0,
             value_surprise: 0.0,
             predicted_value: 0.0,
+            short_value_wdl: [[0.0, 1.0, 0.0]; SHORT_VALUE_HEADS],
         }]);
 
         assert_eq!(packed.policy_masks[occupied.0], -1e9);
@@ -1172,6 +858,7 @@ mod tests {
             policy_surprise: 0.0,
             value_surprise: 0.0,
             predicted_value: 0.0,
+            short_value_wdl: [[0.0, 1.0, 0.0]; SHORT_VALUE_HEADS],
         };
         let packed = pack(&[sample(black), sample(white)]);
         assert_eq!(&packed.roles, &[1.0, 0.0, 0.0, 1.0]);
@@ -1203,6 +890,7 @@ mod tests {
             policy_surprise: 0.0,
             value_surprise: 0.0,
             predicted_value: 0.0,
+            short_value_wdl: [[0.0, 1.0, 0.0]; SHORT_VALUE_HEADS],
         }]);
         let expected_policy = -policy.iter().map(|p| p * p.ln()).sum::<f32>();
         let expected_value = -wdl.iter().map(|p| p * p.ln()).sum::<f32>();
@@ -1214,6 +902,7 @@ mod tests {
     fn trains_policy_and_value_on_available_device() {
         let mut model = PolicyValueModel::random(16, 9);
         let before_local = model.local_axis_embedding.clone();
+        let before_short = model.short_value_head_output.clone();
         let mut board = Board::new();
         assert!(board.play(Move::new(7, 7).unwrap()));
         assert!(board.play(Move::new(7, 8).unwrap()));
@@ -1228,6 +917,7 @@ mod tests {
             policy_surprise: 0.0,
             value_surprise: 0.0,
             predicted_value: 0.0,
+            short_value_wdl: [[0.0, 1.0, 0.0]; SHORT_VALUE_HEADS],
         };
         let stats = train(
             &mut model,
@@ -1240,8 +930,14 @@ mod tests {
         assert_eq!(stats.optimizer_steps, 2);
         assert!(stats.policy_loss.is_finite());
         assert!(stats.value_loss.is_finite());
+        assert!(stats.short_value_loss.is_finite());
+        assert!(
+            (stats.loss - stats.policy_loss - stats.value_loss - stats.short_value_loss).abs()
+                < 1.0e-5
+        );
         assert!(model.policy_local.iter().any(|&weight| weight != 0.0));
         assert_ne!(model.local_axis_embedding, before_local);
+        assert_ne!(model.short_value_head_output, before_short);
         let (policy, value) = model.evaluate(&Board::new());
         assert_eq!(policy.len(), CELL_COUNT);
         assert!(

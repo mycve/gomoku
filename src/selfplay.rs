@@ -215,6 +215,7 @@ pub fn generate_one_detailed_match_controlled(
             policy_surprise,
             value_surprise: 0.0,
             predicted_value: result.root_value,
+            short_value_wdl: [scalar_value_to_wdl(result.root_value); 3],
         });
         board.play(mv);
     }
@@ -253,8 +254,72 @@ pub fn generate_one_detailed_match_controlled(
             stats.white_value_surprise_sum += s.value_surprise;
         }
     }
+    assign_td_lambda_value_targets(&mut samples, out, 0.95);
+    assign_short_value_targets(&mut samples, out);
     samples.retain(|sample| sample.policy_weight > 0.0 || sample.value_weight > 0.0);
     GeneratedGame { samples, stats }
+}
+
+fn assign_td_lambda_value_targets(samples: &mut [Sample], outcome: Option<Outcome>, lambda: f32) {
+    let Some(last) = samples.last_mut() else {
+        return;
+    };
+    let terminal_value = match outcome {
+        Some(Outcome::Win(player)) if player == last.board.to_move() => 1.0,
+        Some(Outcome::Win(_)) => -1.0,
+        _ => 0.0,
+    };
+    let terminal = scalar_value_to_wdl(terminal_value);
+    last.value_wdl = Some(terminal);
+    last.value = terminal[0] - terminal[2];
+    let lambda = lambda.clamp(0.0, 1.0);
+    let mut next_target = terminal;
+    for index in (0..samples.len().saturating_sub(1)).rev() {
+        let bootstrap = flip_wdl(scalar_value_to_wdl(samples[index + 1].predicted_value));
+        let continuation = flip_wdl(next_target);
+        let target = std::array::from_fn(|part| {
+            (1.0 - lambda) * bootstrap[part] + lambda * continuation[part]
+        });
+        samples[index].value_wdl = Some(target);
+        samples[index].value = target[0] - target[2];
+        next_target = target;
+    }
+}
+
+const SHORT_VALUE_HORIZONS: [usize; 3] = [4, 12, 32];
+
+fn scalar_value_to_wdl(value: f32) -> [f32; 3] {
+    let value = value.clamp(-1.0, 1.0);
+    if value >= 0.0 {
+        [value, 1.0 - value, 0.0]
+    } else {
+        [0.0, 1.0 + value, -value]
+    }
+}
+
+fn flip_wdl(wdl: [f32; 3]) -> [f32; 3] {
+    [wdl[2], wdl[1], wdl[0]]
+}
+
+fn assign_short_value_targets(samples: &mut [Sample], outcome: Option<Outcome>) {
+    for (head, horizon) in SHORT_VALUE_HORIZONS.into_iter().enumerate() {
+        let search_weight = 1.0 / (horizon as f32 + 1.0);
+        let mut next_target = None;
+        for sample in samples.iter_mut().rev() {
+            let terminal = match outcome {
+                Some(Outcome::Win(player)) if player == sample.board.to_move() => 1.0,
+                Some(Outcome::Win(_)) => -1.0,
+                _ => 0.0,
+            };
+            let continuation = next_target.map_or_else(|| scalar_value_to_wdl(terminal), flip_wdl);
+            let search = scalar_value_to_wdl(sample.predicted_value);
+            let target = std::array::from_fn(|part| {
+                search_weight * search[part] + (1.0 - search_weight) * continuation[part]
+            });
+            sample.short_value_wdl[head] = target;
+            next_target = Some(target);
+        }
+    }
 }
 
 fn apply_region_opening(board: &mut Board, plies: usize, seed: &mut u64) -> usize {
@@ -339,6 +404,7 @@ pub struct TrainStats {
     pub loss: f32,
     pub policy_loss: f32,
     pub value_loss: f32,
+    pub short_value_loss: f32,
     pub policy_entropy: f32,
     pub value_entropy: f32,
     pub policy_kl: f32,
@@ -633,6 +699,12 @@ mod tests {
                 && sample.value_weight > 0.0
                 && sample.policy_surprise.is_finite()
                 && sample.value_surprise.is_finite()
+        }));
+        assert!(game.samples.iter().all(|sample| {
+            sample
+                .short_value_wdl
+                .iter()
+                .all(|wdl| (wdl.iter().sum::<f32>() - 1.0).abs() < 1.0e-5)
         }));
     }
 }

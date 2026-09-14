@@ -12,14 +12,11 @@ pub struct AzLoopConfig {
     pub replay_path: String,
     pub progress_path: String,
     pub simulations: usize,
-    pub selfplay_white_simulations: usize,
+    pub hidden_size: usize,
     pub seed: u64,
     pub selfplay_samples_per_update: usize,
     pub selfplay_workers: usize,
     pub selfplay_queue_capacity: usize,
-    pub selfplay_current_fraction: f32,
-    pub selfplay_current_white_history_fraction: f32,
-    pub selfplay_paired_history_fraction: f32,
     pub learning_rate: f32,
     pub learning_rate_min: f32,
     pub learning_rate_warmup_steps: usize,
@@ -36,12 +33,6 @@ pub struct AzLoopConfig {
     pub root_dirichlet_total_concentration: f32,
     pub root_exploration_fraction: f32,
     pub root_policy_temperature: f32,
-    pub root_num_symmetries_to_sample: usize,
-    pub use_graph_search: bool,
-    pub graph_search_max_nodes: usize,
-    pub use_lcb_for_selection: bool,
-    pub lcb_stdevs: f32,
-    pub min_visit_prop_for_lcb: f32,
     pub replay_capacity: usize,
     pub replay_warmup_samples: usize,
     pub train_samples_per_update: usize,
@@ -58,29 +49,23 @@ pub struct AzLoopConfig {
     pub arena_promotion_rate: f32,
     pub arena_promotion_confidence_z: f32,
     pub arena_color_score_floor: f32,
-    pub arena_history_size: usize,
-    pub arena_history_score_floor: f32,
-    pub arena_rejection_reset: usize,
     pub tensorboard_logdir: String,
 }
 
 impl Default for AzLoopConfig {
     fn default() -> Self {
         Self {
-            format_version: 18,
+            format_version: 20,
             model_path: "model.safetensors".into(),
             best_model_path: "best.safetensors".into(),
             replay_path: "data/replay.jsonl".into(),
             progress_path: "data/azloop-progress.json".into(),
             simulations: 400,
-            selfplay_white_simulations: 800,
+            hidden_size: 128,
             seed: 20260730,
             selfplay_samples_per_update: 50_000,
             selfplay_workers: 192,
             selfplay_queue_capacity: 0,
-            selfplay_current_fraction: 0.70,
-            selfplay_current_white_history_fraction: 0.20,
-            selfplay_paired_history_fraction: 0.10,
             learning_rate: 0.0008,
             learning_rate_min: 0.0001,
             learning_rate_warmup_steps: 200,
@@ -97,12 +82,6 @@ impl Default for AzLoopConfig {
             root_dirichlet_total_concentration: 10.83,
             root_exploration_fraction: 0.25,
             root_policy_temperature: 1.1,
-            root_num_symmetries_to_sample: 4,
-            use_graph_search: true,
-            graph_search_max_nodes: 65_536,
-            use_lcb_for_selection: true,
-            lcb_stdevs: 3.0,
-            min_visit_prop_for_lcb: 0.15,
             replay_capacity: 500_000,
             replay_warmup_samples: 100_000,
             train_samples_per_update: 50_000,
@@ -110,7 +89,7 @@ impl Default for AzLoopConfig {
             replay_recent_updates: 5,
             replay_policy_surprise_fraction: 0.4,
             replay_value_surprise_fraction: 0.1,
-            checkpoint_interval: 20,
+            checkpoint_interval: 0,
             checkpoint_dir: "checkpoints".into(),
             max_checkpoints: 20,
             arena_interval: 10,
@@ -119,9 +98,6 @@ impl Default for AzLoopConfig {
             arena_promotion_rate: 0.50,
             arena_promotion_confidence_z: 1.28,
             arena_color_score_floor: 0.45,
-            arena_history_size: 2,
-            arena_history_score_floor: 0.45,
-            arena_rejection_reset: 3,
             tensorboard_logdir: "runs/gomoku".into(),
         }
     }
@@ -157,24 +133,12 @@ impl AzLoopConfig {
             ),
             ("root_exploration_fraction", self.root_exploration_fraction),
             ("root_policy_temperature", self.root_policy_temperature),
-            ("lcb_stdevs", self.lcb_stdevs),
-            ("min_visit_prop_for_lcb", self.min_visit_prop_for_lcb),
             ("arena_promotion_rate", self.arena_promotion_rate),
             (
                 "arena_promotion_confidence_z",
                 self.arena_promotion_confidence_z,
             ),
             ("arena_color_score_floor", self.arena_color_score_floor),
-            ("selfplay_current_fraction", self.selfplay_current_fraction),
-            (
-                "selfplay_current_white_history_fraction",
-                self.selfplay_current_white_history_fraction,
-            ),
-            (
-                "selfplay_paired_history_fraction",
-                self.selfplay_paired_history_fraction,
-            ),
-            ("arena_history_score_floor", self.arena_history_score_floor),
             (
                 "replay_recent_sample_fraction",
                 self.replay_recent_sample_fraction,
@@ -193,13 +157,13 @@ impl AzLoopConfig {
                 return Err(io::Error::other(format!("配置 `{name}` 必须是有限数值")));
             }
         }
-        if self.format_version != 18 {
+        if self.format_version != 20 {
             return Err(io::Error::other(
-                "仅支持 format_version = 18；请升级配置后继续，v25 模型、Replay 和进度无需清理",
+                "仅支持 format_version = 20；请重新生成配置",
             ));
         }
         if self.simulations == 0
-            || self.selfplay_white_simulations == 0
+            || self.hidden_size == 0
             || self.selfplay_samples_per_update == 0
             || self.replay_warmup_samples == 0
             || self.batch_epochs == 0
@@ -222,31 +186,16 @@ impl AzLoopConfig {
             || self.temperature_endgame < 0.0
             || self.root_dirichlet_total_concentration < 0.0
             || self.root_policy_temperature <= 0.0
-            || self.lcb_stdevs < 0.0
-            || !(0.0..=1.0).contains(&self.min_visit_prop_for_lcb)
             || !(0.0..=1.0).contains(&self.root_exploration_fraction)
             || !(0.0..=1.0).contains(&self.arena_promotion_rate)
             || !(0.0..=1.0).contains(&self.arena_color_score_floor)
             || self.arena_promotion_confidence_z < 0.0
-            || !(0.0..=1.0).contains(&self.arena_history_score_floor)
             || !(0.0..=1.0).contains(&self.replay_recent_sample_fraction)
             || !(0.0..=1.0).contains(&self.replay_policy_surprise_fraction)
             || !(0.0..=1.0).contains(&self.replay_value_surprise_fraction)
         {
             return Err(io::Error::other(
                 "配置中的学习率、搜索或比例参数超出合法范围",
-            ));
-        }
-        let league_fraction = self.selfplay_current_fraction
-            + self.selfplay_current_white_history_fraction
-            + self.selfplay_paired_history_fraction;
-        if self.selfplay_current_fraction < 0.0
-            || self.selfplay_current_white_history_fraction < 0.0
-            || self.selfplay_paired_history_fraction < 0.0
-            || (league_fraction - 1.0).abs() > 1.0e-5
-        {
-            return Err(io::Error::other(
-                "三项 selfplay 联赛比例必须非负且总和等于 1",
             ));
         }
         if self.arena_interval > 0 && self.arena_games == 0 {
@@ -262,34 +211,21 @@ impl AzLoopConfig {
                 "Policy 和 Value surprise 抽样比例之和不能超过 1",
             ));
         }
-        if !(1..=8).contains(&self.root_num_symmetries_to_sample) {
-            return Err(io::Error::other(
-                "root_num_symmetries_to_sample 必须在 1..=8",
-            ));
-        }
-        if self.use_graph_search && self.graph_search_max_nodes == 0 {
-            return Err(io::Error::other(
-                "启用 Graph Search 时 graph_search_max_nodes 必须大于 0",
-            ));
-        }
         Ok(())
     }
 }
 
-const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 18
+const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 20
 model_path = "model.safetensors"
 best_model_path = "best.safetensors"
 replay_path = "data/replay.jsonl"
 progress_path = "data/azloop-progress.json"
 simulations = 400
-selfplay_white_simulations = 800
+hidden_size = 128
 seed = 20260730
 selfplay_samples_per_update = 50000
 selfplay_workers = 192
 selfplay_queue_capacity = 0
-selfplay_current_fraction = 0.699999988079071
-selfplay_current_white_history_fraction = 0.20000000298023224
-selfplay_paired_history_fraction = 0.10000000149011612
 learning_rate = 0.0008
 learning_rate_min = 0.0001
 learning_rate_warmup_steps = 200
@@ -306,12 +242,6 @@ temperature_decay_plies = 8
 root_dirichlet_total_concentration = 10.83
 root_exploration_fraction = 0.25
 root_policy_temperature = 1.1
-root_num_symmetries_to_sample = 4
-use_graph_search = true
-graph_search_max_nodes = 65536
-use_lcb_for_selection = true
-lcb_stdevs = 3.0
-min_visit_prop_for_lcb = 0.15
 replay_capacity = 500000
 replay_warmup_samples = 100000
 train_samples_per_update = 50000
@@ -319,7 +249,7 @@ replay_recent_sample_fraction = 0.4
 replay_recent_updates = 5
 replay_policy_surprise_fraction = 0.4
 replay_value_surprise_fraction = 0.1
-checkpoint_interval = 20
+checkpoint_interval = 0
 checkpoint_dir = "checkpoints"
 max_checkpoints = 20
 arena_interval = 10
@@ -328,9 +258,6 @@ arena_opening_plies = 2
 arena_promotion_rate = 0.5
 arena_promotion_confidence_z = 1.2799999713897705
 arena_color_score_floor = 0.45
-arena_history_size = 2
-arena_history_score_floor = 0.45
-arena_rejection_reset = 3
 tensorboard_logdir = "runs/gomoku"
 "#;
 
@@ -342,11 +269,11 @@ mod tests {
     fn default_text_is_exact_and_valid() {
         let config: AzLoopConfig = toml::from_str(DEFAULT_CONFIG_TEXT).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.format_version, 18);
+        assert_eq!(config.format_version, 20);
         assert_eq!(config.batch_size, 1024);
+        assert_eq!(config.hidden_size, 128);
         assert_eq!(config.selfplay_samples_per_update, 50_000);
         assert_eq!(config.selfplay_workers, 192);
-        assert_eq!(config.selfplay_white_simulations, 800);
         assert_eq!(config.arena_games, 200);
         assert_eq!(config.replay_capacity, 500_000);
         assert_eq!(config.replay_warmup_samples, 100_000);

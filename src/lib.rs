@@ -3,6 +3,7 @@ pub mod az_loop;
 pub mod az_loop_config;
 pub mod candle_train;
 pub mod distill;
+mod fused_feature_pool;
 pub mod game;
 pub mod gomocup;
 pub mod mcts;

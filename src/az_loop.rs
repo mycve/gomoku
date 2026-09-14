@@ -1,15 +1,14 @@
 use crate::{
-    async_selfplay::{AsyncSelfplay, SelfplayGame, SelfplayLeagueConfig},
+    async_selfplay::{AsyncSelfplay, SelfplayGame},
     az_loop_config::AzLoopConfig,
     candle_train,
     mcts::SearchConfig,
-    model::PolicyValueModel,
+    model::{PolicyValueArch, PolicyValueModel},
     replay,
     selfplay::{SelfplayStats, arena_controlled},
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::VecDeque,
     fs, io,
     path::{Path, PathBuf},
     sync::{
@@ -58,7 +57,6 @@ struct TrainerEvent {
 
 enum TrainerCommand {
     Continue,
-    Reset(PolicyValueModel),
 }
 
 pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()> {
@@ -72,14 +70,17 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     })
     .map_err(io::Error::other)?;
     let mut progress = load_progress(&config.progress_path)?;
-    let initial_model = load_or_init(&config.model_path)?;
+    let arch = PolicyValueArch::with_hidden_size(config.hidden_size);
+    arch.validate()?;
+    let initial_model = load_or_init(&config.model_path, arch, config.seed)?;
     let mut best = if Path::new(&config.best_model_path).exists() {
-        PolicyValueModel::load(&config.best_model_path)?
+        let model = PolicyValueModel::load(&config.best_model_path)?;
+        ensure_arch(&model, arch, &config.best_model_path)?;
+        model
     } else {
         initial_model.save(&config.best_model_path)?;
         initial_model.clone()
     };
-    let mut champion_history = load_champion_history(&config, &best)?;
     let initial_pool = if Path::new(&config.replay_path).exists() {
         let pool = replay::load(&config.replay_path)?;
         fs::remove_file(&config.replay_path)?;
@@ -128,25 +129,13 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         config.root_exploration_fraction
     );
     println!("opening  : pure_selfplay=true start=empty_board");
+    println!("network  : nnue hidden_size={}", arch.hidden_size);
     println!(
-        "search   : black_sims={} white_sims={} cpuct={:.2}+{:.2}log/base{:.0} graph={} lcb={} symmetries={}",
-        config.simulations,
-        config.selfplay_white_simulations,
-        config.cpuct,
-        config.cpuct_log,
-        config.cpuct_base,
-        config.use_graph_search,
-        config.use_lcb_for_selection,
-        config.root_num_symmetries_to_sample
+        "search   : sims={} cpuct={:.2}+{:.2}log/base{:.0}",
+        config.simulations, config.cpuct, config.cpuct_log, config.cpuct_base
     );
-    println!(
-        "league   : current={:.0}% current_white_vs_history={:.0}% paired_history={:.0}% histories={}",
-        config.selfplay_current_fraction * 100.0,
-        config.selfplay_current_white_history_fraction * 100.0,
-        config.selfplay_paired_history_fraction * 100.0,
-        champion_history.len(),
-    );
-    println!("targets  : policy=mcts_visits value=terminal_wdl model=online");
+    println!("selfplay : latest learner is published to actors after every update");
+    println!("targets  : policy=mcts_visits value=td_lambda(0.95) short_value=4/12/32ply");
     println!(
         "lr       : warmup={} cosine={} min={:.6} peak={:.6} resumed_steps={}",
         config.learning_rate_warmup_steps,
@@ -155,14 +144,10 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         config.learning_rate,
         progress.optimizer_steps
     );
-    let published = Arc::new(RwLock::new(best.clone()));
-    let published_history = Arc::new(RwLock::new(
-        champion_history.iter().cloned().collect::<Vec<_>>(),
-    ));
+    let published = Arc::new(RwLock::new(initial_model.clone()));
     let version = Arc::new(AtomicU64::new(progress.update as u64));
     let mut actors = AsyncSelfplay::start(
         Arc::clone(&published),
-        Arc::clone(&published_history),
         Arc::clone(&version),
         Arc::clone(&stop),
         workers,
@@ -175,23 +160,11 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             root_dirichlet_total_concentration: config.root_dirichlet_total_concentration,
             root_exploration_fraction: config.root_exploration_fraction,
             root_policy_temperature: config.root_policy_temperature,
-            root_num_symmetries_to_sample: config.root_num_symmetries_to_sample,
-            use_graph_search: config.use_graph_search,
-            graph_search_max_nodes: config.graph_search_max_nodes,
-            use_lcb_for_selection: config.use_lcb_for_selection,
-            lcb_stdevs: config.lcb_stdevs,
-            min_visit_prop_for_lcb: config.min_visit_prop_for_lcb,
             temperature_start: config.temperature_start,
             temperature_endgame: config.temperature_endgame,
             temperature_decay_delay_plies: config.temperature_decay_delay_plies,
             temperature_decay_plies: config.temperature_decay_plies,
             ..Default::default()
-        },
-        SelfplayLeagueConfig {
-            white_simulations: config.selfplay_white_simulations,
-            current_selfplay_fraction: config.selfplay_current_fraction,
-            current_white_history_fraction: config.selfplay_current_white_history_fraction,
-            paired_history_fraction: config.selfplay_paired_history_fraction,
         },
         config.seed,
     );
@@ -324,13 +297,6 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 index += 1;
                 match trainer_ack_rx.recv() {
                     Ok(TrainerCommand::Continue) => {}
-                    Ok(TrainerCommand::Reset(champion)) => {
-                        model = champion;
-                        training = candle_train::TrainingSession::new(
-                            &model,
-                            current_lr(&trainer_config, optimizer_steps),
-                        )?;
-                    }
                     Err(_) => break,
                 }
             }
@@ -353,13 +319,12 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     let train_device = candle_train::training_device_name()?;
     let end = target_update.unwrap_or(usize::MAX);
     println!(
-        "loop     : mode=batch-async actors={} actor_queue={}(nonblocking-drop) collector_queue=1(nonblocking-drop) trainer_queue=rendezvous warmup={} samples/update>={} sims={}/{} train_device={} batch={} arena_opening_plies={}",
+        "loop     : mode=continuous actors={} actor_queue={}(nonblocking-drop) collector_queue=1 trainer_queue=rendezvous warmup={} samples/update>={} sims={} train_device={} batch={} arena_opening_plies={}",
         workers,
         queue_capacity,
         config.replay_warmup_samples,
         config.selfplay_samples_per_update,
         config.simulations,
-        config.selfplay_white_simulations,
         train_device,
         config.batch_size,
         config.arena_opening_plies
@@ -389,10 +354,10 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         progress.total_samples += event.batch.samples.len();
         progress.optimizer_steps += event.train_stats.optimizer_steps;
         progress.learning_rate = event.learning_rate;
-        // generation 表示数据产生的训练 update，用于 replay 的近期窗口；
-        // published 模型仍然只在 Arena 晋升时替换。
+        // generation 表示数据产生的训练 update，用于 replay 的近期窗口。
+        // 候选网络持续推送给 actor；磁盘上对外发布的仍只有 best。
         version.store(progress.update as u64, Ordering::Release);
-        event.model.save(&config.model_path)?;
+        *published.write().unwrap_or_else(|e| e.into_inner()) = event.model.clone();
         save_progress(&config.progress_path, &progress)?;
         let checkpoint = if config.checkpoint_interval > 0
             && progress.update % config.checkpoint_interval == 0
@@ -421,6 +386,11 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
         tb.add_scalar(
             "train/value_loss",
             event.train_stats.value_loss,
+            progress.update,
+        );
+        tb.add_scalar(
+            "train/short_value_loss",
+            event.train_stats.short_value_loss,
             progress.update,
         );
         tb.add_scalar(
@@ -501,21 +471,6 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             progress.update,
         );
         tb.add_scalar("selfplay/games", event.batch.games as f32, progress.update);
-        tb.add_scalar(
-            "selfplay/current_selfplay_rate",
-            event.batch.stats.current_selfplay_games as f32 / games,
-            progress.update,
-        );
-        tb.add_scalar(
-            "selfplay/current_white_history_rate",
-            event.batch.stats.current_white_history_games as f32 / games,
-            progress.update,
-        );
-        tb.add_scalar(
-            "selfplay/paired_history_rate",
-            event.batch.stats.paired_history_games as f32 / games,
-            progress.update,
-        );
         tb.add_scalar(
             "selfplay/samples",
             event.batch.samples.len() as f32,
@@ -698,22 +653,13 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             progress.total_samples as f32,
             progress.update,
         );
-        let mut trainer_command = TrainerCommand::Continue;
+        let trainer_command = TrainerCommand::Continue;
         if config.arena_interval > 0 && progress.update % config.arena_interval == 0 {
             let arena_started = Instant::now();
-            // arena_games 始终完整用于当前冠军；历史冠军是额外的防遗忘门槛，
-            // 不能稀释主晋升检验的样本量。
-            let (current_games, history_games) =
-                arena_game_budget(config.arena_games, champion_history.len());
+            let current_games = config.arena_games;
             println!(
-                "arena    : starting current_games={} history_games_each={} histories={} simulations={} workers={}",
+                "arena    : starting games={} simulations={} workers={}",
                 current_games,
-                if champion_history.is_empty() {
-                    0
-                } else {
-                    history_games
-                },
-                champion_history.len(),
                 config.simulations,
                 rayon::current_num_threads().min(current_games.max(1))
             );
@@ -723,43 +669,12 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 cpuct_log: config.cpuct_log,
                 cpuct_base: config.cpuct_base,
                 root_policy_temperature: 1.0,
-                root_num_symmetries_to_sample: config.root_num_symmetries_to_sample,
-                use_graph_search: config.use_graph_search,
-                graph_search_max_nodes: config.graph_search_max_nodes,
-                use_lcb_for_selection: config.use_lcb_for_selection,
-                lcb_stdevs: config.lcb_stdevs,
-                min_visit_prop_for_lcb: config.min_visit_prop_for_lcb,
                 opening_random_plies: config.arena_opening_plies,
                 opening_seed: config.seed ^ progress.update as u64,
                 ..Default::default()
             };
             let report =
                 arena_controlled(&event.model, &best, current_games, arena_cfg, Some(&stop));
-            let mut history_passed = true;
-            for (index, champion) in champion_history.iter().enumerate() {
-                let history_report = arena_controlled(
-                    &event.model,
-                    champion,
-                    history_games,
-                    SearchConfig {
-                        opening_seed: arena_cfg.opening_seed ^ ((index as u64 + 1) << 48),
-                        ..arena_cfg
-                    },
-                    Some(&stop),
-                );
-                let passed = history_report.score_rate() >= config.arena_history_score_floor;
-                history_passed &= passed;
-                println!(
-                    "arena-history {}: W/L/D={}/{}/{} rate={:.2}% floor={:.2}% passed={}",
-                    index + 1,
-                    history_report.wins,
-                    history_report.losses,
-                    history_report.draws,
-                    history_report.score_rate() * 100.0,
-                    config.arena_history_score_floor * 100.0,
-                    passed,
-                );
-            }
             let arena_seconds = arena_started.elapsed().as_secs_f32();
             let lower_bound = report.score_rate_lower_bound(config.arena_promotion_confidence_z);
             let overall_passed = report.promotes_with_lower_bound(
@@ -769,7 +684,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             let score_as_black = report.score_as_black();
             let score_as_white = report.score_as_white();
             let color_passed = report.passes_color_floor(config.arena_color_score_floor);
-            let promoted = overall_passed && color_passed && history_passed;
+            let promoted = overall_passed && color_passed;
             println!(
                 "arena    : W/L/D={}/{}/{} score={:.2}% lower={:.2}% target={:.2}% overall_passed={} elo={:+.1} promoted={}",
                 report.wins,
@@ -855,12 +770,8 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             tb.add_scalar("arena/score_as_black", score_as_black, progress.update);
             tb.add_scalar("arena/score_as_white", score_as_white, progress.update);
             if promoted {
-                push_champion_history(&config, &mut champion_history, &best)?;
                 best = event.model.clone();
                 best.save(&config.best_model_path)?;
-                *published.write().unwrap_or_else(|e| e.into_inner()) = best.clone();
-                *published_history.write().unwrap_or_else(|e| e.into_inner()) =
-                    champion_history.iter().cloned().collect();
                 progress.consecutive_rejections = 0;
                 println!(
                     "promote  : best={} model_version={}",
@@ -868,13 +779,6 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                 );
             } else {
                 progress.consecutive_rejections += 1;
-                if config.arena_rejection_reset > 0
-                    && progress.consecutive_rejections >= config.arena_rejection_reset
-                {
-                    trainer_command = TrainerCommand::Reset(best.clone());
-                    progress.consecutive_rejections = 0;
-                    println!("rollback : trainer reset to current champion");
-                }
             }
             save_progress(&config.progress_path, &progress)?;
         }
@@ -896,6 +800,12 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     trainer
         .join()
         .map_err(|_| io::Error::other("Trainer 线程异常退出"))??;
+    // model_path 只是停机续训快照，下次启动后立即消费并删除；
+    // 长期存在、供引擎使用的模型只有 best.safetensors。
+    published
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .save(&config.model_path)?;
     if !interrupted.load(Ordering::SeqCst) && Path::new(&config.replay_path).exists() {
         fs::remove_file(&config.replay_path)?;
     }
@@ -945,13 +855,6 @@ fn print_event(
         event.batch.stats.white_wins,
         event.batch.stats.draws,
         event.batch.stats.plies as f32 / event.batch.games.max(1) as f32
-    );
-    println!(
-        "league   : current={:.1}% current_white_history={:.1}% paired_history={:.1}%",
-        event.batch.stats.current_selfplay_games as f32 * 100.0 / event.batch.games.max(1) as f32,
-        event.batch.stats.current_white_history_games as f32 * 100.0
-            / event.batch.games.max(1) as f32,
-        event.batch.stats.paired_history_games as f32 * 100.0 / event.batch.games.max(1) as f32,
     );
     println!(
         "side     : searches={}/{} avg_sims={:.1}/{:.1} entropy={:.3}/{:.3} policy_surprise={:.3}/{:.3} value_surprise={:.3}/{:.3}",
@@ -1011,7 +914,7 @@ fn print_event(
         event.train_samples as f32 / event.batch.samples.len().max(1) as f32
     );
     println!(
-        "train    : device={} samples={} steps={} total_steps={} lr={:.6} loss={:.4} policy={:.4}(H={:.4} KL={:.4}) value={:.4}(H={:.4} KL={:.4}) sample={:.3}s time={:.2}s sps={:.1}",
+        "train    : device={} samples={} steps={} total_steps={} lr={:.6} loss={:.4} policy={:.4}(H={:.4} KL={:.4}) value={:.4}(H={:.4} KL={:.4}) short={:.4} sample={:.3}s time={:.2}s sps={:.1}",
         device,
         event.train_stats.samples,
         event.train_stats.optimizer_steps,
@@ -1024,6 +927,7 @@ fn print_event(
         event.train_stats.value_loss,
         event.train_stats.value_entropy,
         event.train_stats.value_kl,
+        event.train_stats.short_value_loss,
         event.sampling_seconds,
         event.train_seconds,
         event.train_stats.samples as f32 / event.train_seconds.max(1e-6)
@@ -1044,23 +948,28 @@ fn current_lr(c: &AzLoopConfig, optimizer_step: usize) -> f32 {
     c.learning_rate_min + (c.learning_rate - c.learning_rate_min) * cosine
 }
 
-fn arena_game_budget(current_games: usize, histories: usize) -> (usize, usize) {
-    let history_games = if histories == 0 {
-        0
+fn load_or_init(path: &str, arch: PolicyValueArch, seed: u64) -> io::Result<PolicyValueModel> {
+    if Path::new(path).exists() {
+        let model = PolicyValueModel::load(path)?;
+        ensure_arch(&model, arch, path)?;
+        fs::remove_file(path)?;
+        println!("resume   : consumed {path} into memory");
+        Ok(model)
     } else {
-        current_games.div_ceil(2).div_ceil(histories).max(2)
-    };
-    (current_games, history_games)
+        Ok(PolicyValueModel::random_with_arch(arch, seed))
+    }
 }
 
-fn load_or_init(path: &str) -> io::Result<PolicyValueModel> {
-    if Path::new(path).exists() {
-        PolicyValueModel::load(path)
-    } else {
-        let m = PolicyValueModel::default();
-        m.save(path)?;
-        Ok(m)
+fn ensure_arch(model: &PolicyValueModel, expected: PolicyValueArch, path: &str) -> io::Result<()> {
+    if model.arch() != expected {
+        return Err(io::Error::other(format!(
+            "模型 `{path}` 架构 {:?} 与配置 {:?} 不一致；续训旧模型时请把 hidden_size 设为 {}",
+            model.arch(),
+            expected,
+            model.hidden_size
+        )));
     }
+    Ok(())
 }
 fn load_progress(path: &str) -> io::Result<Progress> {
     if !Path::new(path).exists() {
@@ -1104,43 +1013,6 @@ fn prune_checkpoints(c: &AzLoopConfig) -> io::Result<()> {
     Ok(())
 }
 
-fn champion_history_path(config: &AzLoopConfig, index: usize) -> PathBuf {
-    Path::new(&config.checkpoint_dir).join(format!("champion-history-{}.safetensors", index + 1))
-}
-
-fn load_champion_history(
-    config: &AzLoopConfig,
-    _current: &PolicyValueModel,
-) -> io::Result<VecDeque<PolicyValueModel>> {
-    let mut history = VecDeque::new();
-    for index in 0..config.arena_history_size {
-        let path = champion_history_path(config, index);
-        if !path.exists() {
-            break;
-        }
-        history.push_back(PolicyValueModel::load(path)?);
-    }
-    Ok(history)
-}
-
-fn push_champion_history(
-    config: &AzLoopConfig,
-    history: &mut VecDeque<PolicyValueModel>,
-    champion: &PolicyValueModel,
-) -> io::Result<()> {
-    if config.arena_history_size == 0 {
-        history.clear();
-        return Ok(());
-    }
-    history.push_front(champion.clone());
-    history.truncate(config.arena_history_size);
-    fs::create_dir_all(&config.checkpoint_dir)?;
-    for (index, model) in history.iter().enumerate() {
-        model.save(champion_history_path(config, index))?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1154,12 +1026,5 @@ mod tests {
         assert!((current_lr(&config, 5_200) - 0.00045).abs() < 1e-8);
         assert!((current_lr(&config, 10_200) - 0.0001).abs() < 1e-8);
         assert!((current_lr(&config, 20_000) - 0.0001).abs() < 1e-8);
-    }
-
-    #[test]
-    fn arena_history_does_not_reduce_current_champion_games() {
-        assert_eq!(arena_game_budget(200, 0), (200, 0));
-        assert_eq!(arena_game_budget(200, 1), (200, 100));
-        assert_eq!(arena_game_budget(200, 2), (200, 50));
     }
 }

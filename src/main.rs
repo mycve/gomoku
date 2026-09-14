@@ -300,8 +300,8 @@ fn main() -> io::Result<()> {
                 (samples.len() * args.epochs) as f64 / seconds.max(1e-9)
             );
             println!(
-                "loss     : total={:.4} policy={:.4} value={:.4}",
-                stats.loss, stats.policy_loss, stats.value_loss
+                "loss     : total={:.4} policy={:.4} value={:.4} short={:.4}",
+                stats.loss, stats.policy_loss, stats.value_loss, stats.short_value_loss
             );
         }
         Some(Command::AzDistill(args)) => {

@@ -181,6 +181,7 @@ pub fn load_npz_with_stats(
             policy_surprise: 0.0,
             value_surprise: 0.0,
             predicted_value: 0.0,
+            short_value_wdl: [wdl; 3],
         });
         stats.accepted += 1;
         stats.policy_mass_total += total_mass;

@@ -7,9 +7,11 @@ pub const MOVE_COUNT_INPUT: usize = CELL_COUNT * 2;
 pub const ROLE_INPUT_START: usize = MOVE_COUNT_INPUT + 1;
 pub const ROLE_COUNT: usize = 2;
 pub const INPUT_SIZE: usize = ROLE_INPUT_START + ROLE_COUNT;
-pub const DEFAULT_HIDDEN_SIZE: usize = 192;
-pub const VALUE_HEAD_SIZE: usize = 64;
+/// 与 chineseai 默认主干宽度一致；五子棋保留自己的盘面和局部战术特征。
+pub const DEFAULT_HIDDEN_SIZE: usize = 128;
+pub const VALUE_HEAD_SIZE: usize = 96;
 pub const WDL_SIZE: usize = 3;
+pub const SHORT_VALUE_HEADS: usize = 3;
 pub const STONE_TYPES: usize = 2;
 pub const AXIS_FEATURES: usize = STONE_TYPES * 15;
 pub const DIAGONAL_FEATURES: usize = STONE_TYPES * (BOARD_SIZE * 2 - 1);
@@ -17,18 +19,52 @@ pub const LOCAL_AXES: usize = 4;
 pub const LOCAL_RADIUS: usize = 4;
 pub const LOCAL_RAY_PATTERNS: usize = 4usize.pow(LOCAL_RADIUS as u32);
 pub const LOCAL_AXIS_PATTERNS: usize = LOCAL_RAY_PATTERNS * (LOCAL_RAY_PATTERNS + 1) / 2;
-pub const LOCAL_AXIS_FEATURE_SIZE: usize = 8;
+/// 五子棋的主要容量放在 32,896 种精确方向棋形上，
+/// 类似 chineseai 把大部分参数放在稀疏战术表，而不是盲目加宽稠密主干。
+pub const LOCAL_AXIS_FEATURE_SIZE: usize = 16;
 pub const LOCAL_CANDIDATE_SIZE: usize = LOCAL_AXIS_FEATURE_SIZE * 2;
 pub const VALUE_LOCAL_SIZE: usize = LOCAL_CANDIDATE_SIZE * 2;
 /// Policy 只保留一个很窄的上下文投影；大容量主干专供可增量更新的 value。
-pub const POLICY_HEAD_SIZE: usize = 16;
+pub const POLICY_HEAD_SIZE: usize = 32;
+/// 大容量表直接输出策略 logit，不展开为宽激活。
+pub const POLICY_TACTICAL_SIZE: usize = 1 << 22;
 pub const ROLE_ADAPTER_RANK: usize = 8;
 pub const REGION_COUNT: usize = 9;
 pub const REGION_FEATURE_SIZE: usize = 8;
 pub const REGION_TOTAL_SIZE: usize = REGION_COUNT * REGION_FEATURE_SIZE;
-const FORMAT_VERSION: f32 = 25.0;
+const FORMAT_VERSION: f32 = 28.0;
 const LOCAL_BOUNDARY: u8 = u8::MAX;
 const LOCAL_NEIGHBORS: [u8; CELL_COUNT * LOCAL_AXES * 2 * LOCAL_RADIUS] = build_local_neighbors();
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PolicyValueArch {
+    pub hidden_size: usize,
+}
+
+impl PolicyValueArch {
+    pub const fn default_const() -> Self {
+        Self {
+            hidden_size: DEFAULT_HIDDEN_SIZE,
+        }
+    }
+
+    pub const fn with_hidden_size(hidden_size: usize) -> Self {
+        Self { hidden_size }
+    }
+
+    pub fn validate(self) -> io::Result<()> {
+        if self.hidden_size == 0 {
+            return Err(io::Error::other("hidden_size 必须大于 0"));
+        }
+        Ok(())
+    }
+}
+
+impl Default for PolicyValueArch {
+    fn default() -> Self {
+        Self::default_const()
+    }
+}
 
 const fn build_local_neighbors() -> [u8; CELL_COUNT * LOCAL_AXES * 2 * LOCAL_RADIUS] {
     let mut table = [LOCAL_BOUNDARY; CELL_COUNT * LOCAL_AXES * 2 * LOCAL_RADIUS];
@@ -84,6 +120,7 @@ pub struct PolicyValueModel {
     pub(crate) policy_dynamic: Vec<f32>,
     pub(crate) policy_output: Vec<f32>,
     pub(crate) policy_bias: Vec<f32>,
+    pub(crate) policy_tactical: Vec<f32>,
     pub(crate) local_axis_embedding: Vec<f32>,
     pub(crate) local_axis_scale: Vec<f32>,
     pub(crate) local_axis_bias: Vec<f32>,
@@ -96,6 +133,9 @@ pub struct PolicyValueModel {
     pub(crate) value_head_hidden2: Vec<f32>,
     pub(crate) value_head_bias2: Vec<f32>,
     pub(crate) value_head_output: Vec<f32>,
+    /// 训练专用的 4/12/32 ply 短期价值头，推理不读取。
+    pub(crate) short_value_head_output: Vec<f32>,
+    pub(crate) short_value_head_bias: Vec<f32>,
 }
 
 #[derive(Clone)]
@@ -156,6 +196,15 @@ impl Default for PolicyValueModel {
 }
 
 impl PolicyValueModel {
+    pub fn arch(&self) -> PolicyValueArch {
+        PolicyValueArch::with_hidden_size(self.hidden_size)
+    }
+
+    pub fn random_with_arch(arch: PolicyValueArch, seed: u64) -> Self {
+        arch.validate().expect("五子棋网络架构必须合法");
+        Self::random(arch.hidden_size, seed)
+    }
+
     pub fn random(hidden_size: usize, seed: u64) -> Self {
         let hidden_size = hidden_size.max(1);
         let mut rng = SplitMix64(seed);
@@ -192,6 +241,7 @@ impl PolicyValueModel {
                 .map(|_| rng.weight((2.0 / POLICY_HEAD_SIZE as f32).sqrt() * 0.25))
                 .collect(),
             policy_bias,
+            policy_tactical: vec![0.0; POLICY_TACTICAL_SIZE],
             local_axis_embedding: (0..LOCAL_AXIS_PATTERNS * LOCAL_AXIS_FEATURE_SIZE)
                 .map(|_| rng.weight((2.0 / LOCAL_AXIS_FEATURE_SIZE as f32).sqrt() * 0.25))
                 .collect(),
@@ -210,6 +260,8 @@ impl PolicyValueModel {
                 .collect(),
             value_head_bias2: vec![0.0; VALUE_HEAD_SIZE],
             value_head_output: vec![0.0; VALUE_HEAD_SIZE * WDL_SIZE],
+            short_value_head_output: vec![0.0; SHORT_VALUE_HEADS * WDL_SIZE * VALUE_HEAD_SIZE],
+            short_value_head_bias: vec![0.0; SHORT_VALUE_HEADS * WDL_SIZE],
         };
         model.refresh_local_axis_features();
         model
@@ -321,19 +373,25 @@ impl PolicyValueModel {
                 };
             }
             for &mv in &moves {
-                let (winning_us, winning_them) = self.local_candidate_into(
+                let (winning_us, winning_them, tactical) = self.local_candidate_into(
                     &scratch.local_states,
                     mv,
                     &mut scratch.local_candidate,
                 );
                 scratch.winning_us[mv.0] = winning_us;
                 scratch.winning_them[mv.0] = winning_them;
-                scratch.logits.push(self.policy_logit(
-                    &scratch.policy_global,
-                    &scratch.policy_dynamic,
-                    &scratch.local_candidate,
-                    mv,
-                ));
+                let tactical_logit = tactical
+                    .into_iter()
+                    .map(|index| self.policy_tactical[index])
+                    .sum::<f32>();
+                scratch.logits.push(
+                    self.policy_logit(
+                        &scratch.policy_global,
+                        &scratch.policy_dynamic,
+                        &scratch.local_candidate,
+                        mv,
+                    ) + tactical_logit,
+                );
                 for (i, &value) in scratch.local_candidate.iter().enumerate() {
                     scratch.local_value[i] += value;
                     scratch.local_value[LOCAL_CANDIDATE_SIZE + i] =
@@ -615,23 +673,30 @@ impl PolicyValueModel {
         }
     }
 
-    fn local_candidate_into(&self, states: &[u8], mv: Move, output: &mut [f32]) -> (bool, bool) {
+    fn local_candidate_into(
+        &self,
+        states: &[u8],
+        mv: Move,
+        output: &mut [f32],
+    ) -> (bool, bool, [usize; LOCAL_AXES]) {
         output.fill(0.0);
         let (mean, max) = output.split_at_mut(LOCAL_AXIS_FEATURE_SIZE);
         max.fill(f32::NEG_INFINITY);
         let mut winning_us = false;
         let mut winning_them = false;
         let mut feature_starts = [0; LOCAL_AXES];
+        let mut tactical = [0; LOCAL_AXES];
         for axis in 0..LOCAL_AXES {
             let (first_code, second_code) = local_ray_codes_from_states(states, mv, axis);
             winning_us |= ray_prefix(first_code, 1) + ray_prefix(second_code, 1) >= 4;
             winning_them |= ray_prefix(first_code, 2) + ray_prefix(second_code, 2) >= 4;
             let pattern = second_code * (second_code + 1) / 2 + first_code;
+            tactical[axis] = policy_tactical_index(mv, axis, pattern);
             feature_starts[axis] =
                 ((axis / 2) * LOCAL_AXIS_PATTERNS + pattern) * LOCAL_AXIS_FEATURE_SIZE;
         }
         aggregate_axis_features(&self.local_axis_features, feature_starts, mean, max);
-        (winning_us, winning_them)
+        (winning_us, winning_them, tactical)
     }
 
     pub(crate) fn refresh_local_axis_features(&mut self) {
@@ -744,6 +809,12 @@ impl PolicyValueModel {
         insert(&vars, "policy_bias", &self.policy_bias, (CELL_COUNT,))?;
         insert(
             &vars,
+            "policy_tactical",
+            &self.policy_tactical,
+            (POLICY_TACTICAL_SIZE,),
+        )?;
+        insert(
+            &vars,
             "local_axis_embedding",
             &self.local_axis_embedding,
             (LOCAL_AXIS_PATTERNS, LOCAL_AXIS_FEATURE_SIZE),
@@ -808,6 +879,18 @@ impl PolicyValueModel {
             &self.value_head_output,
             (WDL_SIZE, VALUE_HEAD_SIZE),
         )?;
+        insert(
+            &vars,
+            "short_value_head_output",
+            &self.short_value_head_output,
+            (SHORT_VALUE_HEADS, WDL_SIZE, VALUE_HEAD_SIZE),
+        )?;
+        insert(
+            &vars,
+            "short_value_head_bias",
+            &self.short_value_head_bias,
+            (SHORT_VALUE_HEADS, WDL_SIZE),
+        )?;
         vars.save(path).map_err(candle_error)
     }
 
@@ -848,6 +931,7 @@ impl PolicyValueModel {
             policy_dynamic: load(&tensors, "policy_dynamic")?,
             policy_output: load(&tensors, "policy_output")?,
             policy_bias: load(&tensors, "policy_bias")?,
+            policy_tactical: load(&tensors, "policy_tactical")?,
             local_axis_embedding: load(&tensors, "local_axis_embedding")?,
             local_axis_scale: load(&tensors, "local_axis_scale")?,
             local_axis_bias: load(&tensors, "local_axis_bias")?,
@@ -860,6 +944,8 @@ impl PolicyValueModel {
             value_head_hidden2: load(&tensors, "value_head_hidden2")?,
             value_head_bias2: load(&tensors, "value_head_bias2")?,
             value_head_output: load(&tensors, "value_head_output")?,
+            short_value_head_output: load(&tensors, "short_value_head_output")?,
+            short_value_head_bias: load(&tensors, "short_value_head_bias")?,
         };
         if model.input_hidden.len() != INPUT_SIZE * hidden_size
             || model.stone_hidden.len() != STONE_TYPES * hidden_size
@@ -875,6 +961,7 @@ impl PolicyValueModel {
             || model.policy_dynamic.len() != LOCAL_CANDIDATE_SIZE * POLICY_HEAD_SIZE
             || model.policy_output.len() != CELL_COUNT * POLICY_HEAD_SIZE
             || model.policy_bias.len() != CELL_COUNT
+            || model.policy_tactical.len() != POLICY_TACTICAL_SIZE
             || model.local_axis_embedding.len() != LOCAL_AXIS_PATTERNS * LOCAL_AXIS_FEATURE_SIZE
             || model.local_axis_scale.len() != 2 * LOCAL_AXIS_FEATURE_SIZE
             || model.local_axis_bias.len() != 2 * LOCAL_AXIS_FEATURE_SIZE
@@ -886,6 +973,8 @@ impl PolicyValueModel {
             || model.value_head_hidden2.len() != VALUE_HEAD_SIZE * VALUE_HEAD_SIZE
             || model.value_head_bias2.len() != VALUE_HEAD_SIZE
             || model.value_head_output.len() != VALUE_HEAD_SIZE * WDL_SIZE
+            || model.short_value_head_output.len() != SHORT_VALUE_HEADS * WDL_SIZE * VALUE_HEAD_SIZE
+            || model.short_value_head_bias.len() != SHORT_VALUE_HEADS * WDL_SIZE
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -972,6 +1061,16 @@ fn ray_prefix(mut code: usize, state: usize) -> usize {
         code >>= 2;
     }
     count
+}
+
+pub(crate) fn policy_tactical_index(mv: Move, axis: usize, pattern: usize) -> usize {
+    let mut value = pattern as u64
+        ^ (mv.0 as u64).wrapping_mul(0x9E37_79B9)
+        ^ (axis as u64).wrapping_mul(0x85EB_CA6B);
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value ^= value >> 27;
+    (value as usize) & (POLICY_TACTICAL_SIZE - 1)
 }
 
 #[inline(always)]
@@ -1274,6 +1373,16 @@ mod tests {
     }
 
     #[test]
+    fn short_value_heads_do_not_affect_inference() {
+        let model = PolicyValueModel::random(8, 7);
+        let mut changed = model.clone();
+        changed.short_value_head_output.fill(123.0);
+        changed.short_value_head_bias.fill(-45.0);
+        let board = Board::new();
+        assert_eq!(model.evaluate(&board), changed.evaluate(&board));
+    }
+
+    #[test]
     fn local_axis_encoding_is_reflection_invariant() {
         let mut board = Board::new();
         for text in ["h8", "g8", "i8", "a1", "j8", "a2"] {
@@ -1317,6 +1426,10 @@ mod tests {
             SplitMix64(11).next()
         ));
         let model = PolicyValueModel::random(8, 3);
+        let mut board = Board::new();
+        assert!(board.play(Move::parse("h8").unwrap()));
+        assert!(board.play(Move::parse("h9").unwrap()));
+        let expected_output = model.evaluate(&board);
         model.save(&path).unwrap();
         let restored = PolicyValueModel::load(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
@@ -1330,6 +1443,7 @@ mod tests {
         assert_eq!(restored.role_adapter_up, model.role_adapter_up);
         assert_eq!(restored.region_embedding, model.region_embedding);
         assert_eq!(restored.value_region_hidden, model.value_region_hidden);
+        assert_eq!(restored.evaluate(&board), expected_output);
     }
 
     #[test]

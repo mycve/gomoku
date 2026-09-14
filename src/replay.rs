@@ -19,6 +19,12 @@ pub struct Sample {
     pub policy_surprise: f32,
     pub value_surprise: f32,
     pub predicted_value: f32,
+    #[serde(default = "default_short_value_wdl")]
+    pub short_value_wdl: [[f32; 3]; 3],
+}
+
+fn default_short_value_wdl() -> [[f32; 3]; 3] {
+    [[0.0, 1.0, 0.0]; 3]
 }
 
 impl Sample {
@@ -38,6 +44,7 @@ impl Sample {
             policy_surprise: self.policy_surprise,
             value_surprise: self.value_surprise,
             predicted_value: self.predicted_value,
+            short_value_wdl: self.short_value_wdl,
         }
     }
 }
@@ -252,6 +259,7 @@ mod tests {
             policy_surprise: 0.0,
             value_surprise: 0.0,
             predicted_value: 0.0,
+            short_value_wdl: default_short_value_wdl(),
         }
     }
 
