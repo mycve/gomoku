@@ -307,7 +307,10 @@ fn simulate(
         c
     } else {
         crate::scope_profile!("mcts.create_child");
-        let mut b = nodes[idx].board.clone();
+        let mut b = {
+            crate::scope_profile!("mcts.clone_board");
+            nodes[idx].board.clone()
+        };
         let mv = nodes[idx].children[best].mv;
         assert!(b.play(mv));
         let accumulator_offset = model.accumulator_into_arena(&b, accumulator_arena);

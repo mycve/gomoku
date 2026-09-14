@@ -39,7 +39,11 @@ pub fn chains(cells: &[i8]) -> Vec<Chain> {
 
 /// 仅使用纯空区域证明活棋，比扩展 Benson 保守；绝不依赖对手配合。
 pub fn pass_alive(cells: &[i8]) -> [bool; CELL_COUNT] {
-    let groups = chains(cells);
+    crate::scope_profile!("scoring.pass_alive");
+    pass_alive_with_chains(cells, &chains(cells))
+}
+
+pub(crate) fn pass_alive_with_chains(cells: &[i8], groups: &[Chain]) -> [bool; CELL_COUNT] {
     let mut at = [usize::MAX; CELL_COUNT];
     for (i, chain) in groups.iter().enumerate() {
         for &s in &chain.stones {
@@ -120,6 +124,7 @@ pub struct Analysis {
 }
 
 pub fn analyze(board: &Board) -> Analysis {
+    crate::scope_profile!("scoring.analyze");
     let cells = board.cells();
     let safe = pass_alive(cells);
     let mut result = Analysis {

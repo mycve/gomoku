@@ -142,13 +142,16 @@ impl Board {
         }
     }
     pub(crate) fn placed(&self, mv: Move) -> Option<Vec<i8>> {
+        self.placed_for(mv, self.to_move)
+    }
+    pub(crate) fn placed_for(&self, mv: Move, player: Player) -> Option<Vec<i8>> {
         if mv.0 >= CELL_COUNT || self.cells[mv.0] != 0 {
             return None;
         }
         let mut cells = self.cells.clone();
-        cells[mv.0] = self.to_move.stone();
+        cells[mv.0] = player.stone();
         for neighbor in neighbors(mv.0) {
-            if cells[neighbor] == self.to_move.other().stone() {
+            if cells[neighbor] == player.other().stone() {
                 let (stones, has_liberty) = group(&cells, neighbor);
                 if !has_liberty {
                     for stone in stones {
@@ -186,6 +189,7 @@ impl Board {
         true
     }
     pub fn rule_legal_moves(&self) -> Vec<Move> {
+        crate::scope_profile!("game.legal_moves");
         if self.is_finished() {
             return Vec::new();
         }
@@ -215,6 +219,7 @@ impl Board {
     }
     /// GTP 允许指定任意行棋方，也允许在停一手后继续处理争议。
     pub fn for_turn(&self, player: Player) -> Self {
+        crate::scope_profile!("game.clone_for_turn");
         let mut board = self.clone();
         board.to_move = player;
         board.passes = 0;

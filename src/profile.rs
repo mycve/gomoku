@@ -88,6 +88,14 @@ mod imp {
         rows
     }
 
+    /// 单线程诊断在预热完成后清零；不得与其他正在记录的线程并发调用。
+    pub fn reset() {
+        LOCAL_STATS.with(|stats| stats.borrow_mut().clear());
+        if let Some(global) = GLOBAL_STATS.get() {
+            global.lock().expect("性能统计锁损坏").clear();
+        }
+    }
+
     pub fn print_report() {
         let rows = report();
         if rows.is_empty() {
@@ -114,7 +122,7 @@ mod imp {
 }
 
 #[cfg(feature = "profile")]
-pub use imp::{ScopeTimer, flush_thread, print_report, report};
+pub use imp::{ScopeTimer, flush_thread, print_report, report, reset};
 
 #[cfg(not(feature = "profile"))]
 #[inline(always)]
@@ -123,6 +131,10 @@ pub fn print_report() {}
 #[cfg(not(feature = "profile"))]
 #[inline(always)]
 pub fn flush_thread() {}
+
+#[cfg(not(feature = "profile"))]
+#[inline(always)]
+pub fn reset() {}
 
 #[macro_export]
 macro_rules! scope_profile {

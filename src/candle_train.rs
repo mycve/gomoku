@@ -304,7 +304,8 @@ impl Replica {
         };
         let b = samples.len();
         let h = self.hidden_bias.dim(0).map_err(err)?;
-        crate::scope_profile!("train.tensor_h2d");
+        #[cfg(feature = "profile")]
+        let transfer_timer = crate::profile::ScopeTimer::new("train.tensor_h2d");
         let inputs = Tensor::from_vec(packed.inputs, (b, INPUT_SIZE), &self.device).map_err(err)?;
         let stone_counts =
             Tensor::from_vec(packed.stone_counts, (b, STONE_TYPES), &self.device).map_err(err)?;
@@ -359,8 +360,12 @@ impl Replica {
         let local_legal_mask =
             Tensor::from_vec(packed.local_legal_mask, (b, ACTION_COUNT, 1), &self.device)
                 .map_err(err)?;
+        #[cfg(feature = "profile")]
+        drop(transfer_timer);
+        #[cfg(feature = "profile")]
+        let forward_timer = crate::profile::ScopeTimer::new("train.forward_to_scalar");
         let hidden = {
-            crate::scope_profile!("train.forward");
+            crate::scope_profile!("train.trunk_enqueue");
             inputs
                 .matmul(&self.input_hidden)
                 .and_then(|x| x.add(&stone_counts.matmul(&self.stone_hidden)?))
@@ -565,6 +570,8 @@ impl Replica {
             .map_err(err)?;
         let policy_sum = policy_sum_tensor.to_scalar::<f32>().map_err(err)?;
         let value_sum = value_sum_tensor.to_scalar::<f32>().map_err(err)?;
+        #[cfg(feature = "profile")]
+        drop(forward_timer);
         let grads = if backward {
             crate::scope_profile!("train.backward");
             Some(loss.backward().map_err(err)?)
@@ -582,6 +589,7 @@ impl Replica {
         })
     }
     fn cpu_values(&self) -> io::Result<Vec<Vec<f32>>> {
+        crate::scope_profile!("train.model_d2h");
         self.vars()
             .iter()
             .map(|v| {
@@ -594,6 +602,7 @@ impl Replica {
             .collect()
     }
     fn copy_to(&self, m: &mut PolicyValueModel) -> io::Result<()> {
+        crate::scope_profile!("train.publish_model");
         let v = self.cpu_values()?;
         m.input_hidden = v[0].clone();
         m.stone_hidden = v[1].clone();
@@ -756,7 +765,9 @@ fn pack(samples: &[Sample]) -> Packed {
         let role = usize::from(s.board.to_move() == crate::game::Player::White);
         inputs[row * INPUT_SIZE + ROLE_INPUT_START + role] = 1.0;
         roles[row * ROLE_COUNT + role] = 1.0;
-        for m in s.board.search_candidates() {
+        for m in
+            crate::features::moves_from_mask(&s.board, &extras[10 * CELL_COUNT..11 * CELL_COUNT])
+        {
             masks[row * ACTION_COUNT + m.0] = 0.0;
             local_legal_mask[row * ACTION_COUNT + m.0] = 1.0;
             for (axis, (dr, dc)) in [(1, 0), (0, 1), (1, 1), (1, -1)].into_iter().enumerate() {

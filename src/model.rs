@@ -142,10 +142,10 @@ pub struct PolicyValueModel {
 
 #[derive(Clone)]
 pub(crate) struct EvalAccumulator {
-    black: Vec<f32>,
-    white: Vec<f32>,
-    black_regions: Vec<f32>,
-    white_regions: Vec<f32>,
+    hidden: Vec<f32>,
+    regions: Vec<f32>,
+    legal: Vec<f32>,
+    role: Player,
     move_count: usize,
 }
 
@@ -288,18 +288,12 @@ impl PolicyValueModel {
         scratch: &mut EvalScratch,
     ) -> (Vec<(Move, f32)>, f32) {
         debug_assert_eq!(accumulator.move_count, board.move_count());
-        let preactivation = match board.to_move() {
-            Player::Black => &accumulator.black,
-            Player::White => &accumulator.white,
-        };
-        let regions = match board.to_move() {
-            Player::Black => &accumulator.black_regions,
-            Player::White => &accumulator.white_regions,
-        };
+        debug_assert_eq!(accumulator.role, board.to_move());
         self.evaluate_preactivation_with_scratch(
             board,
-            preactivation,
-            regions,
+            &accumulator.hidden,
+            &accumulator.regions,
+            &accumulator.legal,
             board.to_move(),
             policy_temperature,
             scratch,
@@ -311,6 +305,7 @@ impl PolicyValueModel {
         board: &Board,
         preactivation: &[f32],
         regions: &[f32],
+        legal: &[f32],
         role: Player,
         policy_temperature: f32,
         scratch: &mut EvalScratch,
@@ -321,7 +316,7 @@ impl PolicyValueModel {
             self.activate_hidden_into(preactivation, &mut scratch.hidden);
             self.apply_role_adapter(role, &mut scratch.hidden, &mut scratch.role_adapter);
         }
-        let moves = board.search_candidates();
+        let moves = crate::features::moves_from_mask(board, legal);
         if moves.is_empty() {
             return (Vec::new(), 0.0);
         }
@@ -464,13 +459,13 @@ impl PolicyValueModel {
     pub(crate) fn accumulator(&self, board: &Board) -> EvalAccumulator {
         crate::scope_profile!("model.accumulator_root");
         let mut accumulator = EvalAccumulator {
-            black: self.hidden_bias.clone(),
-            white: self.hidden_bias.clone(),
-            black_regions: vec![0.0; REGION_TOTAL_SIZE],
-            white_regions: vec![0.0; REGION_TOTAL_SIZE],
+            hidden: self.hidden_bias.clone(),
+            regions: vec![0.0; REGION_TOTAL_SIZE],
+            legal: Vec::new(),
+            role: board.to_move(),
             move_count: 0,
         };
-        self.add_role_to_slices(&mut accumulator.black, &mut accumulator.white);
+        self.add_role_to_slices(&mut accumulator.hidden, accumulator.role);
         for (sq, &stone) in board.cells().iter().enumerate() {
             if stone == 0 {
                 continue;
@@ -489,37 +484,30 @@ impl PolicyValueModel {
         for h in 0..self.hidden_size {
             let change = self.input_hidden[PASS_INPUT * self.hidden_size + h]
                 * board.consecutive_passes() as f32;
-            accumulator.black[h] += change;
-            accumulator.white[h] += change;
+            accumulator.hidden[h] += change;
         }
-        for (perspective, hidden) in [
-            (Player::Black, &mut accumulator.black),
-            (Player::White, &mut accumulator.white),
-        ] {
-            for (feature, value) in crate::features::encode(board, perspective)
-                .into_iter()
-                .enumerate()
-            {
-                if value == 0.0 {
-                    continue;
-                }
-                let start = (GO_INPUT_START + feature) * self.hidden_size;
-                for h in 0..self.hidden_size {
-                    hidden[h] += self.input_hidden[start + h] * value;
-                }
+        crate::scope_profile!("model.go_features");
+        let features = crate::features::encode(board, board.to_move());
+        accumulator.legal = features[10 * CELL_COUNT..11 * CELL_COUNT].to_vec();
+        for (feature, value) in features.into_iter().enumerate() {
+            if value == 0.0 {
+                continue;
+            }
+            let start = (GO_INPUT_START + feature) * self.hidden_size;
+            for h in 0..self.hidden_size {
+                accumulator.hidden[h] += self.input_hidden[start + h] * value;
             }
         }
         accumulator
     }
 
-    /// MCTS 使用连续 arena 保存累加器，避免每个节点为两个 Vec 单独分配内存。
+    /// MCTS 连续保存当前行棋方累加器、区域特征和合法落点掩码。
     pub(crate) fn accumulator_into_arena(&self, board: &Board, arena: &mut Vec<f32>) -> usize {
         let accumulator = self.accumulator(board);
         let offset = arena.len();
-        arena.extend_from_slice(&accumulator.black);
-        arena.extend_from_slice(&accumulator.white);
-        arena.extend_from_slice(&accumulator.black_regions);
-        arena.extend_from_slice(&accumulator.white_regions);
+        arena.extend_from_slice(&accumulator.hidden);
+        arena.extend_from_slice(&accumulator.regions);
+        arena.extend_from_slice(&accumulator.legal);
         offset
     }
 
@@ -532,19 +520,15 @@ impl PolicyValueModel {
         scratch: &mut EvalScratch,
     ) -> (Vec<(Move, f32)>, f32) {
         let width = self.accumulator_width();
-        let side_offset = match board.to_move() {
-            Player::Black => offset,
-            Player::White => offset + self.hidden_size,
-        };
-        let region_offset = match board.to_move() {
-            Player::Black => offset + self.hidden_size * 2,
-            Player::White => offset + self.hidden_size * 2 + REGION_TOTAL_SIZE,
-        };
+        let side_offset = offset;
+        let region_offset = offset + self.hidden_size;
+        let legal_offset = region_offset + REGION_TOTAL_SIZE;
         debug_assert!(offset + width <= arena.len());
         self.evaluate_preactivation_with_scratch(
             board,
             &arena[side_offset..side_offset + self.hidden_size],
             &arena[region_offset..region_offset + REGION_TOTAL_SIZE],
+            &arena[legal_offset..legal_offset + CELL_COUNT],
             board.to_move(),
             policy_temperature,
             scratch,
@@ -552,59 +536,59 @@ impl PolicyValueModel {
     }
 
     fn add_stone(&self, accumulator: &mut EvalAccumulator, mv: Move, player: Player) {
-        self.add_stone_to_slices(&mut accumulator.black, &mut accumulator.white, mv, player);
-        self.add_region_to_slices(
-            &mut accumulator.black_regions,
-            &mut accumulator.white_regions,
-            mv,
-            player,
-        );
+        self.add_stone_to_slices(&mut accumulator.hidden, accumulator.role, mv, player);
+        self.add_region_to_slices(&mut accumulator.regions, accumulator.role, mv, player);
     }
 
     pub(crate) fn accumulator_width(&self) -> usize {
-        2 * (self.hidden_size + REGION_TOTAL_SIZE)
+        self.hidden_size + REGION_TOTAL_SIZE + CELL_COUNT
     }
 
-    fn add_region_to_slices(&self, black: &mut [f32], white: &mut [f32], mv: Move, player: Player) {
+    fn add_region_to_slices(
+        &self,
+        values: &mut [f32],
+        perspective: Player,
+        mv: Move,
+        player: Player,
+    ) {
         let region = (mv.row() / (BOARD_SIZE / 3)) * 3 + mv.col() / (BOARD_SIZE / 3);
-        for (perspective, values) in [(Player::Black, black), (Player::White, white)] {
-            let side = usize::from(player != perspective);
-            let source = (region * STONE_TYPES + side) * REGION_FEATURE_SIZE;
-            let target = region * REGION_FEATURE_SIZE;
-            for i in 0..REGION_FEATURE_SIZE {
-                values[target + i] += self.region_embedding[source + i];
-            }
+        let side = usize::from(player != perspective);
+        let source = (region * STONE_TYPES + side) * REGION_FEATURE_SIZE;
+        let target = region * REGION_FEATURE_SIZE;
+        for i in 0..REGION_FEATURE_SIZE {
+            values[target + i] += self.region_embedding[source + i];
         }
     }
 
-    fn add_role_to_slices(&self, black: &mut [f32], white: &mut [f32]) {
-        for (role, hidden) in [(Player::Black, black), (Player::White, white)] {
-            let offset = (ROLE_INPUT_START + role_index(role)) * self.hidden_size;
-            for (h, value) in hidden.iter_mut().enumerate() {
-                *value += self.input_hidden[offset + h];
-            }
+    fn add_role_to_slices(&self, hidden: &mut [f32], role: Player) {
+        let offset = (ROLE_INPUT_START + role_index(role)) * self.hidden_size;
+        for (h, value) in hidden.iter_mut().enumerate() {
+            *value += self.input_hidden[offset + h];
         }
     }
 
-    fn add_stone_to_slices(&self, black: &mut [f32], white: &mut [f32], mv: Move, player: Player) {
-        for (perspective, hidden) in [(Player::Black, black), (Player::White, white)] {
-            let side = usize::from(player != perspective);
-            let exact = (side * CELL_COUNT + mv.0) * self.hidden_size;
-            let rank = (side * BOARD_SIZE + mv.row()) * self.hidden_size;
-            let file = (side * BOARD_SIZE + mv.col()) * self.hidden_size;
-            let diagonal = (side * (BOARD_SIZE * 2 - 1) + mv.row() + BOARD_SIZE - 1 - mv.col())
-                * self.hidden_size;
-            let anti_diagonal =
-                (side * (BOARD_SIZE * 2 - 1) + mv.row() + mv.col()) * self.hidden_size;
-            let stone = side * self.hidden_size;
-            for (h, value) in hidden.iter_mut().enumerate() {
-                *value += self.input_hidden[exact + h]
-                    + self.stone_hidden[stone + h]
-                    + self.rank_hidden[rank + h]
-                    + self.file_hidden[file + h]
-                    + self.diagonal_hidden[diagonal + h]
-                    + self.anti_diagonal_hidden[anti_diagonal + h];
-            }
+    fn add_stone_to_slices(
+        &self,
+        hidden: &mut [f32],
+        perspective: Player,
+        mv: Move,
+        player: Player,
+    ) {
+        let side = usize::from(player != perspective);
+        let exact = (side * CELL_COUNT + mv.0) * self.hidden_size;
+        let rank = (side * BOARD_SIZE + mv.row()) * self.hidden_size;
+        let file = (side * BOARD_SIZE + mv.col()) * self.hidden_size;
+        let diagonal =
+            (side * (BOARD_SIZE * 2 - 1) + mv.row() + BOARD_SIZE - 1 - mv.col()) * self.hidden_size;
+        let anti_diagonal = (side * (BOARD_SIZE * 2 - 1) + mv.row() + mv.col()) * self.hidden_size;
+        let stone = side * self.hidden_size;
+        for (h, value) in hidden.iter_mut().enumerate() {
+            *value += self.input_hidden[exact + h]
+                + self.stone_hidden[stone + h]
+                + self.rank_hidden[rank + h]
+                + self.file_hidden[file + h]
+                + self.diagonal_hidden[diagonal + h]
+                + self.anti_diagonal_hidden[anti_diagonal + h];
         }
     }
 
@@ -613,8 +597,7 @@ impl PolicyValueModel {
         let rule_offset = MOVE_COUNT_INPUT * self.hidden_size;
         for h in 0..self.hidden_size {
             let change = self.input_hidden[rule_offset + h] * delta;
-            accumulator.black[h] += change;
-            accumulator.white[h] += change;
+            accumulator.hidden[h] += change;
         }
         accumulator.move_count = move_count;
     }
@@ -1401,11 +1384,10 @@ mod tests {
         assert!(board.play(Move::parse("h8").unwrap()));
         assert!(board.play(Move::parse("h9").unwrap()));
         assert!(board.play(Move::parse("j8").unwrap()));
-        let accumulator = model.accumulator(&board);
-        for (role, actual) in [
-            (Player::Black, &accumulator.black),
-            (Player::White, &accumulator.white),
-        ] {
+        for role in [Player::Black, Player::White] {
+            let board = board.for_turn(role);
+            let accumulator = model.accumulator(&board);
+            let actual = &accumulator.hidden;
             let mut expected = model.hidden_bias.clone();
             let role_offset = (ROLE_INPUT_START + role_index(role)) * model.hidden_size;
             for h in 0..model.hidden_size {
