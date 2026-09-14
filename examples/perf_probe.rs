@@ -21,6 +21,24 @@ fn main() -> io::Result<()> {
         .get(3)
         .map(String::as_str)
         .unwrap_or("data/go9-v31/replay.jsonl");
+    if mode == "prepare" {
+        if std::path::Path::new(model_path).exists() || std::path::Path::new(replay_path).exists() {
+            return Err(io::Error::other("测试输入已存在，不覆盖"));
+        }
+        let model = PolicyValueModel::random(128, 719);
+        let samples = go9::selfplay::generate(
+            &model,
+            64,
+            SearchConfig {
+                simulations: 16,
+                ..Default::default()
+            },
+        );
+        model.save(model_path)?;
+        replay::save(replay_path, &samples)?;
+        println!("prepared {} fresh MC samples", samples.len());
+        return Ok(());
+    }
     let mut model = PolicyValueModel::load(model_path)?;
     let samples = replay::load(replay_path)?;
     if samples.is_empty() {
@@ -147,12 +165,14 @@ fn main() -> io::Result<()> {
                 );
             }
         }
-        "train" => {
+        "train" | "train-loaded" => {
             let batch_size = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(256);
+            let sample_count = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(2048);
             let batch = samples
                 .iter()
-                .step_by((samples.len() / 2048).max(1))
-                .take(2048)
+                .step_by((samples.len() / sample_count.max(1)).max(1))
+                .cycle()
+                .take(sample_count)
                 .cloned()
                 .collect::<Vec<_>>();
             let mut session = TrainingSession::new(&model, 0.0001)?;
@@ -166,8 +186,41 @@ fn main() -> io::Result<()> {
             )?;
             profile::reset();
             let start = Instant::now();
-            let stats =
-                session.train_controlled(&mut model, &batch, 5, 0.0001, batch_size, None)?;
+            let epochs = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(5);
+            let stats = if mode == "train-loaded" {
+                let search_model = model.clone();
+                let stop = std::sync::atomic::AtomicBool::new(false);
+                let visits = std::sync::atomic::AtomicUsize::new(0);
+                let result = std::thread::scope(|scope| {
+                    for worker in 0..128 {
+                        let board = &boards[worker % boards.len()];
+                        let search_model = &search_model;
+                        let stop = &stop;
+                        let visits = &visits;
+                        scope.spawn(move || {
+                            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                let count = search(board, search_model, cfg)
+                                    .iter()
+                                    .map(|c| c.visits as usize)
+                                    .sum::<usize>();
+                                visits.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        });
+                    }
+                    let result = session
+                        .train_controlled(&mut model, &batch, epochs, 0.0001, batch_size, None);
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    result
+                });
+                println!(
+                    "search_load_workers=128 simulations_per_s={:.0}",
+                    visits.load(std::sync::atomic::Ordering::Relaxed) as f64
+                        / start.elapsed().as_secs_f64()
+                );
+                result?
+            } else {
+                session.train_controlled(&mut model, &batch, epochs, 0.0001, batch_size, None)?
+            };
             println!(
                 "batch={batch_size} samples={} elapsed_ms={:.3} samples_per_s={:.0} loss={:.5}",
                 stats.samples,

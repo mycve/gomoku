@@ -67,26 +67,57 @@ impl TrainingSession {
         batch_size: usize,
         stop: Option<&AtomicBool>,
     ) -> io::Result<TrainStats> {
+        let workers = std::env::var("GO9_TRAIN_PACK_WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4)
+            .min(4);
+        self.train_with_pack_workers(
+            model,
+            samples,
+            epochs,
+            learning_rate,
+            batch_size,
+            stop,
+            workers,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn train_with_pack_workers(
+        &mut self,
+        model: &mut PolicyValueModel,
+        samples: &[Sample],
+        epochs: usize,
+        learning_rate: f32,
+        batch_size: usize,
+        stop: Option<&AtomicBool>,
+        workers: usize,
+    ) -> io::Result<TrainStats> {
         if samples.is_empty() || epochs == 0 || learning_rate <= 0.0 {
             return Ok(TrainStats::default());
         }
         self.optimizer.set_learning_rate(learning_rate as f64);
         let mut stats = TrainStats::default();
         for _ in 0..epochs {
-            for batch in samples.chunks(batch_size.max(1)) {
+            let completed = for_packed_batches(samples, batch_size, workers, |packed| {
                 if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-                    self.copy_model(model)?;
-                    return Ok(finalize_stats(stats));
+                    return Ok(false);
                 }
-                let output = self.train_batch(batch)?;
+                let output = self.train_batch(packed)?;
                 stats.samples += output.samples;
                 stats.policy_loss += output.policy_sum;
                 stats.value_loss += output.value_sum;
                 stats.policy_entropy += output.policy_entropy_sum;
                 stats.value_entropy += output.value_entropy_sum;
                 stats.optimizer_steps += 1;
+                Ok(true)
+            })?;
+            if !completed {
+                break;
             }
         }
+
         self.copy_model(model)?;
         Ok(finalize_stats(stats))
     }
@@ -98,7 +129,7 @@ impl TrainingSession {
         }
         let mut stats = TrainStats::default();
         for batch in samples.chunks(batch_size.max(1)) {
-            let output = self.replica.forward(batch, false, batch.len())?;
+            let output = self.replica.forward(pack(batch), false, batch.len())?;
             stats.samples += output.samples;
             stats.policy_loss += output.policy_sum;
             stats.value_loss += output.value_sum;
@@ -113,14 +144,65 @@ impl TrainingSession {
         Ok(())
     }
 
-    fn train_batch(&mut self, batch: &[Sample]) -> io::Result<BatchOutput> {
-        let output = self.replica.forward(batch, true, batch.len())?;
+    fn train_batch(&mut self, packed: Packed) -> io::Result<BatchOutput> {
+        let count = packed.win_targets.len();
+        let output = self.replica.forward(packed, true, count)?;
         crate::scope_profile!("train.optimizer_step");
         self.optimizer
             .step(output.grads.as_ref().expect("训练批次必须包含梯度"))
             .map_err(err)?;
         Ok(output)
     }
+}
+
+/// 每个线程最多缓存一批，消费者保持原始批次顺序；退出时先断开接收端再等待线程。
+fn for_packed_batches(
+    samples: &[Sample],
+    batch_size: usize,
+    workers: usize,
+    mut consume: impl FnMut(Packed) -> io::Result<bool>,
+) -> io::Result<bool> {
+    let batch_size = batch_size.max(1);
+    let workers = workers.min(samples.len().div_ceil(batch_size));
+    if workers == 0 || samples.len() <= batch_size {
+        for batch in samples.chunks(batch_size) {
+            if !consume(pack(batch))? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    std::thread::scope(|scope| {
+        let mut receivers = Vec::with_capacity(workers);
+        for worker in 0..workers {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            receivers.push(receiver);
+            scope.spawn(move || {
+                for batch in samples.chunks(batch_size).skip(worker).step_by(workers) {
+                    if sender.send(pack(batch)).is_err() {
+                        break;
+                    }
+                }
+                crate::profile::flush_thread();
+            });
+        }
+        let result = (|| {
+            for index in 0..samples.len().div_ceil(batch_size) {
+                let packed = {
+                    crate::scope_profile!("train.pack_wait");
+                    receivers[index % workers]
+                        .recv()
+                        .map_err(io::Error::other)?
+                };
+                if !consume(packed)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })();
+        drop(receivers);
+        result
+    })
 }
 
 fn finalize_stats(mut stats: TrainStats) -> TrainStats {
@@ -268,15 +350,11 @@ impl Replica {
     }
     fn forward(
         &self,
-        samples: &[Sample],
+        packed: Packed,
         backward: bool,
         global_batch_size: usize,
     ) -> io::Result<BatchOutput> {
-        let packed = {
-            crate::scope_profile!("train.pack");
-            pack(samples)
-        };
-        let b = samples.len();
+        let b = packed.win_targets.len();
         let h = self.hidden_bias.dim(0).map_err(err)?;
         #[cfg(feature = "profile")]
         let transfer_timer = crate::profile::ScopeTimer::new("train.tensor_h2d");
@@ -623,6 +701,7 @@ fn make_device(requested: usize) -> io::Result<(Device, String)> {
     }
 }
 
+#[derive(Debug, PartialEq)]
 struct Packed {
     inputs: Vec<f32>,
     roles: Vec<f32>,
@@ -644,6 +723,7 @@ struct Packed {
     value_entropy_sum: f32,
 }
 fn pack(samples: &[Sample]) -> Packed {
+    crate::scope_profile!("train.pack");
     let mut inputs = vec![0.0; samples.len() * INPUT_SIZE];
     let mut roles = vec![0.0; samples.len() * ROLE_COUNT];
     let mut region_counts = vec![0.0; samples.len() * REGION_COUNT * STONE_TYPES];
@@ -783,6 +863,87 @@ fn err(e: impl std::fmt::Display) -> io::Error {
 mod tests {
     use super::*;
     use crate::game::{Board, Move};
+
+    fn prefetch_samples() -> Vec<Sample> {
+        (0..7)
+            .map(|i| {
+                let mut board = Board::new();
+                assert!(board.play(Move(i)));
+                Sample {
+                    board,
+                    policy: vec![(Move::PASS, 1.0)],
+                    value: if i % 2 == 0 { 1.0 } else { -1.0 },
+                    generation: 0,
+                    policy_weight: 1.0,
+                    value_weight: 1.0,
+                    policy_surprise: 0.0,
+                    value_surprise: 0.0,
+                    predicted_value: 0.0,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn prefetch_preserves_training_order_and_partial_batches() {
+        let samples = prefetch_samples();
+        let mut serial = PolicyValueModel::random(16, 719);
+        let mut parallel = serial.clone();
+        // CPU 对照排除 CUDA 原子累加顺序造成的参数漂移。
+        let session = |model: &PolicyValueModel| {
+            let replica = Replica::new(model, &Device::Cpu).unwrap();
+            let optimizer = AdamW::new(replica.vars(), ParamsAdamW::default()).unwrap();
+            TrainingSession { replica, optimizer }
+        };
+        let mut a = session(&serial);
+        let mut b = session(&parallel);
+        for workers in [0, 1, 2, 4] {
+            let mut index = 0;
+            for_packed_batches(&samples, 3, workers, |packed| {
+                assert_eq!(
+                    packed,
+                    pack(&samples[index..(index + 3).min(samples.len())])
+                );
+                index += packed.win_targets.len();
+                Ok(true)
+            })
+            .unwrap();
+            assert_eq!(index, samples.len());
+        }
+        let sa = a
+            .train_with_pack_workers(&mut serial, &samples, 2, 1e-3, 3, None, 0)
+            .unwrap();
+        let sb = b
+            .train_with_pack_workers(&mut parallel, &samples, 2, 1e-3, 3, None, 2)
+            .unwrap();
+        assert_eq!((sa.samples, sa.optimizer_steps), (14, 6));
+        assert_eq!((sb.samples, sb.optimizer_steps), (14, 6));
+        assert!((sa.loss - sb.loss).abs() < 1e-6);
+        for (left, right) in a
+            .replica
+            .cpu_values()
+            .unwrap()
+            .iter()
+            .zip(b.replica.cpu_values().unwrap())
+        {
+            for (x, y) in left.iter().zip(right) {
+                assert!(
+                    (x - y).abs() < 1e-5,
+                    "parameter difference: {x} vs {y}, delta={}",
+                    (x - y).abs()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prefetch_cancellation_and_error_disconnect_workers() {
+        let samples = prefetch_samples();
+        assert!(!for_packed_batches(&samples, 1, 4, |_| Ok(false)).unwrap());
+        let err =
+            for_packed_batches(&samples, 1, 4, |_| Err(io::Error::other("test stop"))).unwrap_err();
+        assert_eq!(err.to_string(), "test stop");
+    }
 
     #[test]
     fn binary_value_loss_is_stable_and_has_correct_gradient() {
