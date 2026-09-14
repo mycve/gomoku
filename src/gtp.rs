@@ -69,7 +69,7 @@ impl<'a> Engine<'a> {
             }
             "name" => {
                 arity(args, 0)?;
-                Ok("Go9".into())
+                Ok("Go19".into())
             }
             "version" => {
                 arity(args, 0)?;
@@ -90,7 +90,7 @@ impl<'a> Engine<'a> {
             "boardsize" | "clear_board" => {
                 if command == "boardsize" {
                     arity(args, 1)?;
-                    if integer(args[0])? != 9 {
+                    if integer(args[0])? != crate::game::BOARD_SIZE {
                         return Err("unacceptable size".into());
                     }
                 } else {
@@ -404,7 +404,7 @@ mod tests {
         let model = PolicyValueModel::random(8, 1);
         let mut engine = Engine::new(&model, config());
         let mut output = Vec::new();
-        engine.run(io::Cursor::new("# comment\r\n1\tprotocol_version\r\n2 boardsize 19\n3 known_command play\n4 nonsense\n5 quit extra\n6 quit\n7 name\n"), &mut output).unwrap();
+        engine.run(io::Cursor::new("# comment\r\n1\tprotocol_version\r\n2 boardsize 9\n3 known_command play\n4 nonsense\n5 quit extra\n6 quit\n7 name\n"), &mut output).unwrap();
         assert_eq!(
             String::from_utf8(output).unwrap(),
             "=1 2\n\n?2 unacceptable size\n\n=3 true\n\n?4 unknown command\n\n?5 syntax error\n\n=6\n\n"
@@ -447,7 +447,7 @@ mod tests {
             engine.command("final_status_list", &["dead"]).unwrap(),
             "C4"
         );
-        assert_eq!(engine.command("final_score", &[]).unwrap(), "B+73.5");
+        assert_eq!(engine.command("final_score", &[]).unwrap(), "B+353.5");
         engine.command("clear_board", &[]).unwrap();
         engine.command("play", &["b", "e5"]).unwrap();
         engine.command("play", &["w", "pass"]).unwrap();

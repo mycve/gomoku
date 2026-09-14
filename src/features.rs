@@ -68,9 +68,15 @@ pub fn is_eye(cells: &[i8], point: usize, player: Player) -> bool {
         for dc in [-1, 1] {
             let r = row as i32 + dr;
             let c = col as i32 + dc;
-            if r >= 0 && c >= 0 && r < 9 && c < 9 {
+            if r >= 0
+                && c >= 0
+                && r < crate::game::BOARD_SIZE as i32
+                && c < crate::game::BOARD_SIZE as i32
+            {
                 diagonals += 1;
-                hostile += usize::from(cells[r as usize * 9 + c as usize] != player.stone());
+                hostile += usize::from(
+                    cells[r as usize * crate::game::BOARD_SIZE + c as usize] != player.stone(),
+                );
             }
         }
     }

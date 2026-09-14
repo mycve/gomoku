@@ -5,11 +5,11 @@ use crossterm::{
     execute,
     terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode},
 };
-use go9::{
+use go19::{
     az_loop,
     az_loop_config::{DEFAULT_CONFIG_PATH, load_or_create},
     candle_train,
-    game::{Board, Move, Outcome, Player},
+    game::{BOARD_SIZE, Board, Move, Outcome, Player},
     mcts::{Candidate, SearchConfig, search},
     model::{
         INPUT_SIZE, LOCAL_AXIS_FEATURE_SIZE, POLICY_HEAD_SIZE, PolicyValueModel,
@@ -26,9 +26,9 @@ use std::{
 
 #[derive(Parser)]
 #[command(
-    name = "go9",
+    name = "go19",
     version,
-    about = "9x9 Go policy/value search and training tools"
+    about = "19x19 Go policy/value search and training tools"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -59,7 +59,7 @@ enum Command {
 
 #[derive(Args)]
 struct GtpArgs {
-    #[arg(long, default_value = "go9-v31-model.safetensors")]
+    #[arg(long, default_value = "go19-v32-model.safetensors")]
     model: String,
     #[arg(long, default_value_t = 256)]
     simulations: usize,
@@ -67,7 +67,7 @@ struct GtpArgs {
 
 #[derive(Args)]
 struct AzInitArgs {
-    #[arg(default_value = "go9-v31-model.safetensors")]
+    #[arg(default_value = "go19-v32-model.safetensors")]
     output: String,
     #[arg(default_value_t = 128)]
     hidden: usize,
@@ -77,7 +77,7 @@ struct AzInitArgs {
 
 #[derive(Args)]
 struct AzSearchArgs {
-    #[arg(default_value = "go9-v31-model.safetensors")]
+    #[arg(default_value = "go19-v32-model.safetensors")]
     model: String,
     #[arg(default_value_t = 3000)]
     simulations: usize,
@@ -89,7 +89,7 @@ struct AzSearchArgs {
 
 #[derive(Args)]
 struct AzBenchArgs {
-    #[arg(default_value = "go9-v31-model.safetensors")]
+    #[arg(default_value = "go19-v32-model.safetensors")]
     model: String,
     #[arg(default_value_t = 3000)]
     simulations: usize,
@@ -102,9 +102,9 @@ struct AzBenchArgs {
 
 #[derive(Args)]
 struct AzTrainBenchArgs {
-    #[arg(default_value = "go9-v31-model.safetensors")]
+    #[arg(default_value = "go19-v32-model.safetensors")]
     model: String,
-    #[arg(default_value = "data/go9-v31/replay.jsonl")]
+    #[arg(default_value = "data/go19-v32/replay.jsonl")]
     replay: String,
     #[arg(default_value_t = 2)]
     epochs: usize,
@@ -125,9 +125,9 @@ struct AzLoopArgs {
 
 #[derive(Args)]
 struct AzArenaBestArgs {
-    #[arg(default_value = "go9-v31-model.safetensors")]
+    #[arg(default_value = "go19-v32-model.safetensors")]
     candidate: String,
-    #[arg(default_value = "go9-v31-best.safetensors")]
+    #[arg(default_value = "go19-v32-best.safetensors")]
     best: String,
     #[arg(default_value_t = 100)]
     games: usize,
@@ -148,7 +148,7 @@ enum HumanSide {
 
 #[derive(Args)]
 struct AzEvalBestArgs {
-    #[arg(default_value = "go9-v31-best.safetensors")]
+    #[arg(default_value = "go19-v32-best.safetensors")]
     best: String,
     #[arg(default_value_t = 3000)]
     simulations: usize,
@@ -160,7 +160,7 @@ struct AzEvalBestArgs {
 
 #[derive(Args)]
 struct PlayArgs {
-    #[arg(default_value = "go9-v31-model.safetensors")]
+    #[arg(default_value = "go19-v32-model.safetensors")]
     model: String,
     #[arg(default_value_t = 3000)]
     simulations: usize,
@@ -190,14 +190,14 @@ fn main() -> io::Result<()> {
                 VALUE_HEAD_SIZE,
                 VALUE_HEAD_SIZE,
             );
-            println!("board    : 9x9 Go, area scoring, komi 7.5");
+            println!("board    : 19x19 Go, area scoring, komi 7.5");
         }
         Some(Command::Gtp(args)) => {
             if args.simulations == 0 {
                 return Err(io::Error::other("simulations 必须大于 0"));
             }
             let model = load_model(&args.model)?;
-            go9::gtp::Engine::new(
+            go19::gtp::Engine::new(
                 &model,
                 SearchConfig {
                     simulations: args.simulations,
@@ -349,7 +349,7 @@ fn main() -> io::Result<()> {
             args.human_side,
         )?,
     }
-    go9::profile::print_report();
+    go19::profile::print_report();
     Ok(())
 }
 
@@ -419,14 +419,18 @@ fn render_interactive_board(
         board.raw_score()
     )?;
     write!(output, "          ")?;
-    for col in 0..go9::game::BOARD_SIZE {
-        write!(output, " {} ", b"abcdefghj"[col] as char)?;
+    for col in 0..go19::game::BOARD_SIZE {
+        write!(
+            output,
+            " {} ",
+            go19::game::COORDINATES.as_bytes()[col] as char
+        )?;
     }
     write!(output, "\r\n")?;
-    for row in (0..go9::game::BOARD_SIZE).rev() {
+    for row in (0..go19::game::BOARD_SIZE).rev() {
         write!(output, "{:>3}       ", row + 1)?;
-        for col in 0..go9::game::BOARD_SIZE {
-            let stone = match board.cells()[row * go9::game::BOARD_SIZE + col] {
+        for col in 0..go19::game::BOARD_SIZE {
+            let stone = match board.cells()[row * go19::game::BOARD_SIZE + col] {
                 1 => 'X',
                 -1 => 'O',
                 _ => '.',
@@ -495,10 +499,10 @@ fn read_board_action(
             continue;
         }
         match key.code {
-            KeyCode::Up => cursor.0 = (cursor.0 + 1).min(go9::game::BOARD_SIZE - 1),
+            KeyCode::Up => cursor.0 = (cursor.0 + 1).min(go19::game::BOARD_SIZE - 1),
             KeyCode::Down => cursor.0 = cursor.0.saturating_sub(1),
             KeyCode::Left => cursor.1 = cursor.1.saturating_sub(1),
-            KeyCode::Right => cursor.1 = (cursor.1 + 1).min(go9::game::BOARD_SIZE - 1),
+            KeyCode::Right => cursor.1 = (cursor.1 + 1).min(go19::game::BOARD_SIZE - 1),
             KeyCode::Enter => {
                 let mv = Move::new(cursor.0, cursor.1).expect("光标始终位于棋盘内");
                 if board.is_legal(mv) {
@@ -546,7 +550,7 @@ fn interactive_search(
         .map(|text| Move::parse(text).ok_or_else(|| io::Error::other(format!("无效坐标 `{text}`"))))
         .collect::<io::Result<Vec<_>>>()?;
     let mut board = board_from_move_values(&history)?;
-    let mut cursor = (4, 4);
+    let mut cursor = (BOARD_SIZE / 2, BOARD_SIZE / 2);
     let _raw = RawModeGuard::enter()?;
     loop {
         let (candidates, seconds) = if board.outcome().is_none() {
@@ -561,7 +565,7 @@ fn interactive_search(
         match read_board_action(
             &board,
             &mut cursor,
-            "Go9 — 交互式局面搜索",
+            "Go19 — 交互式局面搜索",
             &details,
             &candidates,
             true,
@@ -605,7 +609,7 @@ fn human_evaluate_best(
         HumanSide::White => Player::White,
     };
     let mut board = Board::new();
-    let mut cursor = (4, 4);
+    let mut cursor = (BOARD_SIZE / 2, BOARD_SIZE / 2);
     let mut last_search = Vec::new();
     let mut last_seconds = 0.0;
     let _raw = RawModeGuard::enter()?;
@@ -617,11 +621,11 @@ fn human_evaluate_best(
                 Outcome::Win(player) if player == human => "HUMAN WIN",
                 Outcome::Win(_) => "MODEL WIN",
             };
-            let analysis = go9::scoring::analyze(&board);
+            let analysis = go19::scoring::analyze(&board);
             render_interactive_board(
                 &board,
                 cursor,
-                "Go9 — 方向键人机对弈",
+                "Go19 — 方向键人机对弈",
                 &[
                     format!("result   : {result}"),
                     format!(
@@ -648,7 +652,7 @@ fn human_evaluate_best(
             match read_board_action(
                 &board,
                 &mut cursor,
-                "Go9 — 方向键人机对弈",
+                "Go19 — 方向键人机对弈",
                 &details,
                 &last_search,
                 false,

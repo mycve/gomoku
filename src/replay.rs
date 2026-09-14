@@ -12,7 +12,7 @@ use std::{
 pub struct Sample {
     pub board: Board,
     pub policy: Vec<(Move, f32)>,
-    /// 当前行棋方的真实终局结果；v31 必填，旧 TD 回放不可直接复用。
+    /// 当前行棋方的真实终局结果；v32 必填，旧 TD 回放不可直接复用。
     #[serde(rename = "mc_value")]
     pub value: f32,
     pub generation: u64,

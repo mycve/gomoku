@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use candle_core::{CpuStorage, CustomOp2, CustomOp3, Layout, Result, Shape, Tensor};
 
 // FeaturePool 部分与 chineseai 共用同一融合算子源文件；
-// 五子棋当前只调用下面的通用 SparsePool。
+// 围棋只调用下面的通用 SparsePool；上面的象棋结构常量不用于围棋输入。
 const AZ_NNUE_INPUT_SIZE: usize = 1260;
 const STRUCTURAL_PIECE_SIZE: usize = 14;
 const STRUCTURAL_RANK_SIZE: usize = 10;

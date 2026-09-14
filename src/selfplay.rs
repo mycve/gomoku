@@ -628,9 +628,13 @@ mod tests {
 
     #[test]
     fn mixed_game_records_only_current_white_and_uses_more_white_search() {
-        let model = PolicyValueModel::random(8, 91);
+        let mut model = PolicyValueModel::random(8, 91);
+        model.policy_bias[Move::PASS.0] = 20.0;
         let black_cfg = SearchConfig {
             simulations: 2,
+            temperature_start: 0.0,
+            temperature_endgame: 0.0,
+            root_exploration_fraction: 0.0,
             ..Default::default()
         };
         let white_cfg = SearchConfig {

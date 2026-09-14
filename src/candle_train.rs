@@ -67,7 +67,7 @@ impl TrainingSession {
         batch_size: usize,
         stop: Option<&AtomicBool>,
     ) -> io::Result<TrainStats> {
-        let workers = std::env::var("GO9_TRAIN_PACK_WORKERS")
+        let workers = std::env::var("GO19_TRAIN_PACK_WORKERS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(4)
@@ -760,8 +760,7 @@ fn pack(samples: &[Sample]) -> Packed {
                     - sq % BOARD_SIZE] += 1.0;
                 anti_diagonal_counts
                     [row * DIAGONAL_FEATURES + sq / BOARD_SIZE + sq % BOARD_SIZE] += 1.0;
-                let region =
-                    (sq / BOARD_SIZE / (BOARD_SIZE / 3)) * 3 + (sq % BOARD_SIZE) / (BOARD_SIZE / 3);
+                let region = crate::model::region_index(sq);
                 region_counts[(row * REGION_COUNT + region) * STONE_TYPES] += 1.0;
             } else if stone == -us {
                 inputs[row * INPUT_SIZE + CELL_COUNT + sq] = 1.0;
@@ -778,8 +777,7 @@ fn pack(samples: &[Sample]) -> Packed {
                     + (BOARD_SIZE * 2 - 1)
                     + sq / BOARD_SIZE
                     + sq % BOARD_SIZE] += 1.0;
-                let region =
-                    (sq / BOARD_SIZE / (BOARD_SIZE / 3)) * 3 + (sq % BOARD_SIZE) / (BOARD_SIZE / 3);
+                let region = crate::model::region_index(sq);
                 region_counts[(row * REGION_COUNT + region) * STONE_TYPES + 1] += 1.0;
             }
         }
@@ -882,6 +880,21 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn packing_maps_far_corner_and_pass_on_nineteen_board() {
+        let mut sample = prefetch_samples().remove(0);
+        sample.board = Board::from_position(
+            &[(Move(360), crate::game::Player::Black)],
+            crate::game::Player::White,
+        )
+        .unwrap();
+        let packed = pack(&[sample]);
+        assert_eq!(packed.inputs.len(), INPUT_SIZE);
+        assert_eq!(packed.region_counts[(8 * STONE_TYPES) + 1], 1.0);
+        assert_eq!(packed.policy_masks[360], -1e9);
+        assert_eq!(packed.policy_targets[361], 1.0);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use go9::model::PolicyValueModel;
+use go19::model::PolicyValueModel;
 use std::{
     io::Write,
     process::{Command, Stdio},
@@ -16,7 +16,7 @@ fn executable_speaks_gtp_without_stdout_logs() {
             .as_nanos()
     ));
     PolicyValueModel::random(8, 81).save(&path).unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_go9"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_go19"));
     command
         .arg("gtp")
         .arg("--model")
@@ -31,7 +31,7 @@ fn executable_speaks_gtp_without_stdout_logs() {
         command.creation_flags(0x08000000);
     }
     let mut child = command.spawn().unwrap();
-    child.stdin.take().unwrap().write_all(b"1 protocol_version\n2 boardsize 9\n3 komi 6.5\n4 play b E5\n5 reg_genmove w\n6 genmove w\n7 undo\n8 clear_board\n9 play b pass\n10 play w pass\n11 final_score\n12 quit\n13 name\n").unwrap();
+    child.stdin.take().unwrap().write_all(b"1 protocol_version\n2 boardsize 19\n3 komi 6.5\n4 play b T19\n5 reg_genmove w\n6 genmove w\n7 undo\n8 clear_board\n9 play b pass\n10 play w pass\n11 final_score\n12 quit\n13 name\n").unwrap();
     let result = child.wait_with_output().unwrap();
     std::fs::remove_file(path).unwrap();
     assert!(result.status.success());

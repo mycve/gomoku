@@ -1,5 +1,5 @@
 //! 性能诊断，不覆盖输入模型或回放。每次进程只测一个场景。
-use go9::{
+use go19::{
     candle_train::TrainingSession,
     features,
     game::Board,
@@ -16,17 +16,17 @@ fn main() -> io::Result<()> {
     let model_path = args
         .get(2)
         .map(String::as_str)
-        .unwrap_or("go9-v31-model.safetensors");
+        .unwrap_or("go19-v32-model.safetensors");
     let replay_path = args
         .get(3)
         .map(String::as_str)
-        .unwrap_or("data/go9-v31/replay.jsonl");
+        .unwrap_or("data/go19-v32/replay.jsonl");
     if mode == "prepare" {
         if std::path::Path::new(model_path).exists() || std::path::Path::new(replay_path).exists() {
             return Err(io::Error::other("测试输入已存在，不覆盖"));
         }
         let model = PolicyValueModel::random(128, 719);
-        let samples = go9::selfplay::generate(
+        let samples = go19::selfplay::generate(
             &model,
             64,
             SearchConfig {

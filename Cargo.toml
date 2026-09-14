@@ -1,12 +1,12 @@
 [package]
-name = "go9"
+name = "go19"
 version = "0.1.0"
 edition = "2024"
-default-run = "go9"
+default-run = "go19"
 autobins = false
 
 [[bin]]
-name = "go9"
+name = "go19"
 path = "src/main.rs"
 
 [dependencies]
@@ -21,6 +21,7 @@ serde_json = "1"
 toml = "0.8"
 tensorboard-rs = "0.5"
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "frame"] }
+bitvec = "1.0.1"
 
 [features]
 default = []

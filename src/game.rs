@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-pub const BOARD_SIZE: usize = 9;
+pub const BOARD_SIZE: usize = 19;
+pub const COORDINATES: &str = "abcdefghjklmnopqrst";
+type PointSet = bitvec::array::BitArray<[u64; CELL_COUNT.div_ceil(64)]>;
 pub const CELL_COUNT: usize = BOARD_SIZE * BOARD_SIZE;
 pub const ACTION_COUNT: usize = CELL_COUNT + 1;
 pub const KOMI: f32 = 7.5;
@@ -48,7 +50,7 @@ impl Move {
             return Some(Self::PASS);
         }
         let mut chars = s.chars();
-        let col = "abcdefghj".find(chars.next()?)?;
+        let col = COORDINATES.find(chars.next()?)?;
         let row = chars.as_str().parse::<usize>().ok()?.checked_sub(1)?;
         Self::new(row, col)
     }
@@ -56,7 +58,11 @@ impl Move {
         if self == Self::PASS {
             return "pass".into();
         }
-        format!("{}{}", b"abcdefghj"[self.col()] as char, self.row() + 1)
+        format!(
+            "{}{}",
+            COORDINATES.as_bytes()[self.col()] as char,
+            self.row() + 1
+        )
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,27 +74,30 @@ pub enum Outcome {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Board {
+    #[serde(deserialize_with = "deserialize_cells")]
     cells: Vec<i8>,
     to_move: Player,
     moves: usize,
     passes: usize,
     komi_milli: i32,
+    #[serde(deserialize_with = "deserialize_cells")]
     previous: Vec<i8>,
     /// 精确盘面历史，用于位置超级劫；pass 不受超级劫限制。
+    #[serde(deserialize_with = "deserialize_history")]
     history: Vec<Vec<i8>>,
 }
 /// 单个候选的精确提子与落子后气数，不分配临时棋盘。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PlacementInfo {
-    pub captured: u128,
-    pub liberties: u32,
+    pub captured: PointSet,
+    pub liberties: usize,
 }
 
 /// 每个局面只建立一次棋块索引，用位集合合并相邻棋块和气。
 pub(crate) struct MoveAnalysis {
     at: [usize; CELL_COUNT],
-    stones: Vec<u128>,
-    liberties: Vec<u128>,
+    stones: Vec<PointSet>,
+    liberties: Vec<PointSet>,
 }
 impl MoveAnalysis {
     pub(crate) fn new(groups: &[crate::scoring::Chain]) -> Self {
@@ -96,18 +105,17 @@ impl MoveAnalysis {
         let mut stones = Vec::with_capacity(groups.len());
         let mut liberties = Vec::with_capacity(groups.len());
         for (id, chain) in groups.iter().enumerate() {
-            let mut mask = 0;
+            let mut mask = PointSet::ZERO;
             for &p in &chain.stones {
                 at[p] = id;
-                mask |= 1u128 << p;
+                mask.set(p, true);
             }
             stones.push(mask);
-            liberties.push(
-                chain
-                    .liberties
-                    .iter()
-                    .fold(0, |mask, &p| mask | (1u128 << p)),
-            );
+            let mut liberty_mask = PointSet::ZERO;
+            for &p in &chain.liberties {
+                liberty_mask.set(p, true);
+            }
+            liberties.push(liberty_mask);
         }
         Self {
             at,
@@ -125,13 +133,14 @@ impl MoveAnalysis {
         if point >= CELL_COUNT || board.cells[point] != 0 {
             return None;
         }
-        let bit = 1u128 << point;
+        let mut bit = PointSet::ZERO;
+        bit.set(point, true);
         let mut own = bit;
-        let mut liberties = 0;
-        let mut captured = 0;
+        let mut liberties = PointSet::ZERO;
+        let mut captured = PointSet::ZERO;
         for n in neighbors(point) {
             if board.cells[n] == 0 {
-                liberties |= 1u128 << n;
+                liberties.set(n, true);
             } else {
                 let id = self.at[n];
                 if board.cells[n] == player.stone() {
@@ -142,19 +151,21 @@ impl MoveAnalysis {
                 }
             }
         }
-        liberties = (liberties | (adjacent_mask(own) & captured)) & !bit;
-        if liberties == 0 {
+        for p in captured.iter_ones() {
+            if neighbors(p).any(|n| own[n]) {
+                liberties.set(p, true);
+            }
+        }
+        liberties.set(point, false);
+        if liberties.not_any() {
             return None;
         }
         // 精确比较历史，保持位置超级劫语义，不依赖有碰撞风险的哈希。
         let mut after = [0; CELL_COUNT];
         after.copy_from_slice(&board.cells);
         after[point] = player.stone();
-        let mut removed = captured;
-        while removed != 0 {
-            let p = removed.trailing_zeros() as usize;
+        for p in captured.iter_ones() {
             after[p] = 0;
-            removed &= removed - 1;
         }
         if board.history.iter().any(|old| old.as_slice() == after) {
             return None;
@@ -166,15 +177,23 @@ impl MoveAnalysis {
     }
 }
 
-fn adjacent_mask(stones: u128) -> u128 {
-    const BOARD: u128 = (1u128 << CELL_COUNT) - 1;
-    const LEFT: u128 = BOARD / ((1u128 << BOARD_SIZE) - 1);
-    const RIGHT: u128 = LEFT << (BOARD_SIZE - 1);
-    ((stones << BOARD_SIZE)
-        | (stones >> BOARD_SIZE)
-        | ((stones & !LEFT) >> 1)
-        | ((stones & !RIGHT) << 1))
-        & BOARD
+fn deserialize_cells<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<i8>, D::Error> {
+    let cells = Vec::<i8>::deserialize(d)?;
+    if cells.len() != CELL_COUNT || cells.iter().any(|&s| !(-1..=1).contains(&s)) {
+        return Err(serde::de::Error::custom("需要合法的 19×19 盘面"));
+    }
+    Ok(cells)
+}
+fn deserialize_history<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Vec<i8>>, D::Error> {
+    let history = Vec::<Vec<i8>>::deserialize(d)?;
+    if history.is_empty()
+        || history
+            .iter()
+            .any(|cells| cells.len() != CELL_COUNT || cells.iter().any(|&s| !(-1..=1).contains(&s)))
+    {
+        return Err(serde::de::Error::custom("需要合法的 19×19 历史盘面"));
+    }
+    Ok(history)
 }
 
 impl Default for Board {
@@ -401,7 +420,11 @@ pub(crate) fn transform_index(index: usize, symmetry: usize) -> usize {
 }
 impl fmt::Display for Board {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "   A B C D E F G H J")?;
+        write!(f, "   ")?;
+        for col in COORDINATES.chars() {
+            write!(f, "{} ", col.to_ascii_uppercase())?;
+        }
+        writeln!(f)?;
         for row in (0..BOARD_SIZE).rev() {
             write!(f, "{:>2} ", row + 1)?;
             for col in 0..BOARD_SIZE {
@@ -439,6 +462,30 @@ mod tests {
         position(&["a2", "b1", "c2"], &["b2", "a3", "c3", "b4"])
     }
     #[test]
+    fn captures_top_right_corner_above_bit_128() {
+        let mut board = position(&["s19"], &["t19"]);
+        let analysis = MoveAnalysis::new(&crate::scoring::chains(board.cells()));
+        let info = analysis
+            .placement(&board, mv("t18"), Player::Black)
+            .unwrap();
+        assert_eq!(info.captured.count_ones(), 1);
+        assert!(info.captured[360]);
+        assert!(board.play(mv("t18")));
+        assert_eq!(board.cells()[360], 0);
+        assert_eq!(Move::PASS.0, 361);
+    }
+
+    #[test]
+    fn rejects_nine_by_nine_serialized_board() {
+        let mut data = serde_json::to_value(Board::new()).unwrap();
+        data["cells"] = serde_json::json!(vec![0i8; 81]);
+        assert!(serde_json::from_value::<Board>(data).is_err());
+        let mut data = serde_json::to_value(Board::new()).unwrap();
+        data["history"] = serde_json::json!([vec![0i8; 81]]);
+        assert!(serde_json::from_value::<Board>(data).is_err());
+    }
+
+    #[test]
     fn bitset_candidates_match_reference_placement() {
         let mut rng = 719u64;
         for _ in 0..12 {
@@ -456,10 +503,10 @@ mod tests {
                         );
                         if let Some(after) = reference {
                             let actual = actual.unwrap();
-                            let mut captured = 0;
+                            let mut captured = PointSet::ZERO;
                             for p in 0..CELL_COUNT {
                                 if board.cells[p] != 0 && after[p] == 0 {
-                                    captured |= 1u128 << p;
+                                    captured.set(p, true);
                                 }
                             }
                             assert_eq!(actual.captured, captured);
@@ -559,7 +606,7 @@ mod tests {
         for index in 0..ACTION_COUNT {
             assert_eq!(Move::parse(&Move(index).notation()), Some(Move(index)));
         }
-        for text in ["i1", "a0", "a10", "k1", "中1", "@1", ""] {
+        for text in ["i1", "a0", "a20", "u1", "中1", "@1", ""] {
             assert!(Move::parse(text).is_none());
         }
     }

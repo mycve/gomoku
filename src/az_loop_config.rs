@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::{fs, io, path::Path};
 
-pub const DEFAULT_CONFIG_PATH: &str = "go9-v31.azloop.toml";
+pub const DEFAULT_CONFIG_PATH: &str = "go19-v32.azloop.toml";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -56,10 +56,10 @@ impl Default for AzLoopConfig {
     fn default() -> Self {
         Self {
             format_version: 22,
-            model_path: "go9-v31-model.safetensors".into(),
-            best_model_path: "go9-v31-best.safetensors".into(),
-            replay_path: "data/go9-v31/replay.jsonl".into(),
-            progress_path: "data/go9-v31/azloop-progress.json".into(),
+            model_path: "go19-v32-model.safetensors".into(),
+            best_model_path: "go19-v32-best.safetensors".into(),
+            replay_path: "data/go19-v32/replay.jsonl".into(),
+            progress_path: "data/go19-v32/azloop-progress.json".into(),
             simulations: 400,
             hidden_size: 128,
             seed: 20260730,
@@ -90,7 +90,7 @@ impl Default for AzLoopConfig {
             replay_policy_surprise_fraction: 0.4,
             replay_value_surprise_fraction: 0.1,
             checkpoint_interval: 20,
-            checkpoint_dir: "checkpoints/go9-v31".into(),
+            checkpoint_dir: "checkpoints/go19-v32".into(),
             max_checkpoints: 20,
             arena_interval: 20,
             arena_games: 100,
@@ -98,7 +98,7 @@ impl Default for AzLoopConfig {
             arena_promotion_rate: 0.50,
             arena_promotion_confidence_z: 1.28,
             arena_color_score_floor: 0.45,
-            tensorboard_logdir: "runs/go9-v31".into(),
+            tensorboard_logdir: "runs/go19-v32".into(),
         }
     }
 }
@@ -216,10 +216,10 @@ impl AzLoopConfig {
 }
 
 const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 22
-model_path = "go9-v31-model.safetensors"
-best_model_path = "go9-v31-best.safetensors"
-replay_path = "data/go9-v31/replay.jsonl"
-progress_path = "data/go9-v31/azloop-progress.json"
+model_path = "go19-v32-model.safetensors"
+best_model_path = "go19-v32-best.safetensors"
+replay_path = "data/go19-v32/replay.jsonl"
+progress_path = "data/go19-v32/azloop-progress.json"
 simulations = 400
 hidden_size = 128
 seed = 20260730
@@ -250,7 +250,7 @@ replay_recent_updates = 5
 replay_policy_surprise_fraction = 0.4
 replay_value_surprise_fraction = 0.1
 checkpoint_interval = 20
-checkpoint_dir = "checkpoints/go9-v31"
+checkpoint_dir = "checkpoints/go19-v32"
 max_checkpoints = 20
 arena_interval = 20
 arena_games = 100
@@ -258,7 +258,7 @@ arena_opening_plies = 2
 arena_promotion_rate = 0.5
 arena_promotion_confidence_z = 1.28
 arena_color_score_floor = 0.45
-tensorboard_logdir = "runs/go9-v31"
+tensorboard_logdir = "runs/go19-v32"
 "#;
 
 #[cfg(test)]

@@ -32,9 +32,10 @@ pub const ROLE_ADAPTER_RANK: usize = 8;
 pub const REGION_COUNT: usize = 9;
 pub const REGION_FEATURE_SIZE: usize = 8;
 pub const REGION_TOTAL_SIZE: usize = REGION_COUNT * REGION_FEATURE_SIZE;
-const FORMAT_VERSION: f32 = 31.0;
-const LOCAL_BOUNDARY: u8 = u8::MAX;
-const LOCAL_NEIGHBORS: [u8; ACTION_COUNT * LOCAL_AXES * 2 * LOCAL_RADIUS] = build_local_neighbors();
+const FORMAT_VERSION: f32 = 32.0;
+const LOCAL_BOUNDARY: u16 = u16::MAX;
+const LOCAL_NEIGHBORS: [u16; ACTION_COUNT * LOCAL_AXES * 2 * LOCAL_RADIUS] =
+    build_local_neighbors();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PolicyValueArch {
@@ -66,7 +67,7 @@ impl Default for PolicyValueArch {
     }
 }
 
-const fn build_local_neighbors() -> [u8; ACTION_COUNT * LOCAL_AXES * 2 * LOCAL_RADIUS] {
+const fn build_local_neighbors() -> [u16; ACTION_COUNT * LOCAL_AXES * 2 * LOCAL_RADIUS] {
     let mut table = [LOCAL_BOUNDARY; ACTION_COUNT * LOCAL_AXES * 2 * LOCAL_RADIUS];
     let directions = [(1_i32, 0_i32), (0, 1), (1, 1), (1, -1)];
     let mut cell = 0;
@@ -89,7 +90,7 @@ const fn build_local_neighbors() -> [u8; ACTION_COUNT * LOCAL_AXES * 2 * LOCAL_R
                         && next_row < BOARD_SIZE as i32
                         && next_col < BOARD_SIZE as i32
                     {
-                        table[slot] = (next_row as usize * BOARD_SIZE + next_col as usize) as u8;
+                        table[slot] = (next_row as usize * BOARD_SIZE + next_col as usize) as u16;
                     }
                     distance += 1;
                 }
@@ -186,7 +187,7 @@ impl PolicyValueModel {
     }
 
     pub fn random_with_arch(arch: PolicyValueArch, seed: u64) -> Self {
-        arch.validate().expect("9×9围棋网络架构必须合法");
+        arch.validate().expect("19×19围棋网络架构必须合法");
         Self::random(arch.hidden_size, seed)
     }
 
@@ -532,7 +533,7 @@ impl PolicyValueModel {
         mv: Move,
         player: Player,
     ) {
-        let region = (mv.row() / (BOARD_SIZE / 3)) * 3 + mv.col() / (BOARD_SIZE / 3);
+        let region = region_index(mv.0);
         let side = usize::from(player != perspective);
         let source = (region * STONE_TYPES + side) * REGION_FEATURE_SIZE;
         let target = region * REGION_FEATURE_SIZE;
@@ -836,7 +837,7 @@ impl PolicyValueModel {
         if version != FORMAT_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "需要 v31 纯 MC 单胜率模型；旧 WDL 模型不能直接载入",
+                "需要 v32 纯 MC 单胜率模型；9路模型不能直接载入",
             ));
         }
         let hidden_bias = load(&tensors, "hidden_bias")?;
@@ -844,7 +845,7 @@ impl PolicyValueModel {
         if hidden_size == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "9×9围棋模型隐藏层不能为空",
+                "19×19围棋模型隐藏层不能为空",
             ));
         }
         let model = Self {
@@ -907,13 +908,17 @@ impl PolicyValueModel {
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "9×9围棋模型张量尺寸错误",
+                "19×19围棋模型张量尺寸错误",
             ));
         }
         let mut model = model;
         model.refresh_local_axis_features();
         Ok(model)
     }
+}
+
+pub(crate) fn region_index(point: usize) -> usize {
+    (point / BOARD_SIZE * 3 / BOARD_SIZE) * 3 + (point % BOARD_SIZE * 3 / BOARD_SIZE)
 }
 
 fn role_index(player: Player) -> usize {
@@ -1258,15 +1263,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn old_wdl_model_is_rejected() {
+    fn regions_cover_all_nineteen_rows_and_columns() {
+        let mut counts = [0; REGION_COUNT];
+        for point in 0..CELL_COUNT {
+            counts[region_index(point)] += 1;
+        }
+        assert_eq!(region_index(0), 0);
+        assert_eq!(region_index(CELL_COUNT - 1), 8);
+        assert_eq!(counts.iter().sum::<usize>(), 361);
+        assert!(counts.iter().all(|&count| count >= 36));
+        let model = PolicyValueModel::random(8, 19);
+        let board = Board::from_position(&[(Move(360), Player::Black)], Player::White).unwrap();
+        let (policy, value) = model.evaluate(&board);
+        assert_eq!(policy.len(), 361);
+        assert!(policy.iter().any(|&(mv, _)| mv == Move::PASS));
+        assert!(value.is_finite());
+    }
+
+    #[test]
+    fn nine_by_nine_model_is_rejected() {
         let path =
             std::env::temp_dir().join(format!("go9-old-format-{}.safetensors", std::process::id()));
         let vars = VarMap::new();
-        insert(&vars, "format_version", &[30.0], (1,)).unwrap();
+        insert(&vars, "format_version", &[31.0], (1,)).unwrap();
         vars.save(&path).unwrap();
         let result = PolicyValueModel::load(&path);
         std::fs::remove_file(path).unwrap();
-        assert!(result.err().unwrap().to_string().contains("v31"));
+        assert!(result.err().unwrap().to_string().contains("v32"));
     }
 
     #[test]
@@ -1314,6 +1337,30 @@ mod tests {
         let forward = local_ray_codes(&board, candidate, 0, 1);
         let backward = local_ray_codes(&board, candidate, 0, -1);
         assert_eq!(forward, backward);
+    }
+
+    #[test]
+    fn local_neighbors_preserve_full_board_coordinates() {
+        for cell in 0..CELL_COUNT {
+            for (axis, (dr, dc)) in [(1, 0), (0, 1), (1, 1), (1, -1)].into_iter().enumerate() {
+                for (ray, sign) in [-1, 1].into_iter().enumerate() {
+                    for distance in 1..=LOCAL_RADIUS {
+                        let row = (cell / BOARD_SIZE) as i32 + dr * sign * distance as i32;
+                        let col = (cell % BOARD_SIZE) as i32 + dc * sign * distance as i32;
+                        let expected = if (0..BOARD_SIZE as i32).contains(&row)
+                            && (0..BOARD_SIZE as i32).contains(&col)
+                        {
+                            (row as usize * BOARD_SIZE + col as usize) as u16
+                        } else {
+                            LOCAL_BOUNDARY
+                        };
+                        let slot =
+                            ((cell * LOCAL_AXES + axis) * 2 + ray) * LOCAL_RADIUS + distance - 1;
+                        assert_eq!(LOCAL_NEIGHBORS[slot], expected, "cell={cell}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
