@@ -1,6 +1,6 @@
 //! 保守死活分析：Benson 活棋 + 在确定活棋围成的小区域内完整枚举防守着。
 //! 搜索耗尽预算只返回未定，不能把“未证明活”直接当成死。
-use crate::game::{Board, CELL_COUNT, Move, Player, group, neighbors};
+use crate::game::{Board, CELL_COUNT, Move, Player, neighbors};
 
 #[derive(Clone, Debug)]
 pub struct Chain {
@@ -10,23 +10,30 @@ pub struct Chain {
 }
 
 pub fn chains(cells: &[i8]) -> Vec<Chain> {
+    crate::scope_profile!("scoring.chains");
     let mut seen = [false; CELL_COUNT];
+    let mut liberty_stamp = [0_usize; CELL_COUNT];
     let mut result = Vec::new();
     for start in 0..CELL_COUNT {
         if cells[start] == 0 || seen[start] {
             continue;
         }
-        let stones = group(cells, start).0;
+        let mut stones = vec![start];
+        seen[start] = true;
         let mut liberties = Vec::new();
-        let mut liberty_seen = [false; CELL_COUNT];
-        for &stone in &stones {
-            seen[stone] = true;
-            for n in neighbors(stone) {
-                if cells[n] == 0 && !liberty_seen[n] {
-                    liberty_seen[n] = true;
+        let stamp = result.len() + 1;
+        let mut cursor = 0;
+        while cursor < stones.len() {
+            for n in neighbors(stones[cursor]) {
+                if cells[n] == 0 && liberty_stamp[n] != stamp {
+                    liberty_stamp[n] = stamp;
                     liberties.push(n);
+                } else if cells[n] == cells[start] && !seen[n] {
+                    seen[n] = true;
+                    stones.push(n);
                 }
             }
+            cursor += 1;
         }
         result.push(Chain {
             stones,
@@ -44,6 +51,7 @@ pub fn pass_alive(cells: &[i8]) -> [bool; CELL_COUNT] {
 }
 
 pub(crate) fn pass_alive_with_chains(cells: &[i8], groups: &[Chain]) -> [bool; CELL_COUNT] {
+    crate::scope_profile!("scoring.benson");
     let mut at = [usize::MAX; CELL_COUNT];
     for (i, chain) in groups.iter().enumerate() {
         for &s in &chain.stones {

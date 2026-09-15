@@ -126,6 +126,7 @@ pub struct PolicyValueModel {
     pub(crate) local_axis_scale: Vec<f32>,
     pub(crate) local_axis_bias: Vec<f32>,
     local_axis_features: Vec<f32>,
+    stone_features: Vec<f32>,
     pub(crate) policy_local: Vec<f32>,
     pub(crate) value_head_hidden: Vec<f32>,
     pub(crate) value_region_hidden: Vec<f32>,
@@ -234,6 +235,7 @@ impl PolicyValueModel {
             local_axis_scale: vec![1.0; 2 * LOCAL_AXIS_FEATURE_SIZE],
             local_axis_bias: vec![0.0; 2 * LOCAL_AXIS_FEATURE_SIZE],
             local_axis_features: Vec::new(),
+            stone_features: Vec::new(),
             policy_local: vec![0.0; LOCAL_CANDIDATE_SIZE],
             value_head_hidden: (0..hidden_size * VALUE_HEAD_SIZE)
                 .map(|_| rng.weight((2.0 / hidden_size as f32).sqrt() * 0.5))
@@ -247,7 +249,7 @@ impl PolicyValueModel {
             value_head_bias2: vec![0.0; VALUE_HEAD_SIZE],
             value_head_output: vec![0.0; VALUE_HEAD_SIZE],
         };
-        model.refresh_local_axis_features();
+        model.refresh_inference_cache();
         model
     }
 
@@ -476,8 +478,12 @@ impl PolicyValueModel {
                 continue;
             }
             let start = (GO_INPUT_START + feature) * self.hidden_size;
-            for h in 0..self.hidden_size {
-                accumulator.hidden[h] += self.input_hidden[start + h] * value;
+            for (hidden, weight) in accumulator
+                .hidden
+                .iter_mut()
+                .zip(&self.input_hidden[start..start + self.hidden_size])
+            {
+                *hidden += weight * value;
             }
         }
         accumulator
@@ -557,20 +563,12 @@ impl PolicyValueModel {
         player: Player,
     ) {
         let side = usize::from(player != perspective);
-        let exact = (side * CELL_COUNT + mv.0) * self.hidden_size;
-        let rank = (side * BOARD_SIZE + mv.row()) * self.hidden_size;
-        let file = (side * BOARD_SIZE + mv.col()) * self.hidden_size;
-        let diagonal =
-            (side * (BOARD_SIZE * 2 - 1) + mv.row() + BOARD_SIZE - 1 - mv.col()) * self.hidden_size;
-        let anti_diagonal = (side * (BOARD_SIZE * 2 - 1) + mv.row() + mv.col()) * self.hidden_size;
-        let stone = side * self.hidden_size;
-        for (h, value) in hidden.iter_mut().enumerate() {
-            *value += self.input_hidden[exact + h]
-                + self.stone_hidden[stone + h]
-                + self.rank_hidden[rank + h]
-                + self.file_hidden[file + h]
-                + self.diagonal_hidden[diagonal + h]
-                + self.anti_diagonal_hidden[anti_diagonal + h];
+        let start = (side * CELL_COUNT + mv.0) * self.hidden_size;
+        for (value, weight) in hidden
+            .iter_mut()
+            .zip(&self.stone_features[start..start + self.hidden_size])
+        {
+            *value += weight;
         }
     }
 
@@ -645,7 +643,31 @@ impl PolicyValueModel {
         tactical
     }
 
-    pub(crate) fn refresh_local_axis_features(&mut self) {
+    pub(crate) fn refresh_inference_cache(&mut self) {
+        self.stone_features
+            .resize(STONE_TYPES * CELL_COUNT * self.hidden_size, 0.0);
+        for side in 0..STONE_TYPES {
+            for point in 0..CELL_COUNT {
+                let mv = Move(point);
+                let exact = (side * CELL_COUNT + point) * self.hidden_size;
+                let rank = (side * BOARD_SIZE + mv.row()) * self.hidden_size;
+                let file = (side * BOARD_SIZE + mv.col()) * self.hidden_size;
+                let diagonal = (side * (BOARD_SIZE * 2 - 1) + mv.row() + BOARD_SIZE - 1 - mv.col())
+                    * self.hidden_size;
+                let anti_diagonal =
+                    (side * (BOARD_SIZE * 2 - 1) + mv.row() + mv.col()) * self.hidden_size;
+                let stone = side * self.hidden_size;
+                for h in 0..self.hidden_size {
+                    self.stone_features[exact + h] = self.input_hidden[exact + h]
+                        + self.stone_hidden[stone + h]
+                        + self.rank_hidden[rank + h]
+                        + self.file_hidden[file + h]
+                        + self.diagonal_hidden[diagonal + h]
+                        + self.anti_diagonal_hidden[anti_diagonal + h];
+                }
+            }
+        }
+
         self.local_axis_features
             .resize(2 * LOCAL_AXIS_PATTERNS * LOCAL_AXIS_FEATURE_SIZE, 0.0);
         for kind in 0..2 {
@@ -870,6 +892,7 @@ impl PolicyValueModel {
             local_axis_scale: load(&tensors, "local_axis_scale")?,
             local_axis_bias: load(&tensors, "local_axis_bias")?,
             local_axis_features: Vec::new(),
+            stone_features: Vec::new(),
             policy_local: load(&tensors, "policy_local")?,
             value_head_hidden: load(&tensors, "value_head_hidden")?,
             value_region_hidden: load(&tensors, "value_region_hidden")?,
@@ -912,7 +935,7 @@ impl PolicyValueModel {
             ));
         }
         let mut model = model;
-        model.refresh_local_axis_features();
+        model.refresh_inference_cache();
         Ok(model)
     }
 }
@@ -1452,5 +1475,54 @@ mod tests {
                 assert!((expected[h] - actual[h]).abs() < 1.0e-6);
             }
         }
+    }
+
+    #[test]
+    fn fused_stone_cache_matches_nonzero_weights_and_refreshes() {
+        let mut model = PolicyValueModel::random(13, 71);
+        for (kind, weights) in [
+            &mut model.stone_hidden,
+            &mut model.rank_hidden,
+            &mut model.file_hidden,
+            &mut model.diagonal_hidden,
+            &mut model.anti_diagonal_hidden,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (i, value) in weights.iter_mut().enumerate() {
+                *value = (i % 19) as f32 * 0.013 - kind as f32 * 0.027;
+            }
+        }
+        model.refresh_inference_cache();
+        for side in 0..2 {
+            for point in 0..CELL_COUNT {
+                let mv = Move(point);
+                for h in 0..model.hidden_size {
+                    let exact = (side * CELL_COUNT + point) * model.hidden_size + h;
+                    let expected = model.input_hidden[exact]
+                        + model.stone_hidden[side * model.hidden_size + h]
+                        + model.rank_hidden[(side * BOARD_SIZE + mv.row()) * model.hidden_size + h]
+                        + model.file_hidden[(side * BOARD_SIZE + mv.col()) * model.hidden_size + h]
+                        + model.diagonal_hidden[(side * (BOARD_SIZE * 2 - 1)
+                            + mv.row()
+                            + BOARD_SIZE
+                            - 1
+                            - mv.col())
+                            * model.hidden_size
+                            + h]
+                        + model.anti_diagonal_hidden[(side * (BOARD_SIZE * 2 - 1)
+                            + mv.row()
+                            + mv.col())
+                            * model.hidden_size
+                            + h];
+                    assert_eq!(model.stone_features[exact], expected);
+                }
+            }
+        }
+        let old = model.stone_features[0];
+        model.input_hidden[0] += 1.0;
+        model.refresh_inference_cache();
+        assert!((model.stone_features[0] - old - 1.0).abs() < 1e-6);
     }
 }

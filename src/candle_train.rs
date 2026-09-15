@@ -658,7 +658,7 @@ impl Replica {
         m.value_head_hidden2 = v[24].clone();
         m.value_head_bias2 = v[25].clone();
         m.value_head_output = v[26].clone();
-        m.refresh_local_axis_features();
+        m.refresh_inference_cache();
         Ok(())
     }
 }

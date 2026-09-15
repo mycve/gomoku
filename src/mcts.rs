@@ -72,6 +72,7 @@ pub struct SearchOutput {
 }
 struct Node {
     board: Board,
+    outcome: Option<Outcome>,
     accumulator_offset: usize,
     children: Vec<Edge>,
     expanded: bool,
@@ -122,6 +123,7 @@ fn search_until(
     let root_accumulator = model.accumulator_into_arena(board, &mut accumulator_arena);
     let mut nodes = vec![Node {
         board: board.clone(),
+        outcome: board.outcome(),
         accumulator_offset: root_accumulator,
         children: vec![],
         expanded: false,
@@ -183,7 +185,7 @@ fn expand(
     scratch: &mut EvalScratch,
 ) -> f32 {
     crate::scope_profile!("mcts.expand");
-    if let Some(out) = nodes[idx].board.outcome() {
+    if let Some(out) = nodes[idx].outcome {
         return match out {
             Outcome::Draw | Outcome::Aborted => 0.0,
             Outcome::Win(p) => {
@@ -260,7 +262,7 @@ fn simulate(
     cfg: SearchConfig,
     scratch: &mut EvalScratch,
 ) -> f32 {
-    if let Some(out) = nodes[idx].board.outcome() {
+    if let Some(out) = nodes[idx].outcome {
         return match out {
             Outcome::Draw | Outcome::Aborted => 0.0,
             Outcome::Win(p) => {
@@ -313,7 +315,6 @@ fn simulate(
         };
         let mv = nodes[idx].children[best].mv;
         assert!(b.play(mv));
-        let accumulator_offset = model.accumulator_into_arena(&b, accumulator_arena);
         let key = board_hash(&b);
         let c = if cfg.use_graph_search {
             transpositions.get(&key).and_then(|candidates| {
@@ -327,8 +328,15 @@ fn simulate(
         }
         .unwrap_or_else(|| {
             let c = nodes.len();
+            let outcome = b.outcome();
+            let accumulator_offset = if outcome.is_none() {
+                model.accumulator_into_arena(&b, accumulator_arena)
+            } else {
+                0
+            };
             nodes.push(Node {
                 board: b,
+                outcome,
                 accumulator_offset,
                 children: vec![],
                 expanded: false,

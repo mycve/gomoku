@@ -28,9 +28,9 @@ fn main() -> io::Result<()> {
         let model = PolicyValueModel::random(128, 719);
         let samples = go19::selfplay::generate(
             &model,
-            64,
+            1,
             SearchConfig {
-                simulations: 16,
+                simulations: 4,
                 ..Default::default()
             },
         );
@@ -39,13 +39,20 @@ fn main() -> io::Result<()> {
         println!("prepared {} fresh MC samples", samples.len());
         return Ok(());
     }
-    let mut model = PolicyValueModel::load(model_path)?;
+    let mut model = if model_path == "random" {
+        PolicyValueModel::random(128, 719)
+    } else {
+        PolicyValueModel::load(model_path)?
+    };
     let samples = replay::load(replay_path)?;
     if samples.is_empty() {
         return Err(io::Error::other("性能诊断需要非空回放"));
     }
     let cfg = SearchConfig {
-        simulations: 400,
+        simulations: std::env::var("GO19_PROBE_SIMS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(800),
         cpuct: 2.0,
         cpuct_log: 1.5,
         ..Default::default()
@@ -56,7 +63,7 @@ fn main() -> io::Result<()> {
         samples.len()
     );
     let mut boards = vec![Board::new()];
-    for plies in [20, 50, 80, 110] {
+    for plies in [100, 250, 400, 500] {
         if let Some(sample) = samples
             .iter()
             .min_by_key(|s| s.board.move_count().abs_diff(plies))
@@ -95,6 +102,7 @@ fn main() -> io::Result<()> {
             }
             profile::reset();
             for board in &boards {
+                profile::reset();
                 let start = Instant::now();
                 let mut visits = 0;
                 for _ in 0..20 {
@@ -110,6 +118,7 @@ fn main() -> io::Result<()> {
                     start.elapsed().as_secs_f64() * 1000.0,
                     visits as f64 / start.elapsed().as_secs_f64()
                 );
+                profile::print_report();
             }
         }
         "parallel" => {
@@ -143,6 +152,11 @@ fn main() -> io::Result<()> {
         }
         "micro" => {
             for board in &boards {
+                // 仅用于隔离历史长度的成本；不能用于实际搜索或训练。
+                let mut position = serde_json::to_value(board).map_err(io::Error::other)?;
+                position["history"] = serde_json::json!([board.cells()]);
+                let short_history: Board =
+                    serde_json::from_value(position).map_err(io::Error::other)?;
                 let runs = 1000;
                 let start = Instant::now();
                 for _ in 0..runs {
@@ -156,10 +170,20 @@ fn main() -> io::Result<()> {
                 let encode = start.elapsed().as_secs_f64() * 1e6 / runs as f64;
                 let start = Instant::now();
                 for _ in 0..runs {
+                    black_box(short_history.clone());
+                }
+                let short_clone = start.elapsed().as_secs_f64() * 1e6 / runs as f64;
+                let start = Instant::now();
+                for _ in 0..runs {
+                    black_box(features::encode(&short_history, short_history.to_move()));
+                }
+                let short_encode = start.elapsed().as_secs_f64() * 1e6 / runs as f64;
+                let start = Instant::now();
+                for _ in 0..runs {
                     black_box(scoring::analyze(board));
                 }
                 println!(
-                    "plies={} clone_us={clone:.3} encode_us={encode:.3} scoring_us={:.3}",
+                    "plies={} clone_us={clone:.3} encode_us={encode:.3} short_history_clone_us={short_clone:.3} short_history_encode_us={short_encode:.3} scoring_us={:.3}",
                     board.move_count(),
                     start.elapsed().as_secs_f64() * 1e6 / runs as f64
                 );
@@ -235,6 +259,8 @@ fn main() -> io::Result<()> {
             ));
         }
     }
-    profile::print_report();
+    if !matches!(mode, "search" | "graph-off" | "symmetry-one") {
+        profile::print_report();
+    }
     Ok(())
 }

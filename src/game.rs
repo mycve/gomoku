@@ -1,9 +1,27 @@
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 pub const BOARD_SIZE: usize = 19;
 pub const COORDINATES: &str = "abcdefghjklmnopqrst";
 type PointSet = bitvec::array::BitArray<[u64; CELL_COUNT.div_ceil(64)]>;
+#[inline]
+fn union_points(target: &mut PointSet, source: &PointSet) {
+    for (to, from) in target
+        .as_raw_mut_slice()
+        .iter_mut()
+        .zip(source.as_raw_slice())
+    {
+        *to |= from;
+    }
+}
+#[inline]
+fn point_count(points: &PointSet) -> usize {
+    points
+        .as_raw_slice()
+        .iter()
+        .map(|word| word.count_ones() as usize)
+        .sum()
+}
 pub const CELL_COUNT: usize = BOARD_SIZE * BOARD_SIZE;
 pub const ACTION_COUNT: usize = CELL_COUNT + 1;
 pub const KOMI: f32 = 7.5;
@@ -83,8 +101,101 @@ pub struct Board {
     #[serde(deserialize_with = "deserialize_cells")]
     previous: Vec<i8>,
     /// 精确盘面历史，用于位置超级劫；pass 不受超级劫限制。
-    #[serde(deserialize_with = "deserialize_history")]
-    history: Vec<Vec<i8>>,
+    history: PositionHistory,
+}
+
+/// 持久化容器共享历史和索引；搜索分叉只复制修改路径，不复制历史盘面。
+#[derive(Clone, Debug)]
+struct PositionHistory {
+    positions: im::Vector<Arc<Vec<i8>>>,
+    index: im::HashMap<u64, usize>,
+    collisions: im::HashMap<u64, im::Vector<usize>>,
+    current_hash: u64,
+}
+impl PartialEq for PositionHistory {
+    fn eq(&self, other: &Self) -> bool {
+        self.positions == other.positions
+    }
+}
+impl Eq for PositionHistory {}
+impl PositionHistory {
+    fn push(&mut self, cells: Vec<i8>) {
+        let hash = position_hash(&cells);
+        let position = self.positions.len();
+        if let Some(&first) = self.index.get(&hash) {
+            if self.positions[first].as_slice() != cells {
+                self.collisions.entry(hash).or_default().push_back(position);
+            }
+        } else {
+            self.index.insert(hash, position);
+        }
+        self.positions.push_back(Arc::new(cells));
+        self.current_hash = hash;
+    }
+    fn contains_hashed(&self, hash: u64, cells: &[i8]) -> bool {
+        self.index
+            .get(&hash)
+            .is_some_and(|&first| self.positions[first].as_slice() == cells)
+            || self.collisions.get(&hash).is_some_and(|positions| {
+                positions
+                    .iter()
+                    .any(|&position| self.positions[position].as_slice() == cells)
+            })
+    }
+    fn contains(&self, cells: &[i8]) -> bool {
+        self.contains_hashed(position_hash(cells), cells)
+    }
+}
+impl FromIterator<Vec<i8>> for PositionHistory {
+    fn from_iter<T: IntoIterator<Item = Vec<i8>>>(iter: T) -> Self {
+        let mut history = Self {
+            positions: im::Vector::new(),
+            index: im::HashMap::new(),
+            collisions: im::HashMap::new(),
+            current_hash: 0,
+        };
+        for cells in iter {
+            history.push(cells);
+        }
+        history
+    }
+}
+impl Serialize for PositionHistory {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.positions.len()))?;
+        for cells in &self.positions {
+            seq.serialize_element(cells.as_ref())?;
+        }
+        seq.end()
+    }
+}
+impl<'de> Deserialize<'de> for PositionHistory {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(deserialize_history(d)?.into_iter().collect())
+    }
+}
+const ZOBRIST: [[u64; 2]; CELL_COUNT] = {
+    let mut table = [[0; 2]; CELL_COUNT];
+    let mut i = 0;
+    while i < CELL_COUNT * 2 {
+        let mut z = (i as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        table[i / 2][i % 2] = z ^ (z >> 31);
+        i += 1;
+    }
+    table
+};
+fn stone_hash(point: usize, stone: i8) -> u64 {
+    ZOBRIST[point][usize::from(stone == -1)]
+}
+fn position_hash(cells: &[i8]) -> u64 {
+    cells
+        .iter()
+        .enumerate()
+        .filter(|(_, stone)| **stone != 0)
+        .fold(0, |hash, (point, &stone)| hash ^ stone_hash(point, stone))
 }
 /// 单个候选的精确提子与落子后气数，不分配临时棋盘。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -135,7 +246,6 @@ impl MoveAnalysis {
         }
         let mut bit = PointSet::ZERO;
         bit.set(point, true);
-        let mut own = bit;
         let mut liberties = PointSet::ZERO;
         let mut captured = PointSet::ZERO;
         for n in neighbors(point) {
@@ -144,35 +254,49 @@ impl MoveAnalysis {
             } else {
                 let id = self.at[n];
                 if board.cells[n] == player.stone() {
-                    own |= self.stones[id];
-                    liberties |= self.liberties[id];
-                } else if self.liberties[id] == bit {
-                    captured |= self.stones[id];
+                    union_points(&mut liberties, &self.liberties[id]);
+                } else if self.liberties[id].as_raw_slice() == bit.as_raw_slice() {
+                    union_points(&mut captured, &self.stones[id]);
                 }
             }
         }
-        for p in captured.iter_ones() {
-            if neighbors(p).any(|n| own[n]) {
-                liberties.set(p, true);
+        if point_count(&captured) != 0 {
+            let mut own = bit;
+            for n in neighbors(point) {
+                if board.cells[n] == player.stone() {
+                    union_points(&mut own, &self.stones[self.at[n]]);
+                }
+            }
+            for p in captured.iter_ones() {
+                if neighbors(p).any(|n| own[n]) {
+                    liberties.set(p, true);
+                }
             }
         }
         liberties.set(point, false);
-        if liberties.not_any() {
+        let liberty_count = point_count(&liberties);
+        if liberty_count == 0 {
             return None;
         }
-        // 精确比较历史，保持位置超级劫语义，不依赖有碰撞风险的哈希。
-        let mut after = [0; CELL_COUNT];
-        after.copy_from_slice(&board.cells);
-        after[point] = player.stone();
+        let mut hash = board.history.current_hash ^ stone_hash(point, player.stone());
         for p in captured.iter_ones() {
-            after[p] = 0;
+            hash ^= stone_hash(p, -player.stone());
         }
-        if board.history.iter().any(|old| old.as_slice() == after) {
-            return None;
+        // 哈希仅筛选；命中后仍精确比较，碰撞不会误禁着。
+        if board.history.index.contains_key(&hash) {
+            let mut after = [0; CELL_COUNT];
+            after.copy_from_slice(&board.cells);
+            after[point] = player.stone();
+            for p in captured.iter_ones() {
+                after[p] = 0;
+            }
+            if board.history.contains_hashed(hash, &after) {
+                return None;
+            }
         }
         Some(PlacementInfo {
             captured,
-            liberties: liberties.count_ones(),
+            liberties: liberty_count,
         })
     }
 }
@@ -196,6 +320,74 @@ fn deserialize_history<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Vec
     Ok(history)
 }
 
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    #[test]
+    fn history_forks_share_positions_and_keep_exact_collision_checks() {
+        let mut board = Board::new();
+        for text in ["a1", "t19", "b1", "s19"] {
+            assert!(board.play(Move::parse(text).unwrap()));
+        }
+        let original = board.clone();
+        assert!(Arc::ptr_eq(
+            &original.history.positions[1],
+            &board.history.positions[1]
+        ));
+        assert!(board.play(Move::parse("c1").unwrap()));
+        assert_eq!(original.history.positions.len(), 5);
+        assert_eq!(board.history.positions.len(), 6);
+        assert_eq!(board.history.current_hash, position_hash(board.cells()));
+        let foreign = vec![0; CELL_COUNT];
+        let collision = 42;
+        board.history.index.insert(collision, 0);
+        assert!(board.history.contains_hashed(collision, &foreign));
+        assert!(!board.history.contains_hashed(collision, board.cells()));
+        board
+            .history
+            .collisions
+            .insert(collision, im::vector![board.history.positions.len() - 1]);
+        assert!(board.history.contains_hashed(collision, board.cells()));
+    }
+
+    #[test]
+    fn indexed_superko_matches_linear_history_through_long_games() {
+        for seed in 0..3 {
+            let mut board = Board::new();
+            for ply in 0..550 {
+                assert_eq!(board.history.current_hash, position_hash(board.cells()));
+                for cells in &board.history.positions {
+                    assert!(board.history.contains(cells));
+                }
+                let legal = board.rule_legal_moves();
+                for &mv in &legal {
+                    if mv == Move::PASS {
+                        continue;
+                    }
+                    let after = board.placed(mv).unwrap();
+                    assert!(
+                        !board
+                            .history
+                            .positions
+                            .iter()
+                            .any(|old| old.as_slice() == after)
+                    );
+                }
+                let placements = legal
+                    .iter()
+                    .copied()
+                    .filter(|mv| *mv != Move::PASS)
+                    .collect::<Vec<_>>();
+                if placements.is_empty() {
+                    break;
+                }
+                assert!(board.play(placements[(ply * 37 + seed * 13) % placements.len()]));
+            }
+        }
+    }
+}
+
 impl Default for Board {
     fn default() -> Self {
         Self::new()
@@ -205,7 +397,7 @@ impl Board {
     pub fn new() -> Self {
         let cells = vec![0; CELL_COUNT];
         Self {
-            history: vec![cells.clone()],
+            history: [cells.clone()].into_iter().collect(),
             cells: cells.clone(),
             to_move: Player::Black,
             moves: 0,
@@ -242,7 +434,7 @@ impl Board {
         }
         board.to_move = to_move;
         board.previous = board.cells.clone();
-        board.history = vec![board.cells.clone()];
+        board.history = [board.cells.clone()].into_iter().collect();
         Some(board)
     }
     pub(crate) fn transformed(&self, symmetry: usize) -> Self {
@@ -255,7 +447,12 @@ impl Board {
         };
         Self {
             cells: transform(&self.cells),
-            history: self.history.iter().map(|cells| transform(cells)).collect(),
+            history: self
+                .history
+                .positions
+                .iter()
+                .map(|cells| transform(cells))
+                .collect(),
             previous: transform(&self.previous),
             ..self.clone()
         }
@@ -288,6 +485,7 @@ impl Board {
         !self.is_finished() && (mv == Move::PASS || self.placed(mv).is_some())
     }
     pub fn play(&mut self, mv: Move) -> bool {
+        crate::scope_profile!("game.play");
         if self.is_finished() {
             return false;
         }
@@ -373,17 +571,46 @@ impl Board {
         })
     }
 }
+const NEIGHBORS: ([[usize; 4]; CELL_COUNT], [usize; CELL_COUNT]) = {
+    let mut table = [[0; 4]; CELL_COUNT];
+    let mut counts = [0; CELL_COUNT];
+    let mut point = 0;
+    while point < CELL_COUNT {
+        let row = point / BOARD_SIZE;
+        let col = point % BOARD_SIZE;
+        let candidates = [
+            if row > 0 {
+                point - BOARD_SIZE
+            } else {
+                CELL_COUNT
+            },
+            if row + 1 < BOARD_SIZE {
+                point + BOARD_SIZE
+            } else {
+                CELL_COUNT
+            },
+            if col > 0 { point - 1 } else { CELL_COUNT },
+            if col + 1 < BOARD_SIZE {
+                point + 1
+            } else {
+                CELL_COUNT
+            },
+        ];
+        let mut i = 0;
+        while i < 4 {
+            if candidates[i] != CELL_COUNT {
+                table[point][counts[point]] = candidates[i];
+                counts[point] += 1;
+            }
+            i += 1;
+        }
+        point += 1;
+    }
+    (table, counts)
+};
+#[inline]
 pub(crate) fn neighbors(index: usize) -> impl Iterator<Item = usize> {
-    let row = index / BOARD_SIZE;
-    let col = index % BOARD_SIZE;
-    [
-        row.checked_sub(1).map(|r| r * BOARD_SIZE + col),
-        (row + 1 < BOARD_SIZE).then_some(index + BOARD_SIZE),
-        col.checked_sub(1).map(|c| row * BOARD_SIZE + c),
-        (col + 1 < BOARD_SIZE).then_some(index + 1),
-    ]
-    .into_iter()
-    .flatten()
+    NEIGHBORS.0[index][..NEIGHBORS.1[index]].iter().copied()
 }
 pub(crate) fn group(cells: &[i8], start: usize) -> (Vec<usize>, bool) {
     let mut stones = vec![start];
