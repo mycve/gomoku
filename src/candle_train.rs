@@ -1131,6 +1131,7 @@ mod tests {
             value_surprise: 0.0,
             predicted_value: 0.0,
         };
+        let sample = sample.transformed(5);
         let packed = pack(std::slice::from_ref(&sample));
         assert_eq!(packed.policy_targets[Move::PASS.0], 1.0);
         assert_eq!(packed.inputs[crate::model::PASS_INPUT], 1.0);

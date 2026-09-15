@@ -111,15 +111,35 @@ struct PositionHistory {
     index: im::HashMap<u64, usize>,
     collisions: im::HashMap<u64, im::Vector<usize>>,
     current_hash: u64,
+    /// 历史保持原坐标；仅用一个变换编号表示当前棋盘的视角。
+    symmetry: usize,
 }
 impl PartialEq for PositionHistory {
     fn eq(&self, other: &Self) -> bool {
-        self.positions == other.positions
+        if self.symmetry == other.symmetry {
+            return self.positions == other.positions;
+        }
+        self.positions.len() == other.positions.len()
+            && self
+                .positions
+                .iter()
+                .zip(&other.positions)
+                .all(|(left, right)| {
+                    (0..CELL_COUNT).all(|point| {
+                        left[SYMMETRY_MAPS[INVERSE_SYMMETRY[self.symmetry]][point]]
+                            == right[SYMMETRY_MAPS[INVERSE_SYMMETRY[other.symmetry]][point]]
+                    })
+                })
     }
 }
 impl Eq for PositionHistory {}
 impl PositionHistory {
     fn push(&mut self, cells: Vec<i8>) {
+        let cells = if self.symmetry == 0 {
+            cells
+        } else {
+            transform_cells(&cells, INVERSE_SYMMETRY[self.symmetry])
+        };
         let hash = position_hash(&cells);
         let position = self.positions.len();
         if let Some(&first) = self.index.get(&hash) {
@@ -135,15 +155,45 @@ impl PositionHistory {
     fn contains_hashed(&self, hash: u64, cells: &[i8]) -> bool {
         self.index
             .get(&hash)
-            .is_some_and(|&first| self.positions[first].as_slice() == cells)
+            .is_some_and(|&first| self.matches(&self.positions[first], cells))
             || self.collisions.get(&hash).is_some_and(|positions| {
                 positions
                     .iter()
-                    .any(|&position| self.positions[position].as_slice() == cells)
+                    .any(|&position| self.matches(&self.positions[position], cells))
             })
     }
     fn contains(&self, cells: &[i8]) -> bool {
-        self.contains_hashed(position_hash(cells), cells)
+        self.contains_hashed(self.hash(cells), cells)
+    }
+    fn matches(&self, original: &[i8], current: &[i8]) -> bool {
+        if self.symmetry == 0 {
+            return original == current;
+        }
+        original
+            .iter()
+            .enumerate()
+            .all(|(point, &stone)| stone == current[SYMMETRY_MAPS[self.symmetry][point]])
+    }
+    fn stone_hash(&self, point: usize, stone: i8) -> u64 {
+        stone_hash(SYMMETRY_MAPS[INVERSE_SYMMETRY[self.symmetry]][point], stone)
+    }
+    fn hash(&self, cells: &[i8]) -> u64 {
+        if self.symmetry == 0 {
+            return position_hash(cells);
+        }
+        cells
+            .iter()
+            .enumerate()
+            .filter(|(_, stone)| **stone != 0)
+            .fold(0, |hash, (point, &stone)| {
+                hash ^ self.stone_hash(point, stone)
+            })
+    }
+    fn transformed(&self, symmetry: usize) -> Self {
+        Self {
+            symmetry: COMPOSE_SYMMETRY[symmetry][self.symmetry],
+            ..self.clone()
+        }
     }
 }
 impl FromIterator<Vec<i8>> for PositionHistory {
@@ -153,6 +203,7 @@ impl FromIterator<Vec<i8>> for PositionHistory {
             index: im::HashMap::new(),
             collisions: im::HashMap::new(),
             current_hash: 0,
+            symmetry: 0,
         };
         for cells in iter {
             history.push(cells);
@@ -165,7 +216,11 @@ impl Serialize for PositionHistory {
         use serde::ser::SerializeSeq;
         let mut seq = serializer.serialize_seq(Some(self.positions.len()))?;
         for cells in &self.positions {
-            seq.serialize_element(cells.as_ref())?;
+            if self.symmetry == 0 {
+                seq.serialize_element(cells.as_ref())?;
+            } else {
+                seq.serialize_element(&transform_cells(cells, self.symmetry))?;
+            }
         }
         seq.end()
     }
@@ -278,9 +333,9 @@ impl MoveAnalysis {
         if liberty_count == 0 {
             return None;
         }
-        let mut hash = board.history.current_hash ^ stone_hash(point, player.stone());
+        let mut hash = board.history.current_hash ^ board.history.stone_hash(point, player.stone());
         for p in captured.iter_ones() {
-            hash ^= stone_hash(p, -player.stone());
+            hash ^= board.history.stone_hash(p, -player.stone());
         }
         // 哈希仅筛选；命中后仍精确比较，碰撞不会误禁着。
         if board.history.index.contains_key(&hash) {
@@ -323,6 +378,71 @@ fn deserialize_history<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Vec
 #[cfg(test)]
 mod history_tests {
     use super::*;
+
+    #[test]
+    fn lazy_symmetries_share_history_and_match_materialized_boards() {
+        let mut original = Board::new();
+        for ply in 0..420 {
+            let moves = original.rule_legal_moves();
+            let moves = moves
+                .into_iter()
+                .filter(|mv| *mv != Move::PASS)
+                .collect::<Vec<_>>();
+            if moves.is_empty() {
+                break;
+            }
+            assert!(original.play(moves[(ply * 37 + 13) % moves.len()]));
+        }
+        for inner in 0..8 {
+            for outer in 0..8 {
+                let mut lazy = original.transformed(inner).transformed(outer);
+                assert!(Arc::ptr_eq(
+                    &original.history.positions[100],
+                    &lazy.history.positions[100]
+                ));
+                for point in 0..ACTION_COUNT {
+                    assert_eq!(
+                        SYMMETRY_MAPS[COMPOSE_SYMMETRY[outer][inner]][point],
+                        transform_index(transform_index(point, inner), outer)
+                    );
+                }
+                let mut json = serde_json::to_value(&original).unwrap();
+                for key in ["cells", "previous"] {
+                    let values: Vec<i8> = serde_json::from_value(json[key].clone()).unwrap();
+                    json[key] =
+                        serde_json::json!(transform_cells(&transform_cells(&values, inner), outer));
+                }
+                for entry in json["history"].as_array_mut().unwrap() {
+                    let values: Vec<i8> = serde_json::from_value(entry.clone()).unwrap();
+                    *entry =
+                        serde_json::json!(transform_cells(&transform_cells(&values, inner), outer));
+                }
+                let mut eager: Board = serde_json::from_value(json.clone()).unwrap();
+                assert_eq!(serde_json::to_value(&lazy).unwrap(), json);
+                assert_eq!(lazy, eager);
+                for step in 0..5 {
+                    let legal = eager.rule_legal_moves();
+                    assert_eq!(lazy.rule_legal_moves(), legal);
+                    assert_eq!(
+                        crate::features::encode(&lazy, lazy.to_move()),
+                        crate::features::encode(&eager, eager.to_move())
+                    );
+                    if legal.is_empty() {
+                        break;
+                    }
+                    let mv = legal[(step * 17) % legal.len()];
+                    assert!(lazy.play(mv));
+                    assert!(eager.play(mv));
+                    assert_eq!(lazy, eager);
+                    assert_eq!(lazy.history.current_hash, lazy.history.hash(lazy.cells()));
+                }
+                let restored: Board =
+                    serde_json::from_slice(&serde_json::to_vec(&lazy).unwrap()).unwrap();
+                assert_eq!(restored, lazy);
+                assert_eq!(restored.rule_legal_moves(), lazy.rule_legal_moves());
+            }
+        }
+    }
 
     #[test]
     fn history_forks_share_positions_and_keep_exact_collision_checks() {
@@ -438,22 +558,13 @@ impl Board {
         Some(board)
     }
     pub(crate) fn transformed(&self, symmetry: usize) -> Self {
-        let transform = |cells: &[i8]| {
-            let mut result = vec![0; CELL_COUNT];
-            for (index, &stone) in cells.iter().enumerate() {
-                result[transform_index(index, symmetry)] = stone;
-            }
-            result
-        };
+        if symmetry == 0 {
+            return self.clone();
+        }
         Self {
-            cells: transform(&self.cells),
-            history: self
-                .history
-                .positions
-                .iter()
-                .map(|cells| transform(cells))
-                .collect(),
-            previous: transform(&self.previous),
+            cells: transform_cells(&self.cells, symmetry),
+            history: self.history.transformed(symmetry),
+            previous: transform_cells(&self.previous, symmetry),
             ..self.clone()
         }
     }
@@ -631,7 +742,7 @@ pub(crate) fn group(cells: &[i8], start: usize) -> (Vec<usize>, bool) {
     }
     (stones, has_liberty)
 }
-pub(crate) fn transform_index(index: usize, symmetry: usize) -> usize {
+pub(crate) const fn transform_index(index: usize, symmetry: usize) -> usize {
     if index == CELL_COUNT {
         return index;
     }
@@ -640,10 +751,70 @@ pub(crate) fn transform_index(index: usize, symmetry: usize) -> usize {
     if symmetry & 4 != 0 {
         col = BOARD_SIZE - 1 - col;
     }
-    for _ in 0..(symmetry & 3) {
+    let mut rotations = symmetry & 3;
+    while rotations != 0 {
         (row, col) = (col, BOARD_SIZE - 1 - row);
+        rotations -= 1;
     }
     row * BOARD_SIZE + col
+}
+const SYMMETRY_MAPS: [[usize; ACTION_COUNT]; 8] = {
+    let mut maps = [[0; ACTION_COUNT]; 8];
+    let mut symmetry = 0;
+    while symmetry < 8 {
+        let mut point = 0;
+        while point < ACTION_COUNT {
+            maps[symmetry][point] = transform_index(point, symmetry);
+            point += 1;
+        }
+        symmetry += 1;
+    }
+    maps
+};
+const COMPOSE_SYMMETRY: [[usize; 8]; 8] = {
+    let mut result = [[0; 8]; 8];
+    let mut outer = 0;
+    while outer < 8 {
+        let mut inner = 0;
+        while inner < 8 {
+            let mut candidate = 0;
+            while candidate < 8 {
+                if SYMMETRY_MAPS[candidate][0] == SYMMETRY_MAPS[outer][SYMMETRY_MAPS[inner][0]]
+                    && SYMMETRY_MAPS[candidate][1] == SYMMETRY_MAPS[outer][SYMMETRY_MAPS[inner][1]]
+                {
+                    result[outer][inner] = candidate;
+                    break;
+                }
+                candidate += 1;
+            }
+            inner += 1;
+        }
+        outer += 1;
+    }
+    result
+};
+const INVERSE_SYMMETRY: [usize; 8] = {
+    let mut result = [0; 8];
+    let mut symmetry = 0;
+    while symmetry < 8 {
+        let mut inverse = 0;
+        while inverse < 8 {
+            if COMPOSE_SYMMETRY[inverse][symmetry] == 0 {
+                result[symmetry] = inverse;
+                break;
+            }
+            inverse += 1;
+        }
+        symmetry += 1;
+    }
+    result
+};
+fn transform_cells(cells: &[i8], symmetry: usize) -> Vec<i8> {
+    let mut result = vec![0; CELL_COUNT];
+    for (point, &stone) in cells.iter().enumerate() {
+        result[SYMMETRY_MAPS[symmetry][point]] = stone;
+    }
+    result
 }
 impl fmt::Display for Board {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

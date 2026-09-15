@@ -65,22 +65,19 @@ pub fn sample_mixed_recent(
             actual_recent: 0,
         };
     }
-    let newest = pool
-        .iter()
-        .map(|sample| sample.generation)
-        .max()
-        .unwrap_or(0);
-    let oldest_recent = newest.saturating_sub(recent_updates.max(1).saturating_sub(1));
-    let recent = pool
-        .iter()
-        .enumerate()
-        .filter_map(|(index, sample)| (sample.generation >= oldest_recent).then_some(index))
-        .collect::<Vec<_>>();
-    let historical = pool
-        .iter()
-        .enumerate()
-        .filter_map(|(index, sample)| (sample.generation < oldest_recent).then_some(index))
-        .collect::<Vec<_>>();
+    crate::scope_profile!("replay.sample_total");
+    let (oldest_recent, recent, historical) = {
+        crate::scope_profile!("replay.partition");
+        let newest = pool
+            .iter()
+            .map(|sample| sample.generation)
+            .max()
+            .unwrap_or(0);
+        let oldest_recent = newest.saturating_sub(recent_updates.max(1).saturating_sub(1));
+        let (recent, historical): (Vec<_>, Vec<_>) =
+            (0..pool.len()).partition(|&index| pool[index].generation >= oldest_recent);
+        (oldest_recent, recent, historical)
+    };
     let recent_quota = if recent.is_empty() {
         0
     } else {
@@ -88,50 +85,61 @@ pub fn sample_mixed_recent(
     }
     .min(count);
     let mut rng = SplitMix64(seed);
-    let mut samples = Vec::with_capacity(count);
-    let recent_weights = WeightedSource::new(pool, &recent);
-    let historical_weights = WeightedSource::new(pool, &historical);
-    let policy_quota = ((count as f32) * policy_surprise_fraction.clamp(0.0, 1.0)).round() as usize;
-    let value_quota = ((count as f32) * value_surprise_fraction.clamp(0.0, 1.0)).round() as usize;
-    let mut kinds = vec![0u8; count];
-    for kind in &mut kinds[..policy_quota.min(count)] {
-        *kind = 1;
-    }
-    for kind in
-        &mut kinds[policy_quota.min(count)..policy_quota.saturating_add(value_quota).min(count)]
+    let (recent_weights, historical_weights) = {
+        crate::scope_profile!("replay.weights");
+        (
+            WeightedSource::new(pool, &recent),
+            WeightedSource::new(pool, &historical),
+        )
+    };
+    let mut plan = {
+        crate::scope_profile!("replay.select");
+        let mut plan = Vec::with_capacity(count);
+        let policy_quota =
+            ((count as f32) * policy_surprise_fraction.clamp(0.0, 1.0)).round() as usize;
+        let value_quota =
+            ((count as f32) * value_surprise_fraction.clamp(0.0, 1.0)).round() as usize;
+        let mut kinds = vec![0u8; count];
+        for kind in &mut kinds[..policy_quota.min(count)] {
+            *kind = 1;
+        }
+        for kind in
+            &mut kinds[policy_quota.min(count)..policy_quota.saturating_add(value_quota).min(count)]
+        {
+            *kind = 2;
+        }
+        for index in (1..kinds.len()).rev() {
+            let other = rng.index(index + 1);
+            kinds.swap(index, other);
+        }
+        for slot in 0..count {
+            let weights = if slot < recent_quota || historical.is_empty() {
+                &recent_weights
+            } else {
+                &historical_weights
+            };
+            let selected = weights.sample(kinds[slot] as usize, &mut rng);
+            plan.push((selected, rng.index(8)));
+        }
+        plan
+    };
     {
-        *kind = 2;
+        crate::scope_profile!("replay.shuffle");
+        for index in (1..plan.len()).rev() {
+            let other = rng.index(index + 1);
+            plan.swap(index, other);
+        }
     }
-    for index in (1..kinds.len()).rev() {
-        let other = rng.index(index + 1);
-        kinds.swap(index, other);
-    }
-    for slot in 0..count {
-        let source = if slot < recent_quota {
-            &recent
-        } else if historical.is_empty() {
-            &recent
-        } else {
-            &historical
-        };
-        let kind = kinds[slot] as usize;
-        let weights = if std::ptr::eq(source, &recent) {
-            &recent_weights
-        } else {
-            &historical_weights
-        };
-        let selected = weights.sample(kind, &mut rng);
-        let sample = &pool[selected];
-        samples.push(sample.transformed(rng.index(8)));
-    }
-    for index in (1..samples.len()).rev() {
-        let other = rng.index(index + 1);
-        samples.swap(index, other);
-    }
-    let actual_recent = samples
+    let actual_recent = plan
         .iter()
-        .filter(|sample| sample.generation >= oldest_recent)
+        .filter(|&&(index, _)| pool[index].generation >= oldest_recent)
         .count();
+    let samples = {
+        crate::scope_profile!("replay.materialize");
+        plan.into_iter()
+            .map(|(index, symmetry)| pool[index].transformed(symmetry))
+            .collect()
+    };
     MixedSampleBatch {
         samples,
         recent_quota,

@@ -45,6 +45,19 @@ fn main() -> io::Result<()> {
         PolicyValueModel::load(model_path)?
     };
     let samples = replay::load(replay_path)?;
+    let samples = if mode == "sampling" {
+        let pool_size = std::env::var("GO19_PROBE_POOL_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(samples.len());
+        if pool_size == samples.len() {
+            samples
+        } else {
+            samples.iter().cycle().take(pool_size).cloned().collect()
+        }
+    } else {
+        samples
+    };
     if samples.is_empty() {
         return Err(io::Error::other("性能诊断需要非空回放"));
     }
@@ -72,6 +85,27 @@ fn main() -> io::Result<()> {
         }
     }
     match mode {
+        "sampling" => {
+            let count = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(81920);
+            let start = Instant::now();
+            let batch = replay::sample_mixed_recent(&samples, count, 0.4, 5, 0.4, 0.1, 719);
+            println!(
+                "samples={} sampling_seconds={:.6} recent_quota={} actual_recent={}",
+                batch.samples.len(),
+                start.elapsed().as_secs_f64(),
+                batch.recent_quota,
+                batch.actual_recent
+            );
+            if args.get(5).is_some_and(|arg| arg == "digest") {
+                let mut digest = 0xcbf29ce484222325u64;
+                for sample in &batch.samples {
+                    for byte in serde_json::to_vec(sample).map_err(io::Error::other)? {
+                        digest = (digest ^ byte as u64).wrapping_mul(0x100000001b3);
+                    }
+                }
+                println!("serialized_digest={digest:016x}");
+            }
+        }
         "fingerprint" => {
             for board in &boards {
                 let evaluation = model.evaluate(board);
