@@ -62,13 +62,21 @@ enum TrainerCommand {
 pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let interrupted = Arc::new(AtomicBool::new(false));
+    let cancel_replay = Arc::new(AtomicBool::new(false));
+    let cancel_signal = Arc::clone(&cancel_replay);
     let signal = Arc::clone(&stop);
     let interrupt_signal = Arc::clone(&interrupted);
     ctrlc::set_handler(move || {
-        interrupt_signal.store(true, Ordering::SeqCst);
+        if interrupt_signal.swap(true, Ordering::SeqCst) {
+            cancel_signal.store(true, Ordering::SeqCst);
+            eprintln!("stop     : skip replay requested; preserving model snapshot");
+        } else {
+            eprintln!("stop     : requested; saving model before replay, press Ctrl+C again to skip replay");
+        }
         signal.store(true, Ordering::SeqCst);
     })
     .map_err(io::Error::other)?;
+    replay::check_format(&config.replay_path)?;
     let mut progress = load_progress(&config.progress_path)?;
     let arch = PolicyValueArch::with_hidden_size(config.hidden_size);
     arch.validate()?;
@@ -83,9 +91,8 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     };
     let initial_pool = if Path::new(&config.replay_path).exists() {
         let pool = replay::load(&config.replay_path)?;
-        fs::remove_file(&config.replay_path)?;
         println!(
-            "replay   : restored {}/{} samples from {} (file removed)",
+            "replay   : restored {}/{} samples from {}",
             pool.len(),
             config.replay_capacity,
             config.replay_path
@@ -94,6 +101,12 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     } else {
         Vec::new()
     };
+    // 两个快照都已成功读取后才消费，坏回放不会导致续训模型被先行删除。
+    for path in [&config.model_path, &config.replay_path] {
+        if Path::new(path).exists() {
+            fs::remove_file(path)?;
+        }
+    }
     let initial_pool_samples = initial_pool.len();
     let max_workers = thread::available_parallelism()
         .map(|n| n.get())
@@ -223,13 +236,12 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     let (trainer_error_tx, trainer_error_rx) = mpsc::sync_channel::<String>(1);
     let (trainer_ack_tx, trainer_ack_rx) = mpsc::sync_channel::<TrainerCommand>(0);
     let trainer_stop = Arc::clone(&stop);
-    let trainer_interrupted = Arc::clone(&interrupted);
     let trainer_version = Arc::clone(&version);
     let trainer_config = config.clone();
     let start_update = progress.update;
     let start_optimizer_steps = progress.optimizer_steps;
-    let trainer = thread::spawn(move || -> io::Result<()> {
-        let result = (|| -> io::Result<()> {
+    let trainer = thread::spawn(move || -> io::Result<Vec<replay::Sample>> {
+        let result = (|| -> io::Result<Vec<replay::Sample>> {
             let mut model = initial_model;
             let mut training = candle_train::TrainingSession::new(
                 &model,
@@ -302,16 +314,7 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
                     Err(_) => break,
                 }
             }
-            if trainer_interrupted.load(Ordering::SeqCst) {
-                replay::save(&trainer_config.replay_path, &pool)?;
-                println!(
-                    "replay   : interrupt snapshot {} ({}/{})",
-                    trainer_config.replay_path,
-                    pool.len(),
-                    trainer_config.replay_capacity
-                );
-            }
-            Ok(())
+            Ok(pool)
         })();
         if let Err(error) = &result {
             let _ = trainer_error_tx.try_send(format!("{error:#}"));
@@ -802,19 +805,25 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
     stop.store(true, Ordering::SeqCst);
     drop(trainer_ack_tx);
     drop(event_rx);
+    eprintln!("stop     : saving model {}", config.model_path);
+    save_resume_model(
+        &published.read().unwrap_or_else(|e| e.into_inner()),
+        &config.model_path,
+    )?;
+    save_progress(&config.progress_path, &progress)?;
+    eprintln!("stop     : model and progress saved; waiting for workers");
     actors.shutdown()?;
     collector
         .join()
         .map_err(|_| io::Error::other("Collector 线程异常退出"))?;
-    trainer
+    let pool = trainer
         .join()
         .map_err(|_| io::Error::other("Trainer 线程异常退出"))??;
-    // model_path 只是停机续训快照，下次启动后立即消费并删除；
-    // 长期存在、供引擎使用的模型只有 best.safetensors。
-    published
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .save(&config.model_path)?;
+    if interrupted.load(Ordering::SeqCst) {
+        if !replay::save_controlled(&config.replay_path, &pool, Some(&cancel_replay))? {
+            eprintln!("replay   : skipped; model snapshot is saved");
+        }
+    }
     if !interrupted.load(Ordering::SeqCst) && Path::new(&config.replay_path).exists() {
         fs::remove_file(&config.replay_path)?;
     }
@@ -961,8 +970,7 @@ fn load_or_init(path: &str, arch: PolicyValueArch, seed: u64) -> io::Result<Poli
     if Path::new(path).exists() {
         let model = PolicyValueModel::load(path)?;
         ensure_arch(&model, arch, path)?;
-        fs::remove_file(path)?;
-        println!("resume   : consumed {path} into memory");
+        println!("resume   : loaded {path} into memory");
         Ok(model)
     } else {
         Ok(PolicyValueModel::random_with_arch(arch, seed))
@@ -986,14 +994,35 @@ fn load_progress(path: &str) -> io::Result<Progress> {
     }
     serde_json::from_slice(&fs::read(path)?).map_err(io::Error::other)
 }
+fn save_resume_model(model: &PolicyValueModel, path: &str) -> io::Result<()> {
+    let path = Path::new(path);
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let temporary = tempfile::Builder::new()
+        .prefix(".go19-model-")
+        .suffix(".safetensors")
+        .tempfile_in(parent)?;
+    model.save(temporary.path())?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
 fn save_progress(path: &str, p: &Progress) -> io::Result<()> {
-    if let Some(parent) = Path::new(path).parent() {
-        fs::create_dir_all(parent)?
-    }
-    fs::write(
-        path,
-        serde_json::to_vec_pretty(p).map_err(io::Error::other)?,
-    )
+    use std::io::Write;
+    let path = Path::new(path);
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(&serde_json::to_vec_pretty(p).map_err(io::Error::other)?)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
 }
 fn checkpoint_path(c: &AzLoopConfig, update: usize) -> PathBuf {
     Path::new(&c.checkpoint_dir).join(format!("update-{update:06}-model.safetensors"))

@@ -252,6 +252,119 @@ fn position_hash(cells: &[i8]) -> u64 {
         .filter(|(_, stone)| **stone != 0)
         .fold(0, |hash, (point, &stone)| hash ^ stone_hash(point, stone))
 }
+/// 回放快照保持共享历史树，不展开每条样本的全部历史。
+#[derive(Serialize, Deserialize)]
+pub(crate) struct SnapshotHistoryNode {
+    parent: usize,
+    #[serde(deserialize_with = "deserialize_cells")]
+    cells: Vec<i8>,
+}
+#[derive(Serialize, Deserialize)]
+pub(crate) struct SnapshotBoard {
+    #[serde(deserialize_with = "deserialize_cells")]
+    cells: Vec<i8>,
+    #[serde(deserialize_with = "deserialize_cells")]
+    previous: Vec<i8>,
+    to_move: Player,
+    moves: usize,
+    passes: usize,
+    komi_milli: i32,
+    history: usize,
+    symmetry: usize,
+}
+#[derive(Default)]
+pub(crate) struct SnapshotEncoder {
+    // 持有 Arc，保证整个编码期间地址不会被释放并复用。
+    ids: std::collections::HashMap<usize, (usize, Arc<Vec<i8>>)>,
+}
+impl SnapshotEncoder {
+    pub(crate) fn encode(&mut self, board: &Board) -> (Vec<SnapshotHistoryNode>, SnapshotBoard) {
+        let mut parent = 0;
+        let mut pending = Vec::new();
+        for cells in board.history.positions.iter().rev() {
+            let key = Arc::as_ptr(cells) as usize;
+            if let Some((id, _)) = self.ids.get(&key) {
+                parent = *id;
+                break;
+            }
+            pending.push(cells);
+        }
+        let mut nodes = Vec::with_capacity(pending.len());
+        for cells in pending.into_iter().rev() {
+            let id = self.ids.len() + 1;
+            self.ids
+                .insert(Arc::as_ptr(cells) as usize, (id, cells.clone()));
+            nodes.push(SnapshotHistoryNode {
+                parent,
+                cells: cells.as_ref().clone(),
+            });
+            parent = id;
+        }
+        (
+            nodes,
+            SnapshotBoard {
+                cells: board.cells.clone(),
+                previous: board.previous.clone(),
+                to_move: board.to_move,
+                moves: board.moves,
+                passes: board.passes,
+                komi_milli: board.komi_milli,
+                history: parent,
+                symmetry: board.history.symmetry,
+            },
+        )
+    }
+    pub(crate) fn history_nodes(&self) -> usize {
+        self.ids.len()
+    }
+}
+pub(crate) struct SnapshotDecoder {
+    histories: Vec<PositionHistory>,
+}
+impl SnapshotDecoder {
+    pub(crate) fn new() -> Self {
+        Self {
+            histories: vec![std::iter::empty().collect()],
+        }
+    }
+    pub(crate) fn decode(
+        &mut self,
+        nodes: Vec<SnapshotHistoryNode>,
+        board: SnapshotBoard,
+    ) -> std::io::Result<Board> {
+        for node in nodes {
+            let mut history = self
+                .histories
+                .get(node.parent)
+                .ok_or_else(|| std::io::Error::other("回放历史引用无效"))?
+                .clone();
+            history.push(node.cells);
+            self.histories.push(history);
+        }
+        if board.history == 0 || board.symmetry >= 8 {
+            return Err(std::io::Error::other("回放棋盘引用无效"));
+        }
+        let mut history = self
+            .histories
+            .get(board.history)
+            .ok_or_else(|| std::io::Error::other("回放历史缺失"))?
+            .clone();
+        history.symmetry = board.symmetry;
+        if !history.matches(history.positions.back().unwrap(), &board.cells) {
+            return Err(std::io::Error::other("回放历史与当前棋盘不一致"));
+        }
+        Ok(Board {
+            cells: board.cells,
+            previous: board.previous,
+            to_move: board.to_move,
+            moves: board.moves,
+            passes: board.passes,
+            komi_milli: board.komi_milli,
+            history,
+        })
+    }
+}
+
 /// 单个候选的精确提子与落子后气数，不分配临时棋盘。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PlacementInfo {

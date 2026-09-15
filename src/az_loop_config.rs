@@ -58,7 +58,7 @@ impl Default for AzLoopConfig {
             format_version: 22,
             model_path: "go19-v32-model.safetensors".into(),
             best_model_path: "go19-v32-best.safetensors".into(),
-            replay_path: "data/go19-v32/replay.jsonl".into(),
+            replay_path: "data/go19-v32/replay.bin.lz4".into(),
             progress_path: "data/go19-v32/azloop-progress.json".into(),
             simulations: 400,
             hidden_size: 128,
@@ -218,7 +218,7 @@ impl AzLoopConfig {
 const DEFAULT_CONFIG_TEXT: &str = r#"format_version = 22
 model_path = "go19-v32-model.safetensors"
 best_model_path = "go19-v32-best.safetensors"
-replay_path = "data/go19-v32/replay.jsonl"
+replay_path = "data/go19-v32/replay.bin.lz4"
 progress_path = "data/go19-v32/azloop-progress.json"
 simulations = 400
 hidden_size = 128

@@ -20,7 +20,7 @@ fn main() -> io::Result<()> {
     let replay_path = args
         .get(3)
         .map(String::as_str)
-        .unwrap_or("data/go19-v32/replay.jsonl");
+        .unwrap_or("data/go19-v32/replay.bin.lz4");
     if mode == "prepare" {
         if std::path::Path::new(model_path).exists() || std::path::Path::new(replay_path).exists() {
             return Err(io::Error::other("测试输入已存在，不覆盖"));
@@ -85,6 +85,19 @@ fn main() -> io::Result<()> {
         }
     }
     match mode {
+        "snapshot" => {
+            let count = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(81920);
+            let path = args.get(5).ok_or_else(|| io::Error::other("snapshot requires output path"))?;
+            if std::path::Path::new(path).exists() { return Err(io::Error::other("不覆盖已有快照")); }
+            let batch = samples.iter().cycle().take(count).cloned().collect::<Vec<_>>();
+            let start = Instant::now();
+            replay::save(path, &batch)?;
+            let save_seconds = start.elapsed().as_secs_f64();
+            let start = Instant::now();
+            let restored = replay::load(path)?;
+            assert_eq!(restored.len(), batch.len());
+            println!("snapshot_samples={count} bytes={} save_seconds={save_seconds:.3} load_seconds={:.3}", std::fs::metadata(path)?.len(), start.elapsed().as_secs_f64());
+        }
         "sampling" => {
             let count = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(81920);
             let start = Instant::now();
