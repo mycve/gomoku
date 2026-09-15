@@ -307,7 +307,7 @@ fn main() -> io::Result<()> {
             );
             let seconds = started.elapsed().as_secs_f32();
             println!(
-                "result   : W/L/D={}/{}/{} aborted={} score={:.2}% stderr={:.2}% lower={:.2}% elo={:+.1} avg_plies={:.1}",
+                "result   : W/L/D={}/{}/{} aborted={} aborted_as_loss=true score={:.2}% stderr={:.2}% lower={:.2}% elo={:+.1} avg_plies={:.1}",
                 report.wins,
                 report.losses,
                 report.draws,

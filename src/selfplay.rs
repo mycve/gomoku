@@ -359,6 +359,9 @@ pub struct ArenaReport {
     pub losses: usize,
     pub draws: usize,
     pub aborted: usize,
+    pub aborted_as_black: usize,
+    pub aborted_as_white: usize,
+    pub interrupted: usize,
     pub wins_as_black: usize,
     pub losses_as_black: usize,
     pub draws_as_black: usize,
@@ -374,8 +377,9 @@ pub struct ArenaReport {
 }
 
 impl ArenaReport {
+    /// 晋级评估总局数；中止局保守计作候选失分，原始 W/L/D 单独保留。
     pub fn games(self) -> usize {
-        self.wins + self.losses + self.draws
+        self.wins + self.losses + self.draws + self.aborted
     }
     pub fn score_rate(self) -> f32 {
         (self.wins as f32 + self.draws as f32 * 0.5) / self.games().max(1) as f32
@@ -400,16 +404,18 @@ impl ArenaReport {
         self.score_rate() - z.max(0.0) * self.score_rate_standard_error()
     }
     pub fn promotes_with_lower_bound(self, threshold: f32, z: f32) -> bool {
-        self.aborted == 0
+        self.interrupted == 0
             && self.games() > 0
             && self.score_rate_lower_bound(z) >= threshold.clamp(0.0, 1.0)
     }
     pub fn score_as_black(self) -> f32 {
-        let games = self.wins_as_black + self.losses_as_black + self.draws_as_black;
+        let games =
+            self.wins_as_black + self.losses_as_black + self.draws_as_black + self.aborted_as_black;
         (self.wins_as_black as f32 + self.draws_as_black as f32 * 0.5) / games.max(1) as f32
     }
     pub fn score_as_white(self) -> f32 {
-        let games = self.wins_as_white + self.losses_as_white + self.draws_as_white;
+        let games =
+            self.wins_as_white + self.losses_as_white + self.draws_as_white + self.aborted_as_white;
         (self.wins_as_white as f32 + self.draws_as_white as f32 * 0.5) / games.max(1) as f32
     }
     pub fn passes_color_floor(self, floor: f32) -> bool {
@@ -448,7 +454,10 @@ pub fn arena_controlled(
         .into_par_iter()
         .map(|opening_index| {
             if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-                return ArenaReport::default();
+                return ArenaReport {
+                    interrupted: 1,
+                    ..Default::default()
+                };
             }
             let mut board = Board::new();
             let mut opening_seed =
@@ -487,9 +496,14 @@ fn play_arena_game(
         board.play(result[0].mv);
     }
     let plies = board.move_count();
-    match board.outcome() {
+    let outcome = board.outcome();
+    match outcome {
         Some(Outcome::Aborted) | None => ArenaReport {
             aborted: 1,
+            aborted_as_black: usize::from(candidate_black),
+            aborted_as_white: usize::from(!candidate_black),
+            interrupted: usize::from(outcome.is_none()),
+            plies,
             ..Default::default()
         },
         Some(Outcome::Win(player)) => {
@@ -531,6 +545,9 @@ fn merge_arena_reports(a: ArenaReport, b: ArenaReport) -> ArenaReport {
         losses: a.losses + b.losses,
         draws: a.draws + b.draws,
         aborted: a.aborted + b.aborted,
+        aborted_as_black: a.aborted_as_black + b.aborted_as_black,
+        aborted_as_white: a.aborted_as_white + b.aborted_as_white,
+        interrupted: a.interrupted + b.interrupted,
         wins_as_black: a.wins_as_black + b.wins_as_black,
         losses_as_black: a.losses_as_black + b.losses_as_black,
         draws_as_black: a.draws_as_black + b.draws_as_black,
@@ -574,10 +591,72 @@ mod tests {
         let report = ArenaReport {
             wins: 100,
             aborted: 1,
+            interrupted: 1,
             ..Default::default()
         };
         assert!(!report.promotes_with_lower_bound(0.5, 0.0));
         assert!(!ArenaReport::default().promotes_with_lower_bound(0.0, 0.0));
+    }
+
+    #[test]
+    fn arena_move_limit_counts_as_loss_without_vetoing_promotion() {
+        let report = ArenaReport {
+            wins: 67,
+            losses: 23,
+            aborted: 10,
+            wins_as_black: 33,
+            losses_as_black: 12,
+            aborted_as_black: 5,
+            wins_as_white: 34,
+            losses_as_white: 11,
+            aborted_as_white: 5,
+            ..Default::default()
+        };
+        assert_eq!(report.games(), 100);
+        assert!((report.score_rate() - 0.67).abs() < 1e-6);
+        assert!((report.score_as_black() - 0.66).abs() < 1e-6);
+        assert!((report.score_as_white() - 0.68).abs() < 1e-6);
+        assert!(report.promotes_with_lower_bound(0.5, 1.28));
+        assert!(report.passes_color_floor(0.45));
+        let weak = ArenaReport {
+            wins: 50,
+            aborted: 50,
+            ..Default::default()
+        };
+        assert!(!weak.promotes_with_lower_bound(0.5, 1.28));
+        let paired = ArenaReport {
+            wins: 3,
+            losses: 1,
+            aborted: 2,
+            paired_openings: 3,
+            paired_score_square_sum: 1.25,
+            ..Default::default()
+        };
+        assert!((paired.score_rate_standard_error() - (0.25_f32 / 3.0).sqrt()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn arena_distinguishes_move_limit_from_cancelled_evaluation() {
+        let model = PolicyValueModel::random(8, 719);
+        let mut state = serde_json::to_value(Board::new()).unwrap();
+        state["moves"] = serde_json::json!(crate::game::MAX_MOVES);
+        let board: Board = serde_json::from_value(state).unwrap();
+        let report = play_arena_game(board, false, &model, &model, SearchConfig::default(), None);
+        assert_eq!(report.aborted, 1);
+        assert_eq!(report.aborted_as_white, 1);
+        assert_eq!(report.interrupted, 0);
+        assert_eq!(report.plies, crate::game::MAX_MOVES);
+        let stop = AtomicBool::new(true);
+        let cancelled = arena_controlled(&model, &model, 4, SearchConfig::default(), Some(&stop));
+        assert!(cancelled.interrupted > 0);
+        let partial = merge_arena_reports(
+            ArenaReport {
+                wins: 100,
+                ..Default::default()
+            },
+            cancelled,
+        );
+        assert!(!partial.promotes_with_lower_bound(0.5, 0.0));
     }
 
     #[test]

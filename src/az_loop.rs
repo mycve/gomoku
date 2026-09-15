@@ -683,11 +683,12 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             let color_passed = report.passes_color_floor(config.arena_color_score_floor);
             let promoted = overall_passed && color_passed;
             println!(
-                "arena    : W/L/D={}/{}/{} aborted={} score={:.2}% lower={:.2}% target={:.2}% overall_passed={} elo={:+.1} promoted={}",
+                "arena    : W/L/D={}/{}/{} aborted={} aborted_as_loss=true interrupted={} score={:.2}% lower={:.2}% target={:.2}% overall_passed={} elo={:+.1} promoted={}",
                 report.wins,
                 report.losses,
                 report.draws,
                 report.aborted,
+                report.interrupted,
                 report.score_rate() * 100.0,
                 lower_bound * 100.0,
                 config.arena_promotion_rate * 100.0,
@@ -746,6 +747,16 @@ pub fn run(config: AzLoopConfig, target_update: Option<usize>) -> io::Result<()>
             tb.add_scalar(
                 "arena/draw_rate",
                 report.draws as f32 / arena_games,
+                progress.update,
+            );
+            tb.add_scalar(
+                "arena/aborted_rate",
+                report.aborted as f32 / arena_games,
+                progress.update,
+            );
+            tb.add_scalar(
+                "arena/interrupted",
+                report.interrupted as f32,
                 progress.update,
             );
             tb.add_scalar("arena/seconds", arena_seconds, progress.update);
